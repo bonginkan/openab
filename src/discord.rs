@@ -454,6 +454,8 @@ impl EventHandler for Handler {
                     .mention_roles
                     .iter()
                     .any(|r| self.allowed_role_ids.contains(&r.get())));
+        let is_reply_to_bot = !is_mentioned && references_bot_message(&ctx, &msg, bot_id).await;
+        let is_user_trigger = is_mentioned || is_reply_to_bot;
 
         // Bot message gating (from upstream #321)
         if msg.author.bot {
@@ -588,7 +590,7 @@ impl EventHandler for Handler {
         // MultibotMentions: same as Involved, but if other bots are also
         //   in the thread, require @mention to avoid all bots responding.
         // DMs are treated as implicit @mention (mirrors Slack behavior).
-        if !is_mentioned && !is_dm {
+        if !is_user_trigger && !is_dm {
             match self.allow_user_messages {
                 AllowUsers::Mentions => return,
                 AllowUsers::Involved => {
@@ -2157,6 +2159,37 @@ fn detect_thread(
         || parent_id.is_some_and(|pid| allowed_channels.contains(&pid));
     let bot_owns = owner_id.is_some_and(|oid| oid == bot_id);
     (in_allowed_thread, Some(bot_owns))
+}
+
+/// Returns true when the incoming message is a Discord reply to this bot.
+async fn references_bot_message(ctx: &Context, msg: &Message, bot_id: UserId) -> bool {
+    if msg
+        .referenced_message
+        .as_ref()
+        .is_some_and(|referenced| referenced.author.id == bot_id)
+    {
+        return true;
+    }
+
+    let Some(reference) = &msg.message_reference else {
+        return false;
+    };
+    let Some(message_id) = reference.message_id else {
+        return false;
+    };
+
+    match reference.channel_id.message(&ctx.http, message_id).await {
+        Ok(referenced) => referenced.author.id == bot_id,
+        Err(e) => {
+            tracing::debug!(
+                channel_id = %reference.channel_id,
+                message_id = %message_id,
+                error = %e,
+                "failed to fetch referenced Discord message"
+            );
+            false
+        }
+    }
 }
 
 /// Returns `true` if the author should be denied by the user allowlist.
