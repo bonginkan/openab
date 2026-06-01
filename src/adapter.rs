@@ -431,7 +431,7 @@ impl AdapterRouter {
     }
 
     /// Pack one arrival event into ContentBlocks. Per-arrival layout:
-    ///   Text { "<sender_context>\n{json}\n</sender_context>" }   <- delimiter
+    ///   Text { "<sender_context>\n{json}\n</sender_context>\n\n" } <- delimiter
     ///   [Text blocks from extra_blocks (e.g. STT transcripts)]
     ///   Text { "{prompt}" }                                       <- omitted if empty
     ///   [non-Text blocks from extra_blocks (e.g. Image)]
@@ -449,7 +449,7 @@ impl AdapterRouter {
         prompt: &str,
         extra_blocks: Vec<ContentBlock>,
     ) -> Vec<ContentBlock> {
-        let header = format!("<sender_context>\n{}\n</sender_context>", sender_json);
+        let header = format!("<sender_context>\n{}\n</sender_context>\n\n", sender_json);
         let (texts, others): (Vec<_>, Vec<_>) = extra_blocks
             .into_iter()
             .partition(|b| matches!(b, ContentBlock::Text { .. }));

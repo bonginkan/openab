@@ -10,6 +10,12 @@ use tokio::sync::{Mutex, RwLock};
 use tokio::time::Instant;
 use tracing::{info, warn};
 
+type CancelHandle = (
+    Arc<Mutex<tokio::process::ChildStdin>>,
+    String,
+    Arc<AtomicU64>,
+);
+
 /// Combined state protected by a single lock to prevent deadlocks.
 /// Lock ordering: never await a per-connection mutex while holding `state`.
 struct PoolState {
@@ -17,14 +23,7 @@ struct PoolState {
     active: HashMap<String, Arc<Mutex<AcpConnection>>>,
     /// Lock-free side-channel handles: thread_key → (stdin, session_id, request_id_allocator).
     /// Stored separately so cancel can work without locking the connection.
-    cancel_handles: HashMap<
-        String,
-        (
-            Arc<tokio::sync::Mutex<tokio::process::ChildStdin>>,
-            String,
-            Arc<AtomicU64>,
-        ),
-    >,
+    cancel_handles: HashMap<String, CancelHandle>,
     /// Suspended sessions: thread_key → ACP sessionId.
     /// Used at runtime to decide which thread can be resumed via `session/load`
     /// because it no longer has a live in-memory connection.

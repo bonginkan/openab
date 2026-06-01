@@ -946,6 +946,10 @@ mod tests {
         if let ContentBlock::Text { text } = &blocks[0] {
             assert!(text.contains("<sender_context>"));
             assert!(text.contains("</sender_context>"));
+            assert!(
+                text.ends_with("</sender_context>\n\n"),
+                "delimiter should preserve a visible blank line before following text"
+            );
             // Header is delimiter only — prompt lives in its own block.
             assert!(!text.contains("hello"));
         } else {
@@ -956,6 +960,18 @@ mod tests {
         } else {
             panic!("expected Text prompt block");
         }
+
+        let flattened = blocks
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        assert!(
+            flattened.contains("</sender_context>\n\nhello"),
+            "flattened text must not glue sender_context and prompt together"
+        );
     }
 
     #[test]

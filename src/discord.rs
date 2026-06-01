@@ -331,9 +331,9 @@ impl EventHandler for Handler {
         if msg.author.bot && msg.author.id != bot_id {
             let key = msg.channel_id.to_string();
             let mut cache = self.multibot_threads.lock().await;
-            if !cache
+            if cache
                 .get(&key)
-                .is_some_and(|ts| ts.elapsed() < self.session_ttl)
+                .is_none_or(|ts| ts.elapsed() >= self.session_ttl)
             {
                 cache_participation_entry(&mut cache, key, self.session_ttl);
             }
