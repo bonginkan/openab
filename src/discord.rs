@@ -844,7 +844,7 @@ impl EventHandler for Handler {
         // Per-thread streaming: check if another bot is present in this thread
         let other_bot_present_flag = {
             let cache = self.multibot_threads.lock().await;
-            cache.contains_key(&msg.channel_id.to_string())
+            cached_multibot_thread(&cache, &thread_channel.channel_id, self.session_ttl)
         };
 
         // Backfill thread_id: when OAB just created a new thread, the sender
@@ -2295,6 +2295,16 @@ fn should_process_user_message(
     }
 }
 
+fn cached_multibot_thread(
+    cache: &HashMap<String, tokio::time::Instant>,
+    thread_channel_id: &str,
+    ttl: std::time::Duration,
+) -> bool {
+    cache
+        .get(thread_channel_id)
+        .is_some_and(|ts| ts.elapsed() < ttl)
+}
+
 /// Returns true if any bot message in `messages` contains a turn limit warning.
 /// Used to dedup `WarnAndStop` across multiple bot processes sharing a thread. (#530)
 /// Note: this is best-effort — a narrow race window exists where two bots fetch
@@ -2674,6 +2684,32 @@ mod tests {
             true,  // involved
             false, // other_bot_present
         ));
+    }
+
+    #[test]
+    fn streaming_multibot_cache_uses_destination_thread_key() {
+        let ttl = std::time::Duration::from_secs(60);
+        let now = tokio::time::Instant::now();
+        let mut cache = HashMap::new();
+        cache.insert("parent-channel".to_string(), now);
+
+        assert!(
+            !cached_multibot_thread(&cache, "new-thread", ttl),
+            "a parent channel multibot marker must not force a new thread's first reply to send-once"
+        );
+
+        cache.insert("new-thread".to_string(), now);
+        assert!(cached_multibot_thread(&cache, "new-thread", ttl));
+    }
+
+    #[test]
+    fn streaming_multibot_cache_ignores_expired_entries() {
+        let ttl = std::time::Duration::from_secs(60);
+        let expired = tokio::time::Instant::now() - ttl - std::time::Duration::from_secs(1);
+        let mut cache = HashMap::new();
+        cache.insert("thread".to_string(), expired);
+
+        assert!(!cached_multibot_thread(&cache, "thread", ttl));
     }
 
     /// After soft limit fires once (n==20), subsequent bot messages still return

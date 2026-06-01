@@ -913,8 +913,44 @@ impl AdapterRouter {
 fn append_text_chunk(text_buf: &mut String, chunk: &str, separate_response: bool) {
     if separate_response {
         ensure_response_separator(text_buf, chunk);
+    } else if should_separate_stream_chunk(text_buf, chunk) {
+        text_buf.push('\n');
     }
     text_buf.push_str(chunk);
+}
+
+fn should_separate_stream_chunk(text_buf: &str, chunk: &str) -> bool {
+    if text_buf.is_empty() || chunk.is_empty() {
+        return false;
+    }
+    if chunk.chars().next().is_some_and(char::is_whitespace)
+        || text_buf
+            .chars()
+            .next_back()
+            .is_some_and(char::is_whitespace)
+    {
+        return false;
+    }
+
+    let Some(prev) = text_buf.trim_end().chars().next_back() else {
+        return false;
+    };
+    let Some(next) = chunk.chars().next() else {
+        return false;
+    };
+
+    is_sentence_terminal(prev) && is_text_start(next)
+}
+
+fn is_sentence_terminal(ch: char) -> bool {
+    matches!(
+        ch,
+        '.' | '!' | '?' | ':' | ';' | '。' | '！' | '？' | '：' | '；'
+    )
+}
+
+fn is_text_start(ch: char) -> bool {
+    ch.is_alphanumeric()
 }
 
 fn ensure_response_separator(text_buf: &mut String, next_chunk: &str) {
@@ -1244,6 +1280,20 @@ mod tests {
         let mut text = "first".to_string();
         append_text_chunk(&mut text, " response", false);
         assert_eq!(text, "first response");
+    }
+
+    #[test]
+    fn append_text_chunk_separates_standalone_stream_comments() {
+        let mut text = "調査する。".to_string();
+        append_text_chunk(&mut text, "次に確認する。", false);
+        assert_eq!(text, "調査する。\n次に確認する。");
+    }
+
+    #[test]
+    fn append_text_chunk_preserves_mid_sentence_stream_delta() {
+        let mut text = "調査".to_string();
+        append_text_chunk(&mut text, "します。", false);
+        assert_eq!(text, "調査します。");
     }
 
     #[test]
