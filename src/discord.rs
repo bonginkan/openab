@@ -38,6 +38,26 @@ const SELECT_MENU_PAGE_SIZE: usize = 25;
 /// Avoid unbounded Discord history exports from very large threads.
 const THREAD_EXPORT_MESSAGE_LIMIT: usize = 5000;
 
+fn cache_participation_entry(
+    cache: &mut HashMap<String, tokio::time::Instant>,
+    key: String,
+    session_ttl: std::time::Duration,
+) {
+    cache.insert(key, tokio::time::Instant::now());
+
+    if cache.len() > PARTICIPATION_CACHE_MAX {
+        cache.retain(|_, ts| ts.elapsed() < session_ttl);
+        if cache.len() > PARTICIPATION_CACHE_MAX {
+            let mut entries: Vec<_> = cache.iter().map(|(k, v)| (k.clone(), *v)).collect();
+            entries.sort_by_key(|(_, ts)| *ts);
+            let evict_count = entries.len() / 2;
+            for (k, _) in entries.into_iter().take(evict_count) {
+                cache.remove(&k);
+            }
+        }
+    }
+}
+
 // --- DiscordAdapter: implements ChatAdapter for Discord via serenity ---
 
 pub struct DiscordAdapter {
@@ -224,6 +244,11 @@ pub struct Handler {
 }
 
 impl Handler {
+    async fn mark_thread_participated(&self, channel_id: &str) {
+        let mut cache = self.participated_threads.lock().await;
+        cache_participation_entry(&mut cache, channel_id.to_string(), self.session_ttl);
+    }
+
     /// Check if the bot has participated in a Discord thread, and whether
     /// other bots have also posted in it.
     /// Returns `(involved, other_bot_present)`.
@@ -282,37 +307,12 @@ impl Handler {
 
         if involved && !cached_involved {
             let mut cache = self.participated_threads.lock().await;
-            cache.insert(key.clone(), tokio::time::Instant::now());
-
-            // Evict if over capacity
-            if cache.len() > PARTICIPATION_CACHE_MAX {
-                cache.retain(|_, ts| ts.elapsed() < self.session_ttl);
-                if cache.len() > PARTICIPATION_CACHE_MAX {
-                    let mut entries: Vec<_> = cache.iter().map(|(k, v)| (k.clone(), *v)).collect();
-                    entries.sort_by_key(|(_, ts)| *ts);
-                    let evict_count = entries.len() / 2;
-                    for (k, _) in entries.into_iter().take(evict_count) {
-                        cache.remove(&k);
-                    }
-                }
-            }
+            cache_participation_entry(&mut cache, key.clone(), self.session_ttl);
         }
 
         if other_bot_present && !cached_multibot {
             let mut cache = self.multibot_threads.lock().await;
-            cache.insert(key, tokio::time::Instant::now());
-
-            if cache.len() > PARTICIPATION_CACHE_MAX {
-                cache.retain(|_, ts| ts.elapsed() < self.session_ttl);
-                if cache.len() > PARTICIPATION_CACHE_MAX {
-                    let mut entries: Vec<_> = cache.iter().map(|(k, v)| (k.clone(), *v)).collect();
-                    entries.sort_by_key(|(_, ts)| *ts);
-                    let evict_count = entries.len() / 2;
-                    for (k, _) in entries.into_iter().take(evict_count) {
-                        cache.remove(&k);
-                    }
-                }
-            }
+            cache_participation_entry(&mut cache, key, self.session_ttl);
         }
 
         (involved, other_bot_present)
@@ -329,7 +329,12 @@ impl EventHandler for Handler {
         if msg.author.bot && msg.author.id != bot_id {
             let key = msg.channel_id.to_string();
             let mut cache = self.multibot_threads.lock().await;
-            cache.entry(key).or_insert_with(tokio::time::Instant::now);
+            if !cache
+                .get(&key)
+                .is_some_and(|ts| ts.elapsed() < self.session_ttl)
+            {
+                cache_participation_entry(&mut cache, key, self.session_ttl);
+            }
         }
 
         // Bot turn counting: runs before self-check so ALL bot messages
@@ -807,6 +812,13 @@ impl EventHandler for Handler {
                 }
             }
         };
+
+        if !in_thread && !is_dm && thread_channel.parent_id.is_some() {
+            // A top-level trigger that created/joined a thread makes this bot
+            // logically involved before its first reply is visible in history.
+            self.mark_thread_participated(&thread_channel.channel_id)
+                .await;
+        }
 
         // Notify user if any images couldn't be processed.
         if !failed_image_files.is_empty() {

@@ -112,7 +112,7 @@ pub struct AcpConnection {
     /// PID of the direct child, used as the process group ID for cleanup.
     child_pgid: Option<i32>,
     stdin: Arc<Mutex<ChildStdin>>,
-    next_id: AtomicU64,
+    next_id: Arc<AtomicU64>,
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<JsonRpcMessage>>>>,
     notify_tx: Arc<Mutex<Option<mpsc::UnboundedSender<JsonRpcMessage>>>>,
     pub acp_session_id: Option<String>,
@@ -403,7 +403,7 @@ impl AcpConnection {
             _proc: proc,
             child_pgid,
             stdin,
-            next_id: AtomicU64::new(1),
+            next_id: Arc::new(AtomicU64::new(1)),
             pending,
             notify_tx,
             acp_session_id: None,
@@ -632,6 +632,11 @@ impl AcpConnection {
     /// Return a clone of the stdin handle for lock-free cancel.
     pub fn cancel_handle(&self) -> Arc<Mutex<ChildStdin>> {
         Arc::clone(&self.stdin)
+    }
+
+    /// Return the request id allocator for lock-free side-channel writes.
+    pub fn request_id_allocator(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.next_id)
     }
 
     pub fn alive(&self) -> bool {

@@ -1,4 +1,5 @@
 /target
+**/target/
 gateway/target/
 config.toml
 *.swp
