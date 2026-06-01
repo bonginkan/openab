@@ -73,6 +73,21 @@ impl StatusReactionController {
         self.apply_immediate(&emoji).await;
     }
 
+    /// Record that the queued emoji was already applied by the caller.
+    ///
+    /// Batched dispatch adds 👀 to each message before creating the controller;
+    /// the controller still needs to know the anchor message's current status so
+    /// later transitions can remove or move that emoji correctly.
+    pub async fn track_existing_queued(&self) {
+        if !self.enabled {
+            return;
+        }
+        let mut inner = self.inner.lock().await;
+        if inner.current.is_empty() {
+            inner.current = inner.emojis.queued.clone();
+        }
+    }
+
     pub async fn set_thinking(&self) {
         if !self.enabled {
             return;
@@ -127,6 +142,34 @@ impl StatusReactionController {
                 .await;
             inner.current.clear();
         }
+    }
+
+    pub async fn move_to_message(&self, message: MessageRef) {
+        if !self.enabled {
+            return;
+        }
+
+        let mut inner = self.inner.lock().await;
+        if inner.finished
+            || (inner.message.channel == message.channel
+                && inner.message.message_id == message.message_id)
+        {
+            inner.message = message;
+            return;
+        }
+
+        let old_msg = inner.message.clone();
+        let current = inner.current.clone();
+        let adapter = inner.adapter.clone();
+        inner.message = message.clone();
+        drop(inner);
+
+        if current.is_empty() {
+            return;
+        }
+
+        let _ = adapter.add_reaction(&message, &current).await;
+        let _ = adapter.remove_reaction(&old_msg, &current).await;
     }
 
     async fn apply_immediate(&self, emoji: &str) {
@@ -272,5 +315,111 @@ fn cancel_timers(inner: &mut Inner) {
     }
     if let Some(h) = inner.stall_hard_handle.take() {
         h.abort();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::adapter::ChannelRef;
+    use anyhow::Result;
+    use async_trait::async_trait;
+
+    struct RecordingAdapter {
+        events: Arc<Mutex<Vec<(String, String, String)>>>,
+    }
+
+    #[async_trait]
+    impl ChatAdapter for RecordingAdapter {
+        fn platform(&self) -> &'static str {
+            "mock"
+        }
+
+        fn message_limit(&self) -> usize {
+            2000
+        }
+
+        async fn send_message(&self, channel: &ChannelRef, _content: &str) -> Result<MessageRef> {
+            Ok(MessageRef {
+                channel: channel.clone(),
+                message_id: "sent".into(),
+            })
+        }
+
+        async fn create_thread(
+            &self,
+            channel: &ChannelRef,
+            _trigger_msg: &MessageRef,
+            _title: &str,
+        ) -> Result<ChannelRef> {
+            Ok(channel.clone())
+        }
+
+        async fn add_reaction(&self, msg: &MessageRef, emoji: &str) -> Result<()> {
+            self.events.lock().await.push((
+                "add".into(),
+                msg.message_id.clone(),
+                emoji.to_string(),
+            ));
+            Ok(())
+        }
+
+        async fn remove_reaction(&self, msg: &MessageRef, emoji: &str) -> Result<()> {
+            self.events.lock().await.push((
+                "remove".into(),
+                msg.message_id.clone(),
+                emoji.to_string(),
+            ));
+            Ok(())
+        }
+
+        fn use_streaming(&self, _other_bot_present: bool) -> bool {
+            false
+        }
+    }
+
+    fn channel() -> ChannelRef {
+        ChannelRef {
+            platform: "mock".into(),
+            channel_id: "C".into(),
+            thread_id: Some("T".into()),
+            parent_id: None,
+            origin_event_id: None,
+        }
+    }
+
+    fn msg(id: &str) -> MessageRef {
+        MessageRef {
+            channel: channel(),
+            message_id: id.into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn move_to_message_transfers_current_reaction() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let adapter: Arc<dyn ChatAdapter> = Arc::new(RecordingAdapter {
+            events: events.clone(),
+        });
+        let ctrl = StatusReactionController::new(
+            true,
+            adapter,
+            msg("old"),
+            ReactionEmojis::default(),
+            ReactionTiming::default(),
+        );
+
+        ctrl.set_queued().await;
+        ctrl.move_to_message(msg("new")).await;
+
+        let events = events.lock().await.clone();
+        assert_eq!(
+            events,
+            vec![
+                ("add".to_string(), "old".to_string(), "👀".to_string()),
+                ("add".to_string(), "new".to_string(), "👀".to_string()),
+                ("remove".to_string(), "old".to_string(), "👀".to_string()),
+            ]
+        );
     }
 }

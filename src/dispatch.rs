@@ -23,6 +23,9 @@ use crate::config::ReactionsConfig;
 use crate::error_display::format_user_error;
 use crate::reactions::StatusReactionController;
 
+type InFlightSet = std::collections::HashSet<String>;
+type ActiveReactions = HashMap<String, Arc<StatusReactionController>>;
+
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
@@ -252,7 +255,10 @@ pub struct Dispatcher {
     /// `dispatch_batch`). Keyed by *session* key (`<platform>:<thread_id>`), not the
     /// dispatcher key, because the ACP session is shared per-thread across lanes.
     /// Only consulted when `immediate_steer` is on.
-    in_flight: Arc<Mutex<std::collections::HashSet<String>>>,
+    in_flight: Arc<Mutex<InFlightSet>>,
+    /// Active reaction controller per in-flight session. Used by mid-turn
+    /// steering to move status reactions to the newest triggering message.
+    active_reactions: Arc<Mutex<ActiveReactions>>,
 }
 
 impl Dispatcher {
@@ -275,7 +281,8 @@ impl Dispatcher {
             grouping,
             idle_timeout,
             immediate_steer: false,
-            in_flight: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            in_flight: Arc::new(Mutex::new(InFlightSet::new())),
+            active_reactions: Arc::new(Mutex::new(ActiveReactions::new())),
         }
     }
 
@@ -350,13 +357,14 @@ impl Dispatcher {
                 self.in_flight.lock().unwrap().contains(&session_key)
             };
             if in_flight {
-                // 👀 the steered message so the user sees it was picked up.
-                let _ = adapter
-                    .add_reaction(
-                        &msg.trigger_msg,
-                        &self.target.reactions_config().emojis.queued,
-                    )
-                    .await;
+                let active_reactions = {
+                    // SAFETY: no .await while this guard is held.
+                    self.active_reactions
+                        .lock()
+                        .unwrap()
+                        .get(&session_key)
+                        .cloned()
+                };
                 // Clone extra_blocks (may hold base64 image data) so `msg` stays
                 // intact for the fallback-to-buffered path if the steer write fails.
                 let blocks = AdapterRouter::pack_arrival_event(
@@ -366,6 +374,18 @@ impl Dispatcher {
                 );
                 match self.target.steer_prompt_blocks(&session_key, blocks).await {
                     Ok(()) => {
+                        if let Some(reactions) = active_reactions {
+                            reactions.move_to_message(msg.trigger_msg.clone()).await;
+                        } else {
+                            // The turn is in flight but the controller has not been
+                            // registered yet; still mark the steered message as picked up.
+                            let _ = adapter
+                                .add_reaction(
+                                    &msg.trigger_msg,
+                                    &self.target.reactions_config().emojis.queued,
+                                )
+                                .await;
+                        }
                         info!(
                             session_key = %session_key,
                             sender = %msg.sender_name,
@@ -418,6 +438,7 @@ impl Dispatcher {
                     max_tokens,
                     idle_timeout,
                     Arc::clone(&self.in_flight),
+                    Arc::clone(&self.active_reactions),
                 ));
                 ThreadHandle {
                     tx,
@@ -463,6 +484,7 @@ impl Dispatcher {
                         max_tokens,
                         idle_timeout,
                         Arc::clone(&self.in_flight),
+                        Arc::clone(&self.active_reactions),
                     ));
                     ThreadHandle {
                         tx,
@@ -595,12 +617,12 @@ impl Dispatcher {
 /// so the immediate-steer path in `submit` knows when a turn is running. Drop
 /// runs even if `dispatch_batch` panics, preventing a stuck in-flight flag.
 struct InFlightGuard {
-    set: Arc<Mutex<std::collections::HashSet<String>>>,
+    set: Arc<Mutex<InFlightSet>>,
     session_key: String,
 }
 
 impl InFlightGuard {
-    fn enter(set: &Arc<Mutex<std::collections::HashSet<String>>>, session_key: String) -> Self {
+    fn enter(set: &Arc<Mutex<InFlightSet>>, session_key: String) -> Self {
         // SAFETY: no .await while this guard is held.
         set.lock().unwrap().insert(session_key.clone());
         Self {
@@ -617,6 +639,43 @@ impl Drop for InFlightGuard {
     }
 }
 
+struct ActiveReactionGuard {
+    map: Arc<Mutex<ActiveReactions>>,
+    session_key: String,
+    reactions: Arc<StatusReactionController>,
+}
+
+impl ActiveReactionGuard {
+    fn enter(
+        map: &Arc<Mutex<ActiveReactions>>,
+        session_key: String,
+        reactions: Arc<StatusReactionController>,
+    ) -> Self {
+        // SAFETY: no .await while this guard is held.
+        map.lock()
+            .unwrap()
+            .insert(session_key.clone(), reactions.clone());
+        Self {
+            map: Arc::clone(map),
+            session_key,
+            reactions,
+        }
+    }
+}
+
+impl Drop for ActiveReactionGuard {
+    fn drop(&mut self) {
+        // SAFETY: no .await while this guard is held.
+        let mut map = self.map.lock().unwrap();
+        if let Some(current) = map.get(&self.session_key) {
+            if !Arc::ptr_eq(current, &self.reactions) {
+                return;
+            }
+            map.remove(&self.session_key);
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn consumer_loop(
     thread_key: String,
@@ -627,7 +686,8 @@ async fn consumer_loop(
     max_batch: usize,
     max_tokens: usize,
     idle_timeout: Duration,
-    in_flight: Arc<Mutex<std::collections::HashSet<String>>>,
+    in_flight: Arc<Mutex<InFlightSet>>,
+    active_reactions: Arc<Mutex<ActiveReactions>>,
 ) {
     // `pending` holds a message that exceeded the token cap for the current batch;
     // it becomes the first message of the next batch, preserving FIFO.
@@ -692,6 +752,7 @@ async fn consumer_loop(
             &adapter,
             batch,
             bot_present,
+            &active_reactions,
         )
         .await;
     }
@@ -708,6 +769,7 @@ async fn dispatch_batch(
     adapter: &Arc<dyn ChatAdapter>,
     batch: Vec<BufferedMessage>,
     other_bot_present: bool,
+    active_reactions: &Arc<Mutex<ActiveReactions>>,
 ) {
     let dispatch_start = Instant::now();
     let batch_size = batch.len();
@@ -761,7 +823,11 @@ async fn dispatch_batch(
         reactions_config.emojis.clone(),
         reactions_config.timing.clone(),
     ));
-    // 👀 already applied above; skip set_queued() to avoid double-reaction.
+    // 👀 already applied above; tell the controller so later transitions can
+    // remove or move the anchor reaction without issuing a duplicate add.
+    reactions.track_existing_queued().await;
+    let _active_reactions_guard =
+        ActiveReactionGuard::enter(active_reactions, session_key.clone(), reactions.clone());
 
     let result = target
         .stream_prompt_blocks(
@@ -1525,7 +1591,8 @@ mod tests {
             max_batch,
             max_tokens,
             Duration::from_secs(60),
-            Arc::new(Mutex::new(std::collections::HashSet::new())),
+            Arc::new(Mutex::new(InFlightSet::new())),
+            Arc::new(Mutex::new(ActiveReactions::new())),
         )
         .await;
 
@@ -1586,7 +1653,8 @@ mod tests {
             10,
             24_000,
             Duration::from_millis(50),
-            Arc::new(Mutex::new(std::collections::HashSet::new())),
+            Arc::new(Mutex::new(InFlightSet::new())),
+            Arc::new(Mutex::new(ActiveReactions::new())),
         ));
         // Wait enough for the timeout branch + a tick for the task to finish.
         tokio::time::sleep(Duration::from_millis(150)).await;
@@ -1781,8 +1849,7 @@ mod tests {
     // end-to-end without a manually seeded flag.
     #[tokio::test]
     async fn in_flight_guard_clears_after_dispatch() {
-        let set: Arc<Mutex<std::collections::HashSet<String>>> =
-            Arc::new(Mutex::new(std::collections::HashSet::new()));
+        let set: Arc<Mutex<InFlightSet>> = Arc::new(Mutex::new(InFlightSet::new()));
         {
             let _g = InFlightGuard::enter(&set, "mock:T".into());
             assert!(set.lock().unwrap().contains("mock:T"));

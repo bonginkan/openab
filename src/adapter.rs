@@ -1,7 +1,9 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::Serialize;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use tokio::sync::Mutex;
 use tracing::{error, warn};
 
 use crate::acp::{classify_notification, AcpEvent, ContentBlock, SessionPool};
@@ -278,6 +280,116 @@ pub struct AdapterRouter {
     prompt_hard_timeout: std::time::Duration,
     /// Polling cadence for the recv-loop liveness check (#732).
     liveness_check_interval: std::time::Duration,
+    /// Session keys whose next text chunk should start a new visible response
+    /// section because a mid-turn steer prompt was accepted.
+    pending_steer_separators: Arc<Mutex<HashSet<String>>>,
+    /// Streaming post controllers keyed by session. A mid-turn steer cannot move
+    /// a Discord message, so the controller creates a fresh active post after the
+    /// latest user message and points future edits at it.
+    active_posts: Arc<Mutex<HashMap<String, Arc<StreamingPostController>>>>,
+}
+
+struct StreamingPostInner {
+    adapter: Arc<dyn ChatAdapter>,
+    thread_channel: ChannelRef,
+    current_msg: MessageRef,
+    latest_display: String,
+}
+
+struct StreamingPostController {
+    inner: Mutex<StreamingPostInner>,
+}
+
+impl StreamingPostController {
+    fn new(
+        adapter: Arc<dyn ChatAdapter>,
+        thread_channel: ChannelRef,
+        current_msg: MessageRef,
+        initial_display: String,
+    ) -> Self {
+        Self {
+            inner: Mutex::new(StreamingPostInner {
+                adapter,
+                thread_channel,
+                current_msg,
+                latest_display: initial_display,
+            }),
+        }
+    }
+
+    async fn edit(&self, content: &str) {
+        let (adapter, msg) = {
+            let mut inner = self.inner.lock().await;
+            inner.latest_display = content.to_string();
+            (inner.adapter.clone(), inner.current_msg.clone())
+        };
+        let _ = adapter.edit_message(&msg, content).await;
+    }
+
+    async fn move_after_latest(&self) -> Result<()> {
+        let (adapter, thread_channel, old_msg, display) = {
+            let inner = self.inner.lock().await;
+            (
+                inner.adapter.clone(),
+                inner.thread_channel.clone(),
+                inner.current_msg.clone(),
+                inner.latest_display.clone(),
+            )
+        };
+
+        let new_msg = adapter.send_message(&thread_channel, &display).await?;
+        {
+            let mut inner = self.inner.lock().await;
+            inner.current_msg = new_msg;
+        }
+        if let Err(e) = adapter.delete_message(&old_msg).await {
+            tracing::warn!(error = ?e, "delete superseded streaming post failed");
+        }
+        Ok(())
+    }
+
+    async fn current_message(&self) -> MessageRef {
+        self.inner.lock().await.current_msg.clone()
+    }
+}
+
+struct ActivePostGuard {
+    map: Arc<Mutex<HashMap<String, Arc<StreamingPostController>>>>,
+    session_key: String,
+    controller: Arc<StreamingPostController>,
+}
+
+impl ActivePostGuard {
+    async fn enter(
+        map: Arc<Mutex<HashMap<String, Arc<StreamingPostController>>>>,
+        session_key: String,
+        controller: Arc<StreamingPostController>,
+    ) -> Self {
+        map.lock()
+            .await
+            .insert(session_key.clone(), controller.clone());
+        Self {
+            map,
+            session_key,
+            controller,
+        }
+    }
+}
+
+impl Drop for ActivePostGuard {
+    fn drop(&mut self) {
+        let map = self.map.clone();
+        let session_key = self.session_key.clone();
+        let controller = self.controller.clone();
+        tokio::spawn(async move {
+            let mut map = map.lock().await;
+            if let Some(current) = map.get(&session_key) {
+                if Arc::ptr_eq(current, &controller) {
+                    map.remove(&session_key);
+                }
+            }
+        });
+    }
 }
 
 impl AdapterRouter {
@@ -303,6 +415,8 @@ impl AdapterRouter {
             table_mode,
             prompt_hard_timeout: std::time::Duration::from_secs(prompt_hard_timeout_secs),
             liveness_check_interval: std::time::Duration::from_secs(liveness_check_secs),
+            pending_steer_separators: Arc::new(Mutex::new(HashSet::new())),
+            active_posts: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -441,7 +555,28 @@ impl AdapterRouter {
         thread_key: &str,
         content_blocks: Vec<ContentBlock>,
     ) -> Result<()> {
-        self.pool.steer_session(thread_key, &content_blocks).await
+        {
+            let mut pending = self.pending_steer_separators.lock().await;
+            pending.insert(thread_key.to_string());
+        }
+
+        if let Err(e) = self.pool.steer_session(thread_key, &content_blocks).await {
+            let mut pending = self.pending_steer_separators.lock().await;
+            pending.remove(thread_key);
+            return Err(e);
+        }
+
+        let active_post = {
+            let posts = self.active_posts.lock().await;
+            posts.get(thread_key).cloned()
+        };
+        if let Some(post) = active_post {
+            if let Err(e) = post.move_after_latest().await {
+                warn!(error = ?e, "failed to move streaming post after latest message");
+            }
+        }
+
+        Ok(())
     }
 
     async fn stream_prompt(
@@ -484,6 +619,10 @@ impl AdapterRouter {
         let tool_display = self.reactions_config.tool_display;
         let prompt_hard_timeout = self.prompt_hard_timeout;
         let liveness_check_interval = self.liveness_check_interval;
+        let pending_steer_separators = self.pending_steer_separators.clone();
+        let thread_key_for_separator = thread_key.to_string();
+        let active_posts = self.active_posts.clone();
+        let thread_key_for_post = thread_key.to_string();
 
         self.pool
             .with_connection(thread_key, |conn| {
@@ -503,7 +642,7 @@ impl AdapterRouter {
                     }
 
                     // Streaming edit: send placeholder, spawn edit loop
-                    let (buf_tx, placeholder_msg) = if streaming {
+                    let (buf_tx, placeholder_post, _active_post_guard) = if streaming {
                         let initial = if reset {
                             "⚠️ _Session expired, starting fresh..._\n\n…".to_string()
                         } else {
@@ -511,8 +650,19 @@ impl AdapterRouter {
                         };
                         let msg = adapter.send_message(&thread_channel, &initial).await?;
                         let (tx, rx) = tokio::sync::watch::channel(initial);
-                        let edit_adapter = adapter.clone();
-                        let edit_msg = msg.clone();
+                        let post = Arc::new(StreamingPostController::new(
+                            adapter.clone(),
+                            thread_channel.clone(),
+                            msg,
+                            rx.borrow().clone(),
+                        ));
+                        let active_post_guard = ActivePostGuard::enter(
+                            active_posts.clone(),
+                            thread_key_for_post.clone(),
+                            post.clone(),
+                        )
+                        .await;
+                        let placeholder_post = active_post_guard.controller.clone();
                         let limit = message_limit;
                         let mut buf_rx = rx;
                         tokio::spawn(async move {
@@ -530,8 +680,7 @@ impl AdapterRouter {
                                         } else {
                                             content.clone()
                                         };
-                                        let _ =
-                                            edit_adapter.edit_message(&edit_msg, &display).await;
+                                        post.edit(&display).await;
                                         last = content;
                                     }
                                 }
@@ -540,9 +689,9 @@ impl AdapterRouter {
                                 }
                             }
                         });
-                        (Some(tx), Some(msg))
+                        (Some(tx), Some(placeholder_post), Some(active_post_guard))
                     } else {
-                        (None, None)
+                        (None, None, None)
                     };
 
                     // (#732) Liveness-aware recv loop. Filters stale id-bearing
@@ -592,7 +741,11 @@ impl AdapterRouter {
                         if let Some(event) = classify_notification(&notification) {
                             match event {
                                 AcpEvent::Text(t) => {
-                                    text_buf.push_str(&t);
+                                    let separate = {
+                                        let mut pending = pending_steer_separators.lock().await;
+                                        pending.remove(&thread_key_for_separator)
+                                    };
+                                    append_text_chunk(&mut text_buf, &t, separate);
                                     if let Some(tx) = &buf_tx {
                                         let _ = tx.send(compose_display(
                                             &tool_lines,
@@ -690,10 +843,11 @@ impl AdapterRouter {
 
                     let final_content = markdown::convert_tables(&final_content, table_mode);
                     let chunks = format::split_message(&final_content, message_limit);
-                    if let Some(msg) = placeholder_msg {
+                    if let Some(post) = placeholder_post {
                         if let Some(ref reply_id) = directives.reply_to {
                             // reply_to directive: send reply first, then delete placeholder.
                             // Only delete if send succeeds — preserves placeholder on failure.
+                            let msg = post.current_message().await;
                             let mut send_ok = false;
                             let mut first = true;
                             for chunk in &chunks {
@@ -721,7 +875,7 @@ impl AdapterRouter {
                         } else {
                             // Normal streaming: edit first chunk into placeholder, send rest
                             if let Some(first) = chunks.first() {
-                                let _ = adapter.edit_message(&msg, first).await;
+                                post.edit(first).await;
                             }
                             for chunk in chunks.iter().skip(1) {
                                 let _ = adapter.send_message(&thread_channel, chunk).await;
@@ -753,6 +907,24 @@ impl AdapterRouter {
                 })
             })
             .await
+    }
+}
+
+fn append_text_chunk(text_buf: &mut String, chunk: &str, separate_response: bool) {
+    if separate_response {
+        ensure_response_separator(text_buf, chunk);
+    }
+    text_buf.push_str(chunk);
+}
+
+fn ensure_response_separator(text_buf: &mut String, next_chunk: &str) {
+    if text_buf.is_empty() || next_chunk.starts_with('\n') || text_buf.ends_with("\n\n") {
+        return;
+    }
+    if text_buf.ends_with('\n') {
+        text_buf.push('\n');
+    } else {
+        text_buf.push_str("\n\n");
     }
 }
 
@@ -1058,6 +1230,27 @@ mod tests {
         )];
         let out = compose_display(&tools, "response text", false, ToolDisplay::None);
         assert_eq!(out, "response text");
+    }
+
+    #[test]
+    fn append_text_chunk_separates_steered_response() {
+        let mut text = "first response".to_string();
+        append_text_chunk(&mut text, "second response", true);
+        assert_eq!(text, "first response\n\nsecond response");
+    }
+
+    #[test]
+    fn append_text_chunk_does_not_separate_normal_stream_delta() {
+        let mut text = "first".to_string();
+        append_text_chunk(&mut text, " response", false);
+        assert_eq!(text, "first response");
+    }
+
+    #[test]
+    fn append_text_chunk_preserves_chunk_leading_newline() {
+        let mut text = "first response".to_string();
+        append_text_chunk(&mut text, "\nsecond response", true);
+        assert_eq!(text, "first response\nsecond response");
     }
 }
 
