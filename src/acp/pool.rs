@@ -356,6 +356,47 @@ impl SessionPool {
         Ok(())
     }
 
+    /// Forward a steer prompt to a session's agent without locking the connection.
+    ///
+    /// Writes a `session/prompt` request directly to the agent's stdin via the same
+    /// lock-free `cancel_handles` path `cancel_session` uses. This lets a steer reach
+    /// the agent while a turn is in flight — `with_connection` holds the per-connection
+    /// `Mutex` for the entire turn, so the steer prompt cannot go through that path
+    /// concurrently. The patched codex-acp fork injects the prompt into the running
+    /// turn instead of starting a new one.
+    ///
+    /// The request id is intentionally not tracked here: the running turn owns the
+    /// connection's notify subscriber, so the steer's response/notifications are
+    /// surfaced through the in-flight turn's stream rather than a separate receiver.
+    pub async fn steer_session(
+        &self,
+        thread_id: &str,
+        content_blocks: &[crate::acp::ContentBlock],
+    ) -> Result<()> {
+        let (stdin, session_id) = {
+            let state = self.state.read().await;
+            state
+                .cancel_handles
+                .get(thread_id)
+                .cloned()
+                .ok_or_else(|| anyhow!("no session for thread {thread_id}"))?
+        };
+        let prompt_json: Vec<serde_json::Value> =
+            content_blocks.iter().map(|b| b.to_json()).collect();
+        let data = serde_json::to_string(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "session/prompt",
+            "params": {"sessionId": session_id, "prompt": prompt_json},
+        }))?;
+        tracing::info!(session_id, "sending mid-turn steer session/prompt");
+        use tokio::io::AsyncWriteExt;
+        let mut w = stdin.lock().await;
+        w.write_all(data.as_bytes()).await?;
+        w.write_all(b"\n").await?;
+        w.flush().await?;
+        Ok(())
+    }
+
     /// Reset a session: cancel any in-flight operation, remove the active connection,
     /// and clear all suspended state. The ACP process will be killed once the last
     /// Arc reference is dropped (after streaming finishes). The next message will

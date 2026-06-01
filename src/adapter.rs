@@ -424,6 +424,21 @@ impl AdapterRouter {
         result
     }
 
+    /// Forward a steer prompt to the in-flight turn's session without taking the
+    /// per-connection mutex. Used by the dispatcher's immediate-steer path: the
+    /// running turn holds the connection lock for its whole duration, so the steer
+    /// is written straight to the agent's stdin (lock-free) and the patched
+    /// codex-acp fork injects it into the running turn. The steer's output streams
+    /// back through the in-flight turn's subscriber, so there is no separate recv
+    /// loop or reaction lifecycle here.
+    pub async fn steer_prompt_blocks(
+        &self,
+        thread_key: &str,
+        content_blocks: Vec<ContentBlock>,
+    ) -> Result<()> {
+        self.pool.steer_session(thread_key, &content_blocks).await
+    }
+
     async fn stream_prompt(
         &self,
         adapter: &Arc<dyn ChatAdapter>,

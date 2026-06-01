@@ -83,6 +83,32 @@ pub struct Config {
     pub cron: CronConfig,
     #[serde(default)]
     pub hooks: HooksConfig,
+    #[serde(default)]
+    pub steering: SteeringConfig,
+}
+
+/// Mid-turn steering controls.
+///
+/// When `immediate_steer` is off (default) the dispatcher preserves invariant I2
+/// (at most one in-flight ACP turn per thread): a message arriving while a turn is
+/// in flight is buffered and dispatched in the next turn (see
+/// `docs/adr/turn-boundary-batching.md`).
+///
+/// When `immediate_steer` is on, a normal message arriving while a turn is in flight
+/// is forwarded straight to the agent as an additional `session/prompt` *concurrent*
+/// with the running turn, instead of being buffered. The patched codex-acp fork
+/// injects that prompt into the running turn (steering) rather than starting a new
+/// turn. The forwarded prompt is written via the lock-free stdin handle (the same
+/// path `/cancel` uses) so it reaches the agent while the running turn still holds
+/// the per-connection mutex. Requires an agent adapter that supports mid-turn
+/// steering — on agents that do not, the extra prompt is queued by the agent and
+/// handled after the current turn, which is harmless but not true steering.
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+pub struct SteeringConfig {
+    /// Forward an in-flight-arriving message immediately as a steer prompt instead
+    /// of buffering it for the next turn. Default: false (I2 batching preserved).
+    #[serde(default)]
+    pub immediate_steer: bool,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -962,6 +988,31 @@ command = "echo"
         let gw = cfg.gateway.unwrap();
         // explicit flag overrides non-empty list
         assert!(resolve_allow_all(gw.allow_all_users, &gw.allowed_users));
+    }
+
+    #[test]
+    fn immediate_steer_defaults_to_false() {
+        let cfg = parse_config(MINIMAL_TOML, "test").unwrap();
+        assert!(
+            !cfg.steering.immediate_steer,
+            "immediate_steer should default to false"
+        );
+    }
+
+    #[test]
+    fn immediate_steer_parses_true() {
+        let toml = r#"
+[discord]
+bot_token = "t"
+
+[agent]
+command = "echo"
+
+[steering]
+immediate_steer = true
+"#;
+        let cfg = parse_config(toml, "test").unwrap();
+        assert!(cfg.steering.immediate_steer);
     }
 
     #[test]

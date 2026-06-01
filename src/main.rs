@@ -136,6 +136,10 @@ async fn main() -> anyhow::Result<()> {
     }
     let shutdown_hook = cfg.hooks.pre_shutdown.clone();
 
+    // Immediate-steer applies to every adapter's dispatcher; capture it before
+    // `cfg` fields are moved into the per-adapter setup below.
+    let immediate_steer = cfg.steering.immediate_steer;
+
     let pool = Arc::new(acp::SessionPool::new(cfg.agent, cfg.pool.max_sessions));
     let ttl_secs = cfg.pool.session_ttl_hours * 3600;
 
@@ -244,13 +248,16 @@ async fn main() -> anyhow::Result<()> {
             &slack_cfg.message_processing_mode,
             slack_cfg.max_buffered_messages,
         );
-        let slack_dispatcher = Arc::new(dispatch::Dispatcher::with_idle_timeout(
-            router.clone(),
-            slack_cap,
-            slack_cfg.max_batch_tokens,
-            slack_grouping,
-            slack_idle,
-        ));
+        let slack_dispatcher = Arc::new(
+            dispatch::Dispatcher::with_idle_timeout(
+                router.clone(),
+                slack_cap,
+                slack_cfg.max_batch_tokens,
+                slack_grouping,
+                slack_idle,
+            )
+            .with_immediate_steer(immediate_steer),
+        );
         dispatchers.lock().unwrap().push(slack_dispatcher.clone());
         Some(tokio::spawn(async move {
             if let Err(e) = slack::run_slack_adapter(
@@ -286,13 +293,16 @@ async fn main() -> anyhow::Result<()> {
             &gw_cfg.message_processing_mode,
             gw_cfg.max_buffered_messages,
         );
-        let gw_dispatcher = Arc::new(dispatch::Dispatcher::with_idle_timeout(
-            router.clone(),
-            gw_cap,
-            gw_cfg.max_batch_tokens,
-            gw_grouping,
-            gw_idle,
-        ));
+        let gw_dispatcher = Arc::new(
+            dispatch::Dispatcher::with_idle_timeout(
+                router.clone(),
+                gw_cap,
+                gw_cfg.max_batch_tokens,
+                gw_grouping,
+                gw_idle,
+            )
+            .with_immediate_steer(immediate_steer),
+        );
         dispatchers.lock().unwrap().push(gw_dispatcher.clone());
         let params = gateway::GatewayParams {
             url: gw_cfg.url,
@@ -408,13 +418,16 @@ async fn main() -> anyhow::Result<()> {
             &discord_cfg.message_processing_mode,
             discord_cfg.max_buffered_messages,
         );
-        let discord_dispatcher = Arc::new(dispatch::Dispatcher::with_idle_timeout(
-            router.clone(),
-            discord_cap,
-            discord_cfg.max_batch_tokens,
-            discord_grouping,
-            discord_idle,
-        ));
+        let discord_dispatcher = Arc::new(
+            dispatch::Dispatcher::with_idle_timeout(
+                router.clone(),
+                discord_cap,
+                discord_cfg.max_batch_tokens,
+                discord_grouping,
+                discord_idle,
+            )
+            .with_immediate_steer(immediate_steer),
+        );
         dispatchers.lock().unwrap().push(discord_dispatcher.clone());
 
         // Initialize reminder store (persists to $HOME/.openab/reminders.json)

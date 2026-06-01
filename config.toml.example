@@ -73,8 +73,11 @@ working_dir = "/home/agent"
 # inherit_env = ["API_BASE_URL", "MODEL_NAME"]
 
 # [agent]
-# command = "codex"
-# args = ["--acp"]
+# # Local patched fork of codex-acp with mid-turn steering support, built via
+# # `cargo build` at /Users/thepioneer/Documents/GitHub/codex-acp. Point the codex
+# # command at the built binary so this local OpenAB uses the patched adapter.
+# command = "/Users/thepioneer/Documents/GitHub/codex-acp/target/debug/codex-acp"
+# args = []
 # working_dir = "/home/node"
 # env = { OPENAI_API_KEY = "${OPENAI_API_KEY}" }
 
@@ -129,6 +132,16 @@ session_ttl_hours = 24
 # prompt_hard_timeout_secs = 1800
 # Liveness-check cadence (sec) for the recv loop; see #732. Default: 30.
 # liveness_check_secs = 30
+
+# [steering]
+# immediate_steer = false   # false (default): a message arriving while a turn is
+#                           #   in flight is buffered and dispatched in the next turn
+#                           #   (invariant I2; see docs/adr/turn-boundary-batching.md).
+#                           # true: forward such a message straight to the agent as an
+#                           #   additional session/prompt, concurrent with the running
+#                           #   turn. The patched codex-acp fork injects it into the
+#                           #   running turn (mid-turn steering) instead of starting a
+#                           #   new one. Requires an agent that supports steering.
 
 [markdown]
 tables = "code"  # "code" (default) | "bullets" | "off"

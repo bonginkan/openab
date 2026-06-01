@@ -37,6 +37,24 @@ args = []
 working_dir = "/home/node"
 ```
 
+### Local patched fork (mid-turn steering)
+
+A patched fork of codex-acp adds true mid-turn steering: a `session/prompt` sent
+while a turn is running is injected into the running turn instead of starting a new
+one. To run OpenAB against the locally built fork, point the codex command at the
+built binary:
+
+```toml
+[agent]
+command = "/Users/thepioneer/Documents/GitHub/codex-acp/target/debug/codex-acp"
+args = []
+working_dir = "/home/node"
+```
+
+Build it with `cargo build` in `/Users/thepioneer/Documents/GitHub/codex-acp`.
+Pair this with `[steering] immediate_steer = true` (see config-reference) so OpenAB
+forwards in-flight-arriving messages straight through as steer prompts.
+
 ## Authentication
 
 ```bash

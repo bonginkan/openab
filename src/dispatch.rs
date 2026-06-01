@@ -131,6 +131,14 @@ pub trait DispatchTarget: Send + Sync + 'static {
         reactions: Arc<StatusReactionController>,
         other_bot_present: bool,
     ) -> Result<()>;
+
+    /// Forward a steer prompt to a session's in-flight turn without serializing
+    /// behind the per-connection turn mutex. Used by the immediate-steer path.
+    async fn steer_prompt_blocks(
+        &self,
+        session_key: &str,
+        content_blocks: Vec<ContentBlock>,
+    ) -> Result<()>;
 }
 
 #[async_trait]
@@ -162,6 +170,14 @@ impl DispatchTarget for AdapterRouter {
             other_bot_present,
         )
         .await
+    }
+
+    async fn steer_prompt_blocks(
+        &self,
+        session_key: &str,
+        content_blocks: Vec<ContentBlock>,
+    ) -> Result<()> {
+        AdapterRouter::steer_prompt_blocks(self, session_key, content_blocks).await
     }
 }
 
@@ -228,6 +244,15 @@ pub struct Dispatcher {
     max_batch_tokens: usize,
     grouping: BatchGrouping,
     idle_timeout: Duration,
+    /// When true, a message arriving while a turn is in flight for its thread is
+    /// forwarded immediately as a steer prompt (concurrent with the running turn)
+    /// rather than buffered for the next turn. Default off — see `SteeringConfig`.
+    immediate_steer: bool,
+    /// Session keys with a turn currently in flight (set by `consumer_loop` around
+    /// `dispatch_batch`). Keyed by *session* key (`<platform>:<thread_id>`), not the
+    /// dispatcher key, because the ACP session is shared per-thread across lanes.
+    /// Only consulted when `immediate_steer` is on.
+    in_flight: Arc<Mutex<std::collections::HashSet<String>>>,
 }
 
 impl Dispatcher {
@@ -249,7 +274,18 @@ impl Dispatcher {
             max_batch_tokens,
             grouping,
             idle_timeout,
+            immediate_steer: false,
+            in_flight: Arc::new(Mutex::new(std::collections::HashSet::new())),
         }
+    }
+
+    /// Enable immediate-steer mode on this dispatcher (builder style). When set,
+    /// a message arriving while a turn is in flight for its thread is forwarded
+    /// straight to the agent as a steer prompt instead of being buffered (see
+    /// `SteeringConfig::immediate_steer`).
+    pub fn with_immediate_steer(mut self, enabled: bool) -> Self {
+        self.immediate_steer = enabled;
+        self
     }
 
     /// Build the dispatcher key for a (platform, thread, sender) tuple.
@@ -302,6 +338,53 @@ impl Dispatcher {
         let max_tokens = self.max_batch_tokens;
         let idle_timeout = self.idle_timeout;
 
+        // Immediate-steer fast path: if a turn is already in flight for this
+        // thread's session, forward the message straight to the agent as a steer
+        // prompt (concurrent with the running turn) instead of buffering it for
+        // the next turn. When the flag is off this branch is never taken and the
+        // I2 batching path below is unchanged.
+        if self.immediate_steer {
+            let session_key = Dispatcher::session_key(&thread_channel);
+            let in_flight = {
+                // SAFETY: no .await while this guard is held.
+                self.in_flight.lock().unwrap().contains(&session_key)
+            };
+            if in_flight {
+                // 👀 the steered message so the user sees it was picked up.
+                let _ = adapter
+                    .add_reaction(&msg.trigger_msg, &self.target.reactions_config().emojis.queued)
+                    .await;
+                // Clone extra_blocks (may hold base64 image data) so `msg` stays
+                // intact for the fallback-to-buffered path if the steer write fails.
+                let blocks = AdapterRouter::pack_arrival_event(
+                    &msg.sender_json,
+                    &msg.prompt,
+                    msg.extra_blocks.clone(),
+                );
+                match self.target.steer_prompt_blocks(&session_key, blocks).await {
+                    Ok(()) => {
+                        info!(
+                            session_key = %session_key,
+                            sender = %msg.sender_name,
+                            "forwarded in-flight message as mid-turn steer prompt"
+                        );
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        // Steer failed (e.g. no cancel handle yet, or the turn just
+                        // ended between the in_flight check and this write). Fall
+                        // through to the normal buffered path so the message is not
+                        // lost — it will dispatch in the next turn.
+                        warn!(
+                            session_key = %session_key,
+                            error = %e,
+                            "mid-turn steer failed; falling back to buffered dispatch"
+                        );
+                    }
+                }
+            }
+        }
+
         // Pre-fetch a generation in case we end up inserting a fresh handle.
         // Wasted if the entry already exists; generations need only be monotonic.
         let next_g = self.next_generation.fetch_add(1, Ordering::Relaxed);
@@ -331,6 +414,7 @@ impl Dispatcher {
                     cap,
                     max_tokens,
                     idle_timeout,
+                    Arc::clone(&self.in_flight),
                 ));
                 ThreadHandle {
                     tx,
@@ -375,6 +459,7 @@ impl Dispatcher {
                         cap,
                         max_tokens,
                         idle_timeout,
+                        Arc::clone(&self.in_flight),
                     ));
                     ThreadHandle {
                         tx,
@@ -503,6 +588,32 @@ impl Dispatcher {
 // consumer_loop
 // ---------------------------------------------------------------------------
 
+/// RAII guard: marks a session in-flight on construction and clears it on drop,
+/// so the immediate-steer path in `submit` knows when a turn is running. Drop
+/// runs even if `dispatch_batch` panics, preventing a stuck in-flight flag.
+struct InFlightGuard {
+    set: Arc<Mutex<std::collections::HashSet<String>>>,
+    session_key: String,
+}
+
+impl InFlightGuard {
+    fn enter(set: &Arc<Mutex<std::collections::HashSet<String>>>, session_key: String) -> Self {
+        // SAFETY: no .await while this guard is held.
+        set.lock().unwrap().insert(session_key.clone());
+        Self {
+            set: Arc::clone(set),
+            session_key,
+        }
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        // SAFETY: no .await while this guard is held.
+        self.set.lock().unwrap().remove(&self.session_key);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn consumer_loop(
     thread_key: String,
@@ -513,6 +624,7 @@ async fn consumer_loop(
     max_batch: usize,
     max_tokens: usize,
     idle_timeout: Duration,
+    in_flight: Arc<Mutex<std::collections::HashSet<String>>>,
 ) {
     // `pending` holds a message that exceeded the token cap for the current batch;
     // it becomes the first message of the next batch, preserving FIFO.
@@ -564,6 +676,11 @@ async fn consumer_loop(
 
         // §2.6: read the freshest snapshot in the batch (batch is non-empty).
         let bot_present = batch.last().unwrap().other_bot_present;
+
+        // Mark this thread's session in-flight for the duration of the turn so
+        // `submit`'s immediate-steer path can detect it and forward concurrent
+        // arrivals as steer prompts. Cleared on guard drop (incl. panic).
+        let _guard = InFlightGuard::enter(&in_flight, Dispatcher::session_key(&thread_channel));
 
         dispatch_batch(
             &thread_key,
@@ -1236,10 +1353,14 @@ mod tests {
     struct MockDispatchTarget {
         reactions: ReactionsConfig,
         calls: Mutex<Vec<RecordedDispatch>>,
+        /// Block counts of recorded `steer_prompt_blocks` invocations.
+        steers: Mutex<Vec<usize>>,
         /// If set, `ensure_session` returns this error once.
         ensure_err: Mutex<Option<String>>,
         /// If set, `stream_prompt_blocks` returns this error once.
         stream_err: Mutex<Option<String>>,
+        /// If set, `steer_prompt_blocks` returns this error once.
+        steer_err: Mutex<Option<String>>,
     }
 
     impl MockDispatchTarget {
@@ -1247,13 +1368,19 @@ mod tests {
             Self {
                 reactions: ReactionsConfig::default(),
                 calls: Mutex::new(Vec::new()),
+                steers: Mutex::new(Vec::new()),
                 ensure_err: Mutex::new(None),
                 stream_err: Mutex::new(None),
+                steer_err: Mutex::new(None),
             }
         }
 
         fn calls(&self) -> Vec<RecordedDispatch> {
             self.calls.lock().unwrap().clone()
+        }
+
+        fn steers(&self) -> Vec<usize> {
+            self.steers.lock().unwrap().clone()
         }
     }
 
@@ -1284,6 +1411,18 @@ mod tests {
                 other_bot_present,
             });
             if let Some(msg) = self.stream_err.lock().unwrap().take() {
+                return Err(anyhow::anyhow!(msg));
+            }
+            Ok(())
+        }
+
+        async fn steer_prompt_blocks(
+            &self,
+            _session_key: &str,
+            content_blocks: Vec<ContentBlock>,
+        ) -> Result<()> {
+            self.steers.lock().unwrap().push(content_blocks.len());
+            if let Some(msg) = self.steer_err.lock().unwrap().take() {
                 return Err(anyhow::anyhow!(msg));
             }
             Ok(())
@@ -1383,6 +1522,7 @@ mod tests {
             max_batch,
             max_tokens,
             Duration::from_secs(60),
+            Arc::new(Mutex::new(std::collections::HashSet::new())),
         )
         .await;
 
@@ -1443,6 +1583,7 @@ mod tests {
             10,
             24_000,
             Duration::from_millis(50),
+            Arc::new(Mutex::new(std::collections::HashSet::new())),
         ));
         // Wait enough for the timeout branch + a tick for the task to finish.
         tokio::time::sleep(Duration::from_millis(150)).await;
@@ -1505,5 +1646,144 @@ mod tests {
         assert_eq!(calls[0].block_count, 2);
 
         parked.abort();
+    }
+
+    // -----------------------------------------------------------------------
+    // Immediate-steer mode
+    // -----------------------------------------------------------------------
+
+    fn steer_dispatcher(mock: Arc<MockDispatchTarget>, enabled: bool) -> Dispatcher {
+        let target: Arc<dyn DispatchTarget> = mock;
+        Dispatcher::with_idle_timeout(
+            target,
+            10,
+            24_000,
+            BatchGrouping::Thread,
+            DEFAULT_CONSUMER_IDLE_TIMEOUT,
+        )
+        .with_immediate_steer(enabled)
+    }
+
+    // When immediate-steer is ON and a turn is in flight for the thread's session,
+    // submit forwards the message as a steer prompt (no buffering, no new turn).
+    #[tokio::test]
+    async fn submit_steers_when_in_flight_and_enabled() {
+        let mock = Arc::new(MockDispatchTarget::new());
+        let d = steer_dispatcher(mock.clone(), true);
+        let adapter: Arc<dyn ChatAdapter> = Arc::new(MockChatAdapter);
+
+        // Manufacture the in-flight state for the session key the channel maps to.
+        let session_key = Dispatcher::session_key(&make_channel("T"));
+        d.in_flight.lock().unwrap().insert(session_key);
+
+        d.submit(
+            "mock:T".into(),
+            make_channel("T"),
+            adapter,
+            make_msg("steer me", 10),
+        )
+        .await
+        .expect("submit should succeed via steer path");
+
+        // Steer recorded; no batched dispatch (no consumer spawned).
+        let steers = mock.steers();
+        assert_eq!(steers.len(), 1, "expected one steer prompt");
+        // delimiter + prompt = 2 blocks.
+        assert_eq!(steers[0], 2);
+        assert!(
+            mock.calls().is_empty(),
+            "steer must not start a batched turn"
+        );
+    }
+
+    // When immediate-steer is OFF, an in-flight session still buffers (I2 preserved).
+    #[tokio::test]
+    async fn submit_buffers_when_in_flight_but_steer_disabled() {
+        let mock = Arc::new(MockDispatchTarget::new());
+        let d = steer_dispatcher(mock.clone(), false);
+        let adapter: Arc<dyn ChatAdapter> = Arc::new(MockChatAdapter);
+
+        // Even if a session were marked in-flight, the disabled flag means submit
+        // never consults it and follows the buffered path (spawns a consumer).
+        let session_key = Dispatcher::session_key(&make_channel("T"));
+        d.in_flight.lock().unwrap().insert(session_key);
+
+        d.submit(
+            "mock:T".into(),
+            make_channel("T"),
+            adapter,
+            make_msg("buffer me", 10),
+        )
+        .await
+        .expect("submit should buffer");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        assert!(mock.steers().is_empty(), "steer must not fire when disabled");
+        assert_eq!(mock.calls().len(), 1, "message should dispatch as a turn");
+    }
+
+    // When immediate-steer is ON but no turn is in flight, submit takes the normal
+    // buffered path (the first message after idle still starts a turn — I1).
+    #[tokio::test]
+    async fn submit_buffers_when_enabled_but_idle() {
+        let mock = Arc::new(MockDispatchTarget::new());
+        let d = steer_dispatcher(mock.clone(), true);
+        let adapter: Arc<dyn ChatAdapter> = Arc::new(MockChatAdapter);
+
+        d.submit(
+            "mock:T".into(),
+            make_channel("T"),
+            adapter,
+            make_msg("first", 10),
+        )
+        .await
+        .expect("submit should buffer");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        assert!(mock.steers().is_empty(), "no steer when not in flight");
+        assert_eq!(mock.calls().len(), 1, "idle message starts a turn");
+    }
+
+    // Steer write failure falls back to the buffered path so the message survives.
+    #[tokio::test]
+    async fn submit_falls_back_to_buffer_when_steer_errors() {
+        let mock = Arc::new(MockDispatchTarget::new());
+        *mock.steer_err.lock().unwrap() = Some("stdin closed".into());
+        let d = steer_dispatcher(mock.clone(), true);
+        let adapter: Arc<dyn ChatAdapter> = Arc::new(MockChatAdapter);
+
+        let session_key = Dispatcher::session_key(&make_channel("T"));
+        d.in_flight.lock().unwrap().insert(session_key);
+
+        d.submit(
+            "mock:T".into(),
+            make_channel("T"),
+            adapter,
+            make_msg("steer or buffer", 10),
+        )
+        .await
+        .expect("submit should fall back to buffer on steer error");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // One steer attempt was made, then the message was buffered + dispatched.
+        assert_eq!(mock.steers().len(), 1, "one failed steer attempt");
+        assert_eq!(mock.calls().len(), 1, "fallback buffered dispatch");
+    }
+
+    // The InFlightGuard set/clear contract: consumer_loop marks the session
+    // in-flight during dispatch and clears it after, so steer detection works
+    // end-to-end without a manually seeded flag.
+    #[tokio::test]
+    async fn in_flight_guard_clears_after_dispatch() {
+        let set: Arc<Mutex<std::collections::HashSet<String>>> =
+            Arc::new(Mutex::new(std::collections::HashSet::new()));
+        {
+            let _g = InFlightGuard::enter(&set, "mock:T".into());
+            assert!(set.lock().unwrap().contains("mock:T"));
+        }
+        assert!(
+            set.lock().unwrap().is_empty(),
+            "guard drop must clear the flag"
+        );
     }
 }

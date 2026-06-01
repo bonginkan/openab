@@ -87,7 +87,12 @@ pub fn generate_config(
             let (command, args): (&str, Vec<String>) = match agent_command {
                 "kiro" => ("kiro-cli", vec!["acp".into(), "--trust-all-tools".into()]),
                 "claude" => ("claude-agent-acp", vec![]),
-                "codex" => ("codex-acp", vec![]),
+                // Local patched fork of codex-acp (mid-turn steering support),
+                // built at /Users/thepioneer/Documents/GitHub/codex-acp.
+                "codex" => (
+                    "/Users/thepioneer/Documents/GitHub/codex-acp/target/debug/codex-acp",
+                    vec![],
+                ),
                 "gemini" => ("gemini", vec!["--acp".into()]),
                 other => (other, vec![]),
             };
