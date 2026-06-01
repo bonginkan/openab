@@ -578,14 +578,21 @@ mod tests {
     fn persisted_mapping_can_include_active_and_suspended_sessions() {
         let persisted = HashMap::from([
             ("active-thread".to_string(), "session-active".to_string()),
-            ("suspended-thread".to_string(), "session-suspended".to_string()),
+            (
+                "suspended-thread".to_string(),
+                "session-suspended".to_string(),
+            ),
         ]);
 
-        let serialized = serde_json::to_string_pretty(&persisted).expect("serialize persisted mapping");
+        let serialized =
+            serde_json::to_string_pretty(&persisted).expect("serialize persisted mapping");
         let roundtrip: HashMap<String, String> =
             serde_json::from_str(&serialized).expect("deserialize persisted mapping");
 
-        assert_eq!(roundtrip.get("active-thread"), Some(&"session-active".to_string()));
+        assert_eq!(
+            roundtrip.get("active-thread"),
+            Some(&"session-active".to_string())
+        );
         assert_eq!(
             roundtrip.get("suspended-thread"),
             Some(&"session-suspended".to_string())

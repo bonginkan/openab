@@ -352,7 +352,10 @@ impl Dispatcher {
             if in_flight {
                 // 👀 the steered message so the user sees it was picked up.
                 let _ = adapter
-                    .add_reaction(&msg.trigger_msg, &self.target.reactions_config().emojis.queued)
+                    .add_reaction(
+                        &msg.trigger_msg,
+                        &self.target.reactions_config().emojis.queued,
+                    )
                     .await;
                 // Clone extra_blocks (may hold base64 image data) so `msg` stays
                 // intact for the fallback-to-buffered path if the steer write fails.
@@ -1718,7 +1721,10 @@ mod tests {
         .expect("submit should buffer");
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        assert!(mock.steers().is_empty(), "steer must not fire when disabled");
+        assert!(
+            mock.steers().is_empty(),
+            "steer must not fire when disabled"
+        );
         assert_eq!(mock.calls().len(), 1, "message should dispatch as a turn");
     }
 
