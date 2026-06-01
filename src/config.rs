@@ -89,12 +89,12 @@ pub struct Config {
 
 /// Mid-turn steering controls.
 ///
-/// When `immediate_steer` is off (default) the dispatcher preserves invariant I2
+/// When `immediate_steer` is off the dispatcher preserves invariant I2
 /// (at most one in-flight ACP turn per thread): a message arriving while a turn is
 /// in flight is buffered and dispatched in the next turn (see
 /// `docs/adr/turn-boundary-batching.md`).
 ///
-/// When `immediate_steer` is on, a normal message arriving while a turn is in flight
+/// When `immediate_steer` is on (default) a normal message arriving while a turn is in flight
 /// is forwarded straight to the agent as an additional `session/prompt` *concurrent*
 /// with the running turn, instead of being buffered. The patched codex-acp fork
 /// injects that prompt into the running turn (steering) rather than starting a new
@@ -103,12 +103,26 @@ pub struct Config {
 /// the per-connection mutex. Requires an agent adapter that supports mid-turn
 /// steering — on agents that do not, the extra prompt is queued by the agent and
 /// handled after the current turn, which is harmless but not true steering.
-#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[derive(Debug, Clone, Copy, Deserialize)]
 pub struct SteeringConfig {
     /// Forward an in-flight-arriving message immediately as a steer prompt instead
-    /// of buffering it for the next turn. Default: false (I2 batching preserved).
-    #[serde(default)]
+    /// of buffering it for the next turn. Default: true — steering is the more
+    /// convenient behaviour, so it is the out-of-the-box default; set false to
+    /// restore strict I2 turn-boundary batching.
+    #[serde(default = "default_immediate_steer")]
     pub immediate_steer: bool,
+}
+
+fn default_immediate_steer() -> bool {
+    true
+}
+
+impl Default for SteeringConfig {
+    fn default() -> Self {
+        Self {
+            immediate_steer: default_immediate_steer(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -991,11 +1005,30 @@ command = "echo"
     }
 
     #[test]
-    fn immediate_steer_defaults_to_false() {
+    fn immediate_steer_defaults_to_true() {
         let cfg = parse_config(MINIMAL_TOML, "test").unwrap();
         assert!(
+            cfg.steering.immediate_steer,
+            "immediate_steer should default to true (steering is the convenient default)"
+        );
+    }
+
+    #[test]
+    fn immediate_steer_parses_false() {
+        let toml = r#"
+[discord]
+bot_token = "t"
+
+[agent]
+command = "echo"
+
+[steering]
+immediate_steer = false
+"#;
+        let cfg = parse_config(toml, "test").unwrap();
+        assert!(
             !cfg.steering.immediate_steer,
-            "immediate_steer should default to false"
+            "explicit immediate_steer = false should be respected"
         );
     }
 

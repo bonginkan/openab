@@ -134,14 +134,15 @@ session_ttl_hours = 24
 # liveness_check_secs = 30
 
 # [steering]
-# immediate_steer = false   # false (default): a message arriving while a turn is
-#                           #   in flight is buffered and dispatched in the next turn
-#                           #   (invariant I2; see docs/adr/turn-boundary-batching.md).
-#                           # true: forward such a message straight to the agent as an
+# immediate_steer = true    # true (default): a message arriving while a turn is in
+#                           #   flight is forwarded straight to the agent as an
 #                           #   additional session/prompt, concurrent with the running
 #                           #   turn. The patched codex-acp fork injects it into the
 #                           #   running turn (mid-turn steering) instead of starting a
 #                           #   new one. Requires an agent that supports steering.
+#                           # false: buffer such a message and dispatch it in the next
+#                           #   turn (strict invariant I2; see
+#                           #   docs/adr/turn-boundary-batching.md).
 
 [markdown]
 tables = "code"  # "code" (default) | "bullets" | "off"
