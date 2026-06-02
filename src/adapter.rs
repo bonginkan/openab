@@ -31,16 +31,21 @@ pub struct OutputDirectives {
 /// Returns parsed directives and the remaining content (directives stripped).
 pub fn parse_output_directives(content: &str) -> (OutputDirectives, String) {
     let mut directives = OutputDirectives::default();
-    let mut content_start = 0;
+    let Some(header_start) = output_directive_header_start(content) else {
+        return (directives, content.to_string());
+    };
+    let mut content_start = header_start;
     let mut trailing_content: Option<&str> = None;
+    let mut parsed_any = false;
 
-    for line in content.lines() {
+    for line in content[header_start..].lines() {
         let trimmed = line.trim();
         // Try to match [[key:value]] at the start of the line (lenient: allows trailing content)
         if let Some(after_open) = trimmed.strip_prefix("[[") {
             if let Some(close_pos) = after_open.find("]]") {
                 let inner = &after_open[..close_pos];
                 if let Some((key, value)) = inner.split_once(':') {
+                    parsed_any = true;
                     match key.trim() {
                         "reply_to" => {
                             let v = value.trim();
@@ -99,6 +104,10 @@ pub fn parse_output_directives(content: &str) -> (OutputDirectives, String) {
         }
     }
 
+    if !parsed_any {
+        return (directives, content.to_string());
+    }
+
     let remaining = if let Some(trailing) = trailing_content {
         if content_start < content.len() {
             format!("{}\n{}", trailing, &content[content_start..])
@@ -111,6 +120,33 @@ pub fn parse_output_directives(content: &str) -> (OutputDirectives, String) {
         String::new()
     };
     (directives, remaining)
+}
+
+fn output_directive_header_start(content: &str) -> Option<usize> {
+    let mut start = 0;
+    for (idx, ch) in content.char_indices() {
+        if ch.is_whitespace() || ch == '\u{feff}' || ch == '\u{200b}' {
+            start = idx + ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+
+    content[start..].starts_with("[[").then_some(start)
+}
+
+fn strip_output_directives_for_display(content: &str) -> String {
+    let Some(header_start) = output_directive_header_start(content) else {
+        return content.to_string();
+    };
+
+    let header = &content[header_start..];
+    if header.strip_prefix("[[").is_some_and(|s| !s.contains("]]")) {
+        return content[..header_start].to_string();
+    }
+
+    let (_, stripped) = parse_output_directives(content);
+    stripped
 }
 
 fn is_valid_attachment_directive_path(value: &str) -> bool {
@@ -961,10 +997,9 @@ impl AdapterRouter {
                                     };
                                     append_text_chunk(&mut text_buf, &t, separate);
                                     if let Some(tx) = &buf_tx {
-                                        let _ = tx.send(compose_display(
+                                        let _ = tx.send(compose_streaming_display(
                                             &tool_lines,
                                             &text_buf,
-                                            true,
                                             tool_display,
                                         ));
                                     }
@@ -986,10 +1021,9 @@ impl AdapterRouter {
                                         });
                                     }
                                     if let Some(tx) = &buf_tx {
-                                        let _ = tx.send(compose_display(
+                                        let _ = tx.send(compose_streaming_display(
                                             &tool_lines,
                                             &text_buf,
-                                            true,
                                             tool_display,
                                         ));
                                     }
@@ -1014,10 +1048,9 @@ impl AdapterRouter {
                                         });
                                     }
                                     if let Some(tx) = &buf_tx {
-                                        let _ = tx.send(compose_display(
+                                        let _ = tx.send(compose_streaming_display(
                                             &tool_lines,
                                             &text_buf,
-                                            true,
                                             tool_display,
                                         ));
                                     }
@@ -1422,6 +1455,15 @@ impl ToolEntry {
 /// Maximum number of finished tool entries to show individually
 /// during streaming before collapsing into a summary line.
 const TOOL_COLLAPSE_THRESHOLD: usize = 3;
+
+fn compose_streaming_display(
+    tool_lines: &[ToolEntry],
+    text: &str,
+    tool_display: ToolDisplay,
+) -> String {
+    let display_text = strip_output_directives_for_display(text);
+    compose_display(tool_lines, &display_text, true, tool_display)
+}
 
 fn compose_display(
     tool_lines: &[ToolEntry],
@@ -1852,7 +1894,7 @@ mod tests {
 
 #[cfg(test)]
 mod directive_tests {
-    use super::parse_output_directives;
+    use super::{parse_output_directives, strip_output_directives_for_display};
 
     #[test]
     fn parse_reply_to_directive() {
@@ -1882,6 +1924,29 @@ mod directive_tests {
     #[test]
     fn parse_attach_image_directive() {
         let input = "[[attach_image:/home/node/.codex/generated_images/out.png]]\nDone";
+        let (directives, content) = parse_output_directives(input);
+        assert_eq!(
+            directives.attach_images,
+            vec!["/home/node/.codex/generated_images/out.png".to_string()]
+        );
+        assert_eq!(content, "Done");
+    }
+
+    #[test]
+    fn parse_attach_image_allows_leading_blank_line() {
+        let input = "\n[[attach_image:/home/node/.codex/generated_images/out.png]]\nDone";
+        let (directives, content) = parse_output_directives(input);
+        assert_eq!(
+            directives.attach_images,
+            vec!["/home/node/.codex/generated_images/out.png".to_string()]
+        );
+        assert_eq!(content, "Done");
+    }
+
+    #[test]
+    fn parse_attach_image_allows_leading_invisible_chars() {
+        let input =
+            "\u{feff}\u{200b}[[attach_image:/home/node/.codex/generated_images/out.png]]\nDone";
         let (directives, content) = parse_output_directives(input);
         assert_eq!(
             directives.attach_images,
@@ -1952,6 +2017,26 @@ mod directive_tests {
         let (directives, content) = parse_output_directives(input);
         assert_eq!(directives.reply_to, None);
         assert_eq!(content, input);
+    }
+
+    #[test]
+    fn parse_leading_space_without_directive_preserves_content() {
+        let input = "\n  Normal first line\n[[reply_to:123]]\nMore content";
+        let (directives, content) = parse_output_directives(input);
+        assert_eq!(directives.reply_to, None);
+        assert_eq!(content, input);
+    }
+
+    #[test]
+    fn strip_output_directives_for_display_hides_complete_header() {
+        let input = "[[attach_image:/home/node/.codex/generated_images/out.png]]\nDone";
+        assert_eq!(strip_output_directives_for_display(input), "Done");
+    }
+
+    #[test]
+    fn strip_output_directives_for_display_hides_partial_header() {
+        let input = "[[attach_image:/home/node/.codex/generated_images/out";
+        assert_eq!(strip_output_directives_for_display(input), "");
     }
 
     #[test]
