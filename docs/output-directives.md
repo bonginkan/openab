@@ -16,7 +16,7 @@ Actual message content starts here...
 Rules:
 - Consecutive `[[key:value]]` lines at the start of output = directive header block
 - First line that doesn't match `[[key:value]]` (with colon) = content begins
-- `attach_image` may also appear later as a standalone directive line outside code blocks; this supports generated-image workflows where the agent writes explanatory text before the path is known
+- `attach_image` may also appear later outside code blocks, including inline with surrounding text; this supports generated-image workflows where the agent writes explanatory text before the path is known
 - `[[X]]` without colon is NOT a directive — stops parsing, preserved as content
 - Directives are stripped from the final message (never visible to users)
 - Unknown keys are silently ignored (forward compatible, logged at debug level)
@@ -109,7 +109,7 @@ allowed_dirs = ["/home/node", "/home/node/.codex/generated_images"]
 - Supported formats: PNG, JPEG, GIF, WebP.
 - Files are read by OpenAB, validated as images, capped by `attachments.max_bytes`, then uploaded as Discord message attachments.
 - Multiple `attach_image` directives are allowed; `attachments.max_files` caps files per response.
-- Unlike other directives, `attach_image` can be emitted either in the initial directive header or as a standalone directive line later in the response.
+- Unlike other directives, `attach_image` can be emitted either in the initial directive header or later in the response outside code blocks.
 - Directives are stripped from visible text.
 - If validation or upload fails, OpenAB sends a warning instead of exposing the directive.
 

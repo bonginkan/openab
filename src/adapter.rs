@@ -45,7 +45,7 @@ pub fn parse_output_directives(content: &str) -> (OutputDirectives, String) {
         // Try to match [[key:value]] at the start of the line (lenient: allows trailing content).
         // Some markdown transports escape the brackets as \[\[key:value\]\]; treat that as
         // the same directive while keeping parsing constrained to the response header.
-        if let Some(after_open) = strip_directive_open(trimmed) {
+        if let Some((_, after_open)) = strip_directive_open(trimmed) {
             if let Some((close_pos, close_len)) = find_directive_close(after_open) {
                 let inner = &after_open[..close_pos];
                 if let Some((key, value)) = inner.split_once(':') {
@@ -148,7 +148,7 @@ fn output_directive_header_start(content: &str) -> Option<usize> {
 fn strip_output_directives_for_display(content: &str) -> String {
     if let Some(header_start) = output_directive_header_start(content) {
         let header = &content[header_start..];
-        if strip_directive_open(header).is_some_and(|s| find_directive_close(s).is_none()) {
+        if strip_directive_open(header).is_some_and(|(_, s)| find_directive_close(s).is_none()) {
             return content[..header_start].to_string();
         }
     }
@@ -172,10 +172,11 @@ fn extract_embedded_attach_image_directives(content: &str) -> (Vec<String>, Stri
         }
 
         if !in_code_fence {
-            if let Some((path, remainder)) = parse_attach_image_line(trimmed) {
-                attach_images.push(path);
-                if !remainder.is_empty() {
-                    stripped.push_str(remainder);
+            let (paths, stripped_body) = strip_attach_image_directives_from_line(body);
+            if !paths.is_empty() {
+                attach_images.extend(paths);
+                if !stripped_body.is_empty() {
+                    stripped.push_str(&stripped_body);
                     stripped.push_str(line_ending);
                 }
                 continue;
@@ -202,20 +203,58 @@ fn is_markdown_code_fence(trimmed_line: &str) -> bool {
     trimmed_line.starts_with("```")
 }
 
-fn parse_attach_image_line(trimmed_line: &str) -> Option<(String, &str)> {
-    let after_open = strip_directive_open(trimmed_line)?;
-    let (close_pos, close_len) = find_directive_close(after_open)?;
-    let inner = &after_open[..close_pos];
-    let (key, value) = inner.split_once(':')?;
-    if key.trim() != "attach_image" {
-        return None;
+fn strip_attach_image_directives_from_line(line: &str) -> (Vec<String>, String) {
+    let mut attach_images = Vec::new();
+    let mut stripped = String::with_capacity(line.len());
+    let mut copied_until = 0;
+    let mut search_start = 0;
+
+    while let Some((open_rel, open_len)) = find_directive_open(&line[search_start..]) {
+        let open_idx = search_start + open_rel;
+        let after_open_idx = open_idx + open_len;
+        let after_open = &line[after_open_idx..];
+        let Some((close_pos, close_len)) = find_directive_close(after_open) else {
+            break;
+        };
+        let inner = &after_open[..close_pos];
+        let Some((key, value)) = inner.split_once(':') else {
+            search_start = after_open_idx;
+            continue;
+        };
+        if key.trim() != "attach_image" {
+            search_start = after_open_idx;
+            continue;
+        }
+        let v = value.trim();
+        if !is_valid_attachment_directive_path(v) {
+            search_start = after_open_idx;
+            continue;
+        }
+
+        stripped.push_str(&line[copied_until..open_idx]);
+        attach_images.push(v.to_string());
+        search_start = after_open_idx + close_pos + close_len;
+        copied_until = search_start;
     }
-    let v = value.trim();
-    if !is_valid_attachment_directive_path(v) {
-        return None;
+
+    stripped.push_str(&line[copied_until..]);
+    (attach_images, stripped)
+}
+
+fn has_unclosed_output_directive(text: &str) -> bool {
+    let line = text.rsplit('\n').next().unwrap_or(text);
+    let mut search_start = 0;
+
+    while let Some((open_rel, open_len)) = find_directive_open(&line[search_start..]) {
+        let after_open_idx = search_start + open_rel + open_len;
+        let after_open = &line[after_open_idx..];
+        let Some((close_pos, close_len)) = find_directive_close(after_open) else {
+            return true;
+        };
+        search_start = after_open_idx + close_pos + close_len;
     }
-    let remainder = after_open[close_pos + close_len..].trim();
-    Some((v.to_string(), remainder))
+
+    false
 }
 
 fn is_output_directive_padding_char(ch: char) -> bool {
@@ -232,9 +271,22 @@ fn is_output_directive_padding_char(ch: char) -> bool {
         )
 }
 
-fn strip_directive_open(line: &str) -> Option<&str> {
+fn strip_directive_open(line: &str) -> Option<(usize, &str)> {
     line.strip_prefix("[[")
-        .or_else(|| line.strip_prefix("\\[\\["))
+        .map(|after_open| ("[[".len(), after_open))
+        .or_else(|| {
+            line.strip_prefix("\\[\\[")
+                .map(|after_open| ("\\[\\[".len(), after_open))
+        })
+}
+
+fn find_directive_open(line: &str) -> Option<(usize, usize)> {
+    match (line.find("[["), line.find("\\[\\[")) {
+        (Some(raw), Some(escaped)) if escaped < raw => Some((escaped, "\\[\\[".len())),
+        (Some(raw), _) => Some((raw, "[[".len())),
+        (None, Some(escaped)) => Some((escaped, "\\[\\[".len())),
+        (None, None) => None,
+    }
 }
 
 fn find_directive_close(after_open: &str) -> Option<(usize, usize)> {
@@ -1455,6 +1507,9 @@ fn should_separate_stream_chunk(text_buf: &str, chunk: &str) -> bool {
     if is_inside_inline_code_span(text_buf) {
         return false;
     }
+    if has_unclosed_output_directive(text_buf) {
+        return false;
+    }
 
     is_sentence_terminal(prev) && is_text_start(next)
 }
@@ -1867,6 +1922,16 @@ mod tests {
     }
 
     #[test]
+    fn append_text_chunk_does_not_separate_inside_output_directive() {
+        let mut text = "Done.[[attach_image:/Users/thepioneer/.".to_string();
+        append_text_chunk(&mut text, "codex/generated_images/out.png]]", false);
+        assert_eq!(
+            text,
+            "Done.[[attach_image:/Users/thepioneer/.codex/generated_images/out.png]]"
+        );
+    }
+
+    #[test]
     fn append_text_chunk_preserves_mid_sentence_stream_delta() {
         let mut text = "調査".to_string();
         append_text_chunk(&mut text, "します。", false);
@@ -2066,6 +2131,29 @@ mod directive_tests {
     }
 
     #[test]
+    fn parse_attach_image_from_inline_body_text() {
+        let input = "Generated image.[[attach_image:/home/node/.codex/generated_images/out.png]]";
+        let (directives, content) = parse_output_directives(input);
+        assert_eq!(
+            directives.attach_images,
+            vec!["/home/node/.codex/generated_images/out.png".to_string()]
+        );
+        assert_eq!(content, "Generated image.");
+    }
+
+    #[test]
+    fn parse_attach_image_from_inline_body_escaped_text() {
+        let input =
+            "Generated image.\\[\\[attach_image:/home/node/.codex/generated_images/out.png\\]\\]";
+        let (directives, content) = parse_output_directives(input);
+        assert_eq!(
+            directives.attach_images,
+            vec!["/home/node/.codex/generated_images/out.png".to_string()]
+        );
+        assert_eq!(content, "Generated image.");
+    }
+
+    #[test]
     fn parse_attach_image_ignores_code_fence_examples() {
         let input =
             "Example:\n```\n[[attach_image:/home/node/.codex/generated_images/out.png]]\n```\nDone";
@@ -2081,6 +2169,15 @@ mod directive_tests {
         assert_eq!(
             strip_output_directives_for_display(input),
             "Generated image:\nDone"
+        );
+    }
+
+    #[test]
+    fn strip_output_directives_for_display_hides_inline_attach_image() {
+        let input = "Generated image.[[attach_image:/home/node/.codex/generated_images/out.png]]";
+        assert_eq!(
+            strip_output_directives_for_display(input),
+            "Generated image."
         );
     }
 
