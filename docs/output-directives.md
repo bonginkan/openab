@@ -8,6 +8,7 @@ Agents can control platform-specific message delivery by prefixing their output 
 
 ```
 [[reply_to:1502606076451885136]]
+[[attach_image:/home/node/.codex/generated_images/out.png]]
 [[ephemeral:true]]              ← future
 Actual message content starts here...
 ```
@@ -75,3 +76,39 @@ This creates clear visual conversation threads within a Discord thread — essen
 | **OAB** | `[[reply_to:message_id]]` directive | ✅ Agent chooses any message |
 
 > **Note:** `reply_to` is currently implemented for Discord and Feishu (gateway). Slack message IDs (ts format like `1234567890.123456`) are accepted by the parser but the Slack adapter does not yet send threaded replies via this directive — it falls back to plain send. Slack support can be added in a future PR.
+
+### `attach_image`
+
+Attach a local image file produced by the agent to the outgoing user-facing response.
+
+```
+[[attach_image:/home/node/.codex/generated_images/sky.png]]
+Here is the generated image.
+```
+
+**Value**: Local file path visible to the OpenAB process. Relative paths are resolved from `[agent].working_dir`.
+
+**Configuration**: Disabled by default. Enable with:
+
+```toml
+[attachments]
+enabled = true
+```
+
+When `attachments.allowed_dirs` is empty, only `[agent].working_dir` is allowed. Set `allowed_dirs` to permit additional output directories such as Codex's generated image folder:
+
+```toml
+[attachments]
+enabled = true
+allowed_dirs = ["/home/node", "/home/node/.codex/generated_images"]
+```
+
+**Behavior**:
+- Supported output platforms: Discord.
+- Supported formats: PNG, JPEG, GIF, WebP.
+- Files are read by OpenAB, validated as images, capped by `attachments.max_bytes`, then uploaded as Discord message attachments.
+- Multiple `attach_image` directives are allowed; `attachments.max_files` caps files per response.
+- Directives are stripped from visible text.
+- If validation or upload fails, OpenAB sends a warning instead of exposing the directive.
+
+**Security**: OpenAB canonicalizes the requested file path and only reads files under `attachments.allowed_dirs` (or `[agent].working_dir` by default). Do not set `allowed_dirs` wider than the directory where agents intentionally write shareable artifacts.

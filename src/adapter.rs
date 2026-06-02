@@ -2,12 +2,14 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
+use std::io::Cursor;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{error, warn};
 
 use crate::acp::{classify_notification, AcpEvent, ContentBlock, SessionPool};
-use crate::config::{ReactionsConfig, ToolDisplay};
+use crate::config::{AttachmentsConfig, ReactionsConfig, ToolDisplay};
 use crate::error_display::{format_coded_error, format_user_error};
 use crate::format;
 use crate::markdown::{self, TableMode};
@@ -21,6 +23,8 @@ use crate::reactions::StatusReactionController;
 pub struct OutputDirectives {
     /// Message ID to reply to (Discord: message_reference)
     pub reply_to: Option<String>,
+    /// Local image files produced by the agent and safe-listed for outbound upload.
+    pub attach_images: Vec<String>,
 }
 
 /// Parse `[[key:value]]` directives from the beginning of agent output.
@@ -48,6 +52,12 @@ pub fn parse_output_directives(content: &str) -> (OutputDirectives, String) {
                                 })
                             {
                                 directives.reply_to = Some(v.to_string());
+                            }
+                        }
+                        "attach_image" => {
+                            let v = value.trim();
+                            if is_valid_attachment_directive_path(v) {
+                                directives.attach_images.push(v.to_string());
                             }
                         }
                         _ => {
@@ -101,6 +111,13 @@ pub fn parse_output_directives(content: &str) -> (OutputDirectives, String) {
         String::new()
     };
     (directives, remaining)
+}
+
+fn is_valid_attachment_directive_path(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 4096
+        && !value.contains('\0')
+        && !value.chars().any(|c| c.is_control() && c != '\t')
 }
 
 // --- Platform-agnostic types ---
@@ -253,6 +270,22 @@ pub trait ChatAdapter: Send + Sync + 'static {
         self.send_message(channel, content).await
     }
 
+    /// Send a message with one or more file attachments.
+    /// Default: unsupported; individual adapters opt in where the platform API
+    /// is wired and permission requirements are known.
+    async fn send_attachments(
+        &self,
+        _channel: &ChannelRef,
+        _content: &str,
+        _attachments: Vec<OutboundAttachment>,
+        _reply_to_message_id: Option<&str>,
+    ) -> Result<MessageRef> {
+        Err(anyhow::anyhow!(
+            "outbound attachments are not supported for {}",
+            self.platform()
+        ))
+    }
+
     /// Delete a message. Used to remove streaming placeholders when reply_to is set.
     /// Default: edits to zero-width space (fallback for platforms without delete support).
     async fn delete_message(&self, msg: &MessageRef) -> Result<()> {
@@ -267,6 +300,151 @@ pub trait ChatAdapter: Send + Sync + 'static {
     /// not be detected until the next message. This is acceptable: the first
     /// response may stream, but subsequent ones will correctly use send-once.
     fn use_streaming(&self, other_bot_present: bool) -> bool;
+}
+
+/// Validated outbound file payload ready for a platform adapter to upload.
+#[derive(Debug, Clone)]
+pub struct OutboundAttachment {
+    pub filename: String,
+    pub data: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+struct OutboundAttachments {
+    enabled: bool,
+    allowed_dirs: Vec<PathBuf>,
+    agent_working_dir: PathBuf,
+    max_bytes: u64,
+    max_files: usize,
+}
+
+impl OutboundAttachments {
+    fn new(config: AttachmentsConfig, agent_working_dir: impl Into<PathBuf>) -> Self {
+        let agent_working_dir = agent_working_dir.into();
+        let allowed_dirs = if config.allowed_dirs.is_empty() {
+            vec![agent_working_dir.clone()]
+        } else {
+            config.allowed_dirs.into_iter().map(PathBuf::from).collect()
+        };
+        Self {
+            enabled: config.enabled,
+            allowed_dirs,
+            agent_working_dir,
+            max_bytes: config.max_bytes,
+            max_files: config.max_files,
+        }
+    }
+
+    async fn load_images(&self, paths: &[String]) -> (Vec<OutboundAttachment>, Vec<String>) {
+        let mut warnings = Vec::new();
+        if paths.is_empty() {
+            return (Vec::new(), warnings);
+        }
+        if !self.enabled {
+            warnings.push(
+                "⚠️ Outbound image attachment skipped because [attachments].enabled is false."
+                    .to_string(),
+            );
+            return (Vec::new(), warnings);
+        }
+
+        let mut attachments = Vec::new();
+        for raw_path in paths.iter().take(self.max_files) {
+            match self.load_one_image(raw_path).await {
+                Ok(file) => attachments.push(file),
+                Err(e) => warnings.push(format!(
+                    "⚠️ Outbound image attachment skipped for `{}`: {e}",
+                    sanitize_attachment_label(raw_path)
+                )),
+            }
+        }
+        if paths.len() > self.max_files {
+            warnings.push(format!(
+                "⚠️ Outbound image attachment limit reached; skipped {} file(s).",
+                paths.len() - self.max_files
+            ));
+        }
+        (attachments, warnings)
+    }
+
+    async fn load_one_image(&self, raw_path: &str) -> Result<OutboundAttachment> {
+        let candidate = self.resolve_agent_path(raw_path);
+        let canonical = tokio::fs::canonicalize(&candidate)
+            .await
+            .map_err(|e| anyhow::anyhow!("cannot resolve path {}: {e}", candidate.display()))?;
+        self.ensure_allowed_path(&canonical).await?;
+
+        let metadata = tokio::fs::metadata(&canonical).await?;
+        anyhow::ensure!(metadata.is_file(), "path is not a regular file");
+        anyhow::ensure!(
+            metadata.len() <= self.max_bytes,
+            "file is {} bytes, over the {} byte limit",
+            metadata.len(),
+            self.max_bytes
+        );
+
+        let data = tokio::fs::read(&canonical).await?;
+        anyhow::ensure!(
+            data.len() as u64 <= self.max_bytes,
+            "file is {} bytes, over the {} byte limit",
+            data.len(),
+            self.max_bytes
+        );
+        ensure_supported_image(&data)?;
+
+        let filename = canonical
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| anyhow::anyhow!("path has no valid filename"))?
+            .to_string();
+        Ok(OutboundAttachment { filename, data })
+    }
+
+    fn resolve_agent_path(&self, raw_path: &str) -> PathBuf {
+        let path = Path::new(raw_path);
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            self.agent_working_dir.join(path)
+        }
+    }
+
+    async fn ensure_allowed_path(&self, canonical_file: &Path) -> Result<()> {
+        for dir in &self.allowed_dirs {
+            if let Ok(canonical_dir) = tokio::fs::canonicalize(dir).await {
+                if canonical_file.starts_with(&canonical_dir) {
+                    return Ok(());
+                }
+            }
+        }
+        Err(anyhow::anyhow!(
+            "path is outside attachments.allowed_dirs (default: agent.working_dir)"
+        ))
+    }
+}
+
+fn ensure_supported_image(data: &[u8]) -> Result<()> {
+    let reader = image::ImageReader::new(Cursor::new(data)).with_guessed_format()?;
+    let format = reader.format();
+    match format {
+        Some(
+            image::ImageFormat::Png
+            | image::ImageFormat::Jpeg
+            | image::ImageFormat::Gif
+            | image::ImageFormat::WebP,
+        ) => {
+            let _ = reader.decode()?;
+            Ok(())
+        }
+        _ => Err(anyhow::anyhow!(
+            "file is not a supported image (png, jpg, jpeg, gif, webp)"
+        )),
+    }
+}
+
+fn sanitize_attachment_label(value: &str) -> String {
+    let flat = value.replace(['\r', '\n'], " ");
+    format::truncate_chars_tail(&flat, 160)
 }
 
 // --- AdapterRouter ---
@@ -287,13 +465,15 @@ pub struct AdapterRouter {
     /// a Discord message, so the controller creates a fresh active post after the
     /// latest user message and points future edits at it.
     active_posts: Arc<Mutex<HashMap<String, Arc<StreamingPostController>>>>,
+    outbound_attachments: OutboundAttachments,
 }
 
 struct StreamingPostInner {
     adapter: Arc<dyn ChatAdapter>,
     thread_channel: ChannelRef,
-    current_msg: MessageRef,
+    current_msgs: Vec<MessageRef>,
     latest_display: String,
+    message_limit: usize,
 }
 
 struct StreamingPostController {
@@ -306,50 +486,88 @@ impl StreamingPostController {
         thread_channel: ChannelRef,
         current_msg: MessageRef,
         initial_display: String,
+        message_limit: usize,
     ) -> Self {
         Self {
             inner: Mutex::new(StreamingPostInner {
                 adapter,
                 thread_channel,
-                current_msg,
+                current_msgs: vec![current_msg],
                 latest_display: initial_display,
+                message_limit,
             }),
         }
     }
 
     async fn edit(&self, content: &str) {
-        let (adapter, msg) = {
+        let (adapter, thread_channel, current_msgs, chunks) = {
             let mut inner = self.inner.lock().await;
             inner.latest_display = content.to_string();
-            (inner.adapter.clone(), inner.current_msg.clone())
+            (
+                inner.adapter.clone(),
+                inner.thread_channel.clone(),
+                inner.current_msgs.clone(),
+                split_streaming_display(content, inner.message_limit),
+            )
         };
-        let _ = adapter.edit_message(&msg, content).await;
+
+        let mut updated_msgs = Vec::with_capacity(chunks.len());
+        for (idx, chunk) in chunks.iter().enumerate() {
+            if let Some(msg) = current_msgs.get(idx) {
+                let _ = adapter.edit_message(msg, chunk).await;
+                updated_msgs.push(msg.clone());
+            } else if let Ok(msg) = adapter.send_message(&thread_channel, chunk).await {
+                updated_msgs.push(msg);
+            }
+        }
+
+        for msg in current_msgs.iter().skip(chunks.len()) {
+            if let Err(e) = adapter.delete_message(msg).await {
+                tracing::warn!(error = ?e, "delete excess streaming post failed");
+            }
+        }
+
+        let mut inner = self.inner.lock().await;
+        inner.current_msgs = updated_msgs;
     }
 
     async fn move_after_latest(&self) -> Result<()> {
-        let (adapter, thread_channel, old_msg, display) = {
+        let (adapter, thread_channel, old_msgs, chunks) = {
             let inner = self.inner.lock().await;
             (
                 inner.adapter.clone(),
                 inner.thread_channel.clone(),
-                inner.current_msg.clone(),
-                inner.latest_display.clone(),
+                inner.current_msgs.clone(),
+                split_streaming_display(&inner.latest_display, inner.message_limit),
             )
         };
 
-        let new_msg = adapter.send_message(&thread_channel, &display).await?;
+        let mut new_msgs = Vec::with_capacity(chunks.len());
+        for chunk in &chunks {
+            new_msgs.push(adapter.send_message(&thread_channel, chunk).await?);
+        }
         {
             let mut inner = self.inner.lock().await;
-            inner.current_msg = new_msg;
+            inner.current_msgs = new_msgs;
         }
-        if let Err(e) = adapter.delete_message(&old_msg).await {
-            tracing::warn!(error = ?e, "delete superseded streaming post failed");
+        for msg in &old_msgs {
+            if let Err(e) = adapter.delete_message(msg).await {
+                tracing::warn!(error = ?e, "delete superseded streaming post failed");
+            }
         }
         Ok(())
     }
 
-    async fn current_message(&self) -> MessageRef {
-        self.inner.lock().await.current_msg.clone()
+    async fn delete_current_messages(&self) {
+        let (adapter, msgs) = {
+            let inner = self.inner.lock().await;
+            (inner.adapter.clone(), inner.current_msgs.clone())
+        };
+        for msg in msgs {
+            if let Err(e) = adapter.delete_message(&msg).await {
+                tracing::warn!(error = ?e, "delete streaming post failed");
+            }
+        }
     }
 }
 
@@ -399,6 +617,8 @@ impl AdapterRouter {
         table_mode: TableMode,
         prompt_hard_timeout_secs: u64,
         liveness_check_secs: u64,
+        attachments_config: AttachmentsConfig,
+        agent_working_dir: String,
     ) -> Self {
         if liveness_check_secs >= prompt_hard_timeout_secs {
             warn!(
@@ -417,6 +637,7 @@ impl AdapterRouter {
             liveness_check_interval: std::time::Duration::from_secs(liveness_check_secs),
             pending_steer_separators: Arc::new(Mutex::new(HashSet::new())),
             active_posts: Arc::new(Mutex::new(HashMap::new())),
+            outbound_attachments: OutboundAttachments::new(attachments_config, agent_working_dir),
         }
     }
 
@@ -623,6 +844,7 @@ impl AdapterRouter {
         let thread_key_for_separator = thread_key.to_string();
         let active_posts = self.active_posts.clone();
         let thread_key_for_post = thread_key.to_string();
+        let outbound_attachments = self.outbound_attachments.clone();
 
         self.pool
             .with_connection(thread_key, |conn| {
@@ -655,6 +877,7 @@ impl AdapterRouter {
                             thread_channel.clone(),
                             msg,
                             rx.borrow().clone(),
+                            message_limit,
                         ));
                         let active_post_guard = ActivePostGuard::enter(
                             active_posts.clone(),
@@ -663,7 +886,6 @@ impl AdapterRouter {
                         )
                         .await;
                         let placeholder_post = active_post_guard.controller.clone();
-                        let limit = message_limit;
                         let mut buf_rx = rx;
                         tokio::spawn(async move {
                             let mut last = String::new();
@@ -672,15 +894,7 @@ impl AdapterRouter {
                                 if buf_rx.has_changed().unwrap_or(false) {
                                     let content = buf_rx.borrow_and_update().clone();
                                     if content != last {
-                                        let display = if content.chars().count() > limit - 100 {
-                                            format!(
-                                                "…{}",
-                                                format::truncate_chars_tail(&content, limit - 100)
-                                            )
-                                        } else {
-                                            content.clone()
-                                        };
-                                        post.edit(&display).await;
+                                        post.edit(&content).await;
                                         last = content;
                                     }
                                 }
@@ -824,14 +1038,20 @@ impl AdapterRouter {
                     // Directives are agent meta-layer, not content — must be stripped
                     // before tool lines are composed into the display output.
                     let (directives, stripped_text) = parse_output_directives(&text_buf);
+                    let has_attachment_directives = !directives.attach_images.is_empty();
+                    let (attachments, attachment_warnings) = outbound_attachments
+                        .load_images(&directives.attach_images)
+                        .await;
                     let text_buf = stripped_text;
 
                     // Build final content
                     let final_content =
                         compose_display(&tool_lines, &text_buf, false, tool_display);
-                    let final_content = if final_content.is_empty() {
+                    let mut final_content = if final_content.is_empty() {
                         if let Some(err) = response_error {
                             format!("⚠️ {err}")
+                        } else if has_attachment_directives {
+                            String::new()
                         } else {
                             "_(no response)_".to_string()
                         }
@@ -840,14 +1060,27 @@ impl AdapterRouter {
                     } else {
                         final_content
                     };
+                    if !attachment_warnings.is_empty() {
+                        if !final_content.is_empty() {
+                            final_content.push_str("\n\n");
+                        }
+                        final_content.push_str(&attachment_warnings.join("\n"));
+                    }
 
-                    let final_content = markdown::convert_tables(&final_content, table_mode);
-                    let chunks = format::split_message(&final_content, message_limit);
+                    let final_content = if final_content.is_empty() {
+                        String::new()
+                    } else {
+                        markdown::convert_tables(&final_content, table_mode)
+                    };
+                    let chunks = if final_content.is_empty() {
+                        Vec::new()
+                    } else {
+                        format::split_message(&final_content, message_limit)
+                    };
                     if let Some(post) = placeholder_post {
                         if let Some(ref reply_id) = directives.reply_to {
                             // reply_to directive: send reply first, then delete placeholder.
                             // Only delete if send succeeds — preserves placeholder on failure.
-                            let msg = post.current_message().await;
                             let mut send_ok = false;
                             let mut first = true;
                             for chunk in &chunks {
@@ -867,39 +1100,146 @@ impl AdapterRouter {
                                 }
                                 first = false;
                             }
-                            if send_ok {
-                                if let Err(e) = adapter.delete_message(&msg).await {
-                                    tracing::warn!(error = ?e, "delete placeholder failed; placeholder will remain visible");
+                            if !attachments.is_empty() {
+                                match send_outbound_attachments(
+                                    &adapter,
+                                    &thread_channel,
+                                    attachments,
+                                    None,
+                                    if chunks.is_empty() { Some(reply_id.as_str()) } else { None },
+                                )
+                                .await
+                                {
+                                    Ok(()) => {
+                                        if chunks.is_empty() {
+                                            send_ok = true;
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(error = ?e, "outbound attachment send failed");
+                                        if chunks.is_empty() {
+                                            post.edit(&format!("⚠️ Failed to send attachment: {e}")).await;
+                                        } else {
+                                            let _ = adapter
+                                                .send_message(
+                                                    &thread_channel,
+                                                    &format!("⚠️ Failed to send attachment: {e}"),
+                                                )
+                                                .await;
+                                        }
+                                    }
                                 }
                             }
-                        } else {
-                            // Normal streaming: edit first chunk into placeholder, send rest
-                            if let Some(first) = chunks.first() {
-                                post.edit(first).await;
+                            if send_ok {
+                                post.delete_current_messages().await;
                             }
-                            for chunk in chunks.iter().skip(1) {
-                                let _ = adapter.send_message(&thread_channel, chunk).await;
+                        } else {
+                            // Normal streaming: edit the placeholder post set into
+                            // the final split content. No truncation: long content
+                            // remains visible across multiple Discord messages.
+                            if !final_content.is_empty() {
+                                post.edit(&final_content).await;
+                            }
+                            if !attachments.is_empty() {
+                                match send_outbound_attachments(
+                                    &adapter,
+                                    &thread_channel,
+                                    attachments,
+                                    None,
+                                    None,
+                                )
+                                .await
+                                {
+                                    Ok(()) => {
+                                        if chunks.is_empty() {
+                                            post.delete_current_messages().await;
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(error = ?e, "outbound attachment send failed");
+                                        if chunks.is_empty() {
+                                            post.edit(&format!("⚠️ Failed to send attachment: {e}")).await;
+                                        } else {
+                                            let _ = adapter
+                                                .send_message(
+                                                    &thread_channel,
+                                                    &format!("⚠️ Failed to send attachment: {e}"),
+                                                )
+                                                .await;
+                                        }
+                                    }
+                                }
                             }
                         }
                     } else {
-                        // Send-once: all chunks as new messages
-                        // First chunk uses reply_to directive if present
-                        let mut first = true;
-                        for chunk in &chunks {
-                            if first {
-                                if let Some(ref reply_id) = directives.reply_to {
-                                    let _ = adapter.send_message_with_reply(
-                                        &thread_channel,
-                                        chunk,
-                                        reply_id,
-                                    ).await;
+                        if !attachments.is_empty() {
+                            let first_content = chunks.first().map(String::as_str);
+                            match send_outbound_attachments(
+                                &adapter,
+                                &thread_channel,
+                                attachments,
+                                first_content,
+                                directives.reply_to.as_deref(),
+                            )
+                            .await
+                            {
+                                Ok(()) => {
+                                    for chunk in chunks.iter().skip(1) {
+                                        let _ = adapter.send_message(&thread_channel, chunk).await;
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!(error = ?e, "outbound attachment send failed");
+                                    // Preserve the textual response even if attachment upload fails.
+                                    let mut first = true;
+                                    for chunk in &chunks {
+                                        if first {
+                                            if let Some(ref reply_id) = directives.reply_to {
+                                                let _ = adapter
+                                                    .send_message_with_reply(
+                                                        &thread_channel,
+                                                        chunk,
+                                                        reply_id,
+                                                    )
+                                                    .await;
+                                            } else {
+                                                let _ = adapter
+                                                    .send_message(&thread_channel, chunk)
+                                                    .await;
+                                            }
+                                        } else {
+                                            let _ = adapter.send_message(&thread_channel, chunk).await;
+                                        }
+                                        first = false;
+                                    }
+                                    let _ = adapter
+                                        .send_message(
+                                            &thread_channel,
+                                            &format!("⚠️ Failed to send attachment: {e}"),
+                                        )
+                                        .await;
+                                }
+                            }
+                        } else {
+                            // Send-once: all chunks as new messages
+                            // First chunk uses reply_to directive if present
+                            let mut first = true;
+                            for chunk in &chunks {
+                                if first {
+                                    if let Some(ref reply_id) = directives.reply_to {
+                                        let _ = adapter.send_message_with_reply(
+                                            &thread_channel,
+                                            chunk,
+                                            reply_id,
+                                        ).await;
+                                    } else {
+                                        let _ = adapter.send_message(&thread_channel, chunk).await;
+                                    }
                                 } else {
                                     let _ = adapter.send_message(&thread_channel, chunk).await;
                                 }
-                            } else {
-                                let _ = adapter.send_message(&thread_channel, chunk).await;
+                                first = false;
                             }
-                            first = false;
                         }
                     }
 
@@ -907,6 +1247,49 @@ impl AdapterRouter {
                 })
             })
             .await
+    }
+}
+
+async fn send_outbound_attachments(
+    adapter: &Arc<dyn ChatAdapter>,
+    thread_channel: &ChannelRef,
+    mut attachments: Vec<OutboundAttachment>,
+    first_content: Option<&str>,
+    reply_to_message_id: Option<&str>,
+) -> Result<()> {
+    const MAX_FILES_PER_MESSAGE: usize = 10;
+
+    let mut batch_index = 0;
+    while !attachments.is_empty() {
+        let take = attachments.len().min(MAX_FILES_PER_MESSAGE);
+        let batch: Vec<_> = attachments.drain(..take).collect();
+        let content = if batch_index == 0 {
+            first_content.unwrap_or("")
+        } else {
+            ""
+        };
+        let reply_to = if batch_index == 0 {
+            reply_to_message_id
+        } else {
+            None
+        };
+        adapter
+            .send_attachments(thread_channel, content, batch, reply_to)
+            .await?;
+        batch_index += 1;
+    }
+    Ok(())
+}
+
+fn split_streaming_display(content: &str, message_limit: usize) -> Vec<String> {
+    if content.is_empty() {
+        return vec!["\u{200b}".to_string()];
+    }
+    let chunks = format::split_message(content, message_limit);
+    if chunks.is_empty() {
+        vec!["\u{200b}".to_string()]
+    } else {
+        chunks
     }
 }
 
@@ -1302,6 +1685,114 @@ mod tests {
         append_text_chunk(&mut text, "\nsecond response", true);
         assert_eq!(text, "first response\nsecond response");
     }
+
+    #[test]
+    fn split_streaming_display_splits_without_truncating() {
+        let text = "a".repeat(4500);
+        let chunks = split_streaming_display(&text, 2000);
+        assert!(chunks.len() > 1);
+        assert_eq!(chunks.concat(), text);
+        assert!(
+            chunks.iter().all(|chunk| chunk.chars().count() <= 2000),
+            "all streaming chunks must respect platform limit"
+        );
+    }
+
+    #[test]
+    fn split_streaming_display_empty_uses_zero_width_space() {
+        let chunks = split_streaming_display("", 2000);
+        assert_eq!(chunks, vec!["\u{200b}".to_string()]);
+    }
+
+    fn test_png_bytes() -> Vec<u8> {
+        let img = image::RgbImage::new(1, 1);
+        let mut buf = Cursor::new(Vec::new());
+        img.write_to(&mut buf, image::ImageFormat::Png).unwrap();
+        buf.into_inner()
+    }
+
+    #[tokio::test]
+    async fn outbound_attachments_loads_image_from_allowed_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let image_path = dir.path().join("generated.png");
+        std::fs::write(&image_path, test_png_bytes()).unwrap();
+        let cfg = AttachmentsConfig {
+            enabled: true,
+            allowed_dirs: vec![dir.path().to_string_lossy().to_string()],
+            max_bytes: 1024 * 1024,
+            max_files: 10,
+        };
+        let outbound = OutboundAttachments::new(cfg, dir.path().to_string_lossy().to_string());
+
+        let (files, warnings) = outbound
+            .load_images(&[image_path.to_string_lossy().to_string()])
+            .await;
+
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].filename, "generated.png");
+        assert!(!files[0].data.is_empty());
+    }
+
+    #[tokio::test]
+    async fn outbound_attachments_rejects_path_outside_allowed_dir() {
+        let allowed = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let image_path = outside.path().join("secret.png");
+        std::fs::write(&image_path, test_png_bytes()).unwrap();
+        let cfg = AttachmentsConfig {
+            enabled: true,
+            allowed_dirs: vec![allowed.path().to_string_lossy().to_string()],
+            max_bytes: 1024 * 1024,
+            max_files: 10,
+        };
+        let outbound = OutboundAttachments::new(cfg, allowed.path().to_string_lossy().to_string());
+
+        let (files, warnings) = outbound
+            .load_images(&[image_path.to_string_lossy().to_string()])
+            .await;
+
+        assert!(files.is_empty());
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("outside attachments.allowed_dirs"));
+    }
+
+    #[tokio::test]
+    async fn outbound_attachments_relative_path_uses_agent_working_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("relative.png"), test_png_bytes()).unwrap();
+        let cfg = AttachmentsConfig {
+            enabled: true,
+            allowed_dirs: Vec::new(),
+            max_bytes: 1024 * 1024,
+            max_files: 10,
+        };
+        let outbound = OutboundAttachments::new(cfg, dir.path().to_string_lossy().to_string());
+
+        let (files, warnings) = outbound.load_images(&["relative.png".to_string()]).await;
+
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].filename, "relative.png");
+    }
+
+    #[tokio::test]
+    async fn outbound_attachments_disabled_warns_without_reading() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = AttachmentsConfig {
+            enabled: false,
+            allowed_dirs: vec![dir.path().to_string_lossy().to_string()],
+            max_bytes: 1024 * 1024,
+            max_files: 10,
+        };
+        let outbound = OutboundAttachments::new(cfg, dir.path().to_string_lossy().to_string());
+
+        let (files, warnings) = outbound.load_images(&["missing.png".to_string()]).await;
+
+        assert!(files.is_empty());
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("enabled is false"));
+    }
 }
 
 #[cfg(test)]
@@ -1329,7 +1820,35 @@ mod directive_tests {
         let input = "[[reply_to:123456]]\n[[unknown_key:value]]\nContent here";
         let (directives, content) = parse_output_directives(input);
         assert_eq!(directives.reply_to, Some("123456".to_string()));
+        assert!(directives.attach_images.is_empty());
         assert_eq!(content, "Content here");
+    }
+
+    #[test]
+    fn parse_attach_image_directive() {
+        let input = "[[attach_image:/home/node/.codex/generated_images/out.png]]\nDone";
+        let (directives, content) = parse_output_directives(input);
+        assert_eq!(
+            directives.attach_images,
+            vec!["/home/node/.codex/generated_images/out.png".to_string()]
+        );
+        assert_eq!(content, "Done");
+    }
+
+    #[test]
+    fn parse_multiple_attach_image_directives() {
+        let input = "[[attach_image:one.png]]\n[[attach_image:two.webp]]\nDone";
+        let (directives, content) = parse_output_directives(input);
+        assert_eq!(directives.attach_images, vec!["one.png", "two.webp"]);
+        assert_eq!(content, "Done");
+    }
+
+    #[test]
+    fn parse_attach_image_rejects_empty_path() {
+        let input = "[[attach_image:]]\nDone";
+        let (directives, content) = parse_output_directives(input);
+        assert!(directives.attach_images.is_empty());
+        assert_eq!(content, "Done");
     }
 
     #[test]

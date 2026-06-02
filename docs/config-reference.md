@@ -103,7 +103,43 @@ The AI agent subprocess that OpenAB spawns to handle messages via ACP.
 
 > **Default inherited vars:** After `env_clear()`, the agent always receives `HOME`, `PATH`, and `USER` (on Windows: `USERPROFILE`, `USERNAME`, `PATH`, `SystemRoot`, `SystemDrive`). Use `inherit_env` to pass additional vars beyond this baseline.
 
-### Agent examples
+---
+
+## `[attachments]`
+
+Outbound image attachments from the agent back to the user.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | bool | `false` | Enable `[[attach_image:path]]` output directives. Disabled by default to preserve text-only behavior. |
+| `allowed_dirs` | string[] | `[]` | Directories OpenAB may read outbound image files from. Empty means only `[agent].working_dir`. |
+| `max_bytes` | u64 | `10485760` | Maximum bytes per outbound image. Default is 10 MiB. |
+| `max_files` | usize | `10` | Maximum outbound image files per ACP response. |
+
+Supported image formats are PNG, JPEG, GIF, and WebP. Relative directive paths
+are resolved from `[agent].working_dir`.
+
+```toml
+[agent]
+working_dir = "/home/node"
+
+[attachments]
+enabled = true
+allowed_dirs = ["/home/node", "/home/node/.codex/generated_images"]
+max_bytes = 10485760
+max_files = 10
+```
+
+Agents attach a generated image by prefixing their output with:
+
+```text
+[[attach_image:/home/node/.codex/generated_images/out.png]]
+Here is the generated image.
+```
+
+---
+
+## Agent Examples
 
 ```toml
 # Kiro CLI

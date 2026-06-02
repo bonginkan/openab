@@ -315,6 +315,13 @@ agents:
       # maxBatchTokens: soft token cap per ACP turn for batching modes (default 24000)
       # maxBatchTokens: 24000
     workingDir: /home/agent
+    attachments:
+      enabled: false
+      # Allow agent-generated image uploads via [[attach_image:path]].
+      # Empty allowedDirs means only workingDir is allowed.
+      allowedDirs: []
+      maxBytes: 10485760
+      maxFiles: 10
     env: {}
     # Load env vars from existing Secrets or ConfigMaps, e.g. GH_TOKEN.
     envFrom: []

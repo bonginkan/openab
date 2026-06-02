@@ -1,6 +1,8 @@
 use crate::acp::protocol::ConfigOption;
 use crate::acp::ContentBlock;
-use crate::adapter::{AdapterRouter, ChannelRef, ChatAdapter, MessageRef, SenderContext};
+use crate::adapter::{
+    AdapterRouter, ChannelRef, ChatAdapter, MessageRef, OutboundAttachment, SenderContext,
+};
 use crate::bot_turns::{BotTurnTracker, TurnAction, TurnSeverity, BOT_TURN_LIMIT_WARNING_PREFIX};
 use crate::config::{AllowBots, AllowUsers, SttConfig};
 use crate::format;
@@ -130,6 +132,37 @@ impl ChatAdapter for DiscordAdapter {
                 self.send_message(channel, content).await
             }
         }
+    }
+
+    async fn send_attachments(
+        &self,
+        channel: &ChannelRef,
+        content: &str,
+        attachments: Vec<OutboundAttachment>,
+        reply_to_message_id: Option<&str>,
+    ) -> anyhow::Result<MessageRef> {
+        let ch_id: u64 = Self::resolve_channel(channel).parse()?;
+        let files = attachments
+            .into_iter()
+            .map(|file| CreateAttachment::bytes(file.data, file.filename));
+        let mut builder = serenity::builder::CreateMessage::new().add_files(files);
+        if !content.is_empty() {
+            builder = builder.content(content);
+        }
+        if let Some(reply_to_message_id) = reply_to_message_id {
+            if let Ok(msg_id) = reply_to_message_id.parse::<u64>() {
+                builder =
+                    builder.reference_message((ChannelId::new(ch_id), MessageId::new(msg_id)));
+            }
+        }
+
+        let msg = ChannelId::new(ch_id)
+            .send_message(&self.http, builder)
+            .await?;
+        Ok(MessageRef {
+            channel: channel.clone(),
+            message_id: msg.id.to_string(),
+        })
     }
 
     async fn delete_message(&self, msg: &MessageRef) -> anyhow::Result<()> {

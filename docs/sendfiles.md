@@ -11,10 +11,12 @@
 
 ---
 
-OpenAB streams text only — it does **not** relay file attachments from the agent.
-To send a file back to the user, the agent must call the Discord API directly.
+OpenAB can relay image attachments via `[[attach_image:path]]`, but it does
+**not** relay non-image file attachments from the agent. To send a non-image file
+back to the user, the agent must call the Discord API directly or send an
+external link.
 
-> For image-specific guidance (formats, sidecar pattern), see [sendimages.md](sendimages.md).
+> For image-specific guidance (formats, output directive), see [sendimages.md](sendimages.md).
 
 ## How It Works
 

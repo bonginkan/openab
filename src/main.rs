@@ -139,6 +139,7 @@ async fn main() -> anyhow::Result<()> {
     // Immediate-steer applies to every adapter's dispatcher; capture it before
     // `cfg` fields are moved into the per-adapter setup below.
     let immediate_steer = cfg.steering.immediate_steer;
+    let agent_working_dir = cfg.agent.working_dir.clone();
 
     let pool = Arc::new(acp::SessionPool::new(cfg.agent, cfg.pool.max_sessions));
     let ttl_secs = cfg.pool.session_ttl_hours * 3600;
@@ -165,6 +166,8 @@ async fn main() -> anyhow::Result<()> {
         cfg.markdown.tables,
         cfg.pool.prompt_hard_timeout_secs,
         cfg.pool.liveness_check_secs,
+        cfg.attachments,
+        agent_working_dir,
     ));
 
     // Shutdown signal for Slack adapter

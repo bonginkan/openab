@@ -155,6 +155,14 @@ data:
     inherit_env = {{ $mergedInheritEnv | toJson }}
     {{- end }}
 
+    {{- if $cfg.attachments }}
+    [attachments]
+    enabled = {{ if hasKey ($cfg.attachments) "enabled" }}{{ ($cfg.attachments).enabled }}{{ else }}false{{ end }}
+    allowed_dirs = {{ ($cfg.attachments).allowedDirs | default list | toJson }}
+    max_bytes = {{ ($cfg.attachments).maxBytes | default 10485760 | int }}
+    max_files = {{ ($cfg.attachments).maxFiles | default 10 | int }}
+    {{- end }}
+
     [pool]
     max_sessions = {{ ($cfg.pool).maxSessions | default 10 }}
     session_ttl_hours = {{ ($cfg.pool).sessionTtlHours | default 24 }}

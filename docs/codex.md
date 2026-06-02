@@ -107,6 +107,22 @@ Generated images are saved by Codex under
 Codex to copy the selected output into `/home/node`, for example
 `/home/node/sky-birds.png`.
 
+To have OpenAB attach generated images back to Discord natively, enable outbound
+attachments and allow Codex's generated image directory:
+
+```toml
+[attachments]
+enabled = true
+allowed_dirs = ["/home/node", "/home/node/.codex/generated_images"]
+```
+
+Then have Codex prefix the response with an output directive:
+
+```text
+[[attach_image:/home/node/.codex/generated_images/sky-birds.png]]
+Here is the generated image.
+```
+
 > Note: Codex image generation may return a model-native size rather than the
 > exact dimensions requested in the prompt. If exact dimensions matter, resize
 > only when the user explicitly asks for it.

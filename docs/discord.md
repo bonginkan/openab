@@ -241,6 +241,10 @@ No configuration is needed — video forwarding is always enabled.
 
 OpenAB uses **edit-streaming** on Discord — the bot sends a placeholder message and updates it every 1.5 seconds as tokens arrive, giving a live typing effect.
 
+If the live response grows beyond Discord's message length limit, OpenAB keeps
+the earlier text visible by splitting the streaming display across multiple bot
+messages instead of truncating older content.
+
 Streaming is decided **per-thread**, not globally:
 
 | Thread state | Streaming |

@@ -80,6 +80,8 @@ pub struct Config {
     #[serde(default)]
     pub markdown: MarkdownConfig,
     #[serde(default)]
+    pub attachments: AttachmentsConfig,
+    #[serde(default)]
     pub cron: CronConfig,
     #[serde(default)]
     pub hooks: HooksConfig,
@@ -201,6 +203,36 @@ pub struct SttConfig {
     pub echo_transcript: bool,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct AttachmentsConfig {
+    /// Enable agent-to-user outbound image attachments via output directives.
+    /// Default: false to preserve existing text-only behavior.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Directories from which outbound images may be attached. Empty means the
+    /// agent working directory only.
+    #[serde(default)]
+    pub allowed_dirs: Vec<String>,
+    /// Max bytes per outbound image. Default matches Discord's default app file
+    /// upload limit.
+    #[serde(default = "default_attachment_max_bytes")]
+    pub max_bytes: u64,
+    /// Max outbound image files per ACP response.
+    #[serde(default = "default_attachment_max_files")]
+    pub max_files: usize,
+}
+
+impl Default for AttachmentsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            allowed_dirs: Vec::new(),
+            max_bytes: default_attachment_max_bytes(),
+            max_files: default_attachment_max_files(),
+        }
+    }
+}
+
 impl Default for SttConfig {
     fn default() -> Self {
         Self {
@@ -221,6 +253,12 @@ fn default_stt_base_url() -> String {
 }
 fn default_echo_transcript() -> bool {
     false
+}
+fn default_attachment_max_bytes() -> u64 {
+    10 * 1024 * 1024
+}
+fn default_attachment_max_files() -> usize {
+    10
 }
 
 #[derive(Debug, Deserialize)]
@@ -754,6 +792,14 @@ fn parse_config(raw: &str, source: &str) -> anyhow::Result<Config> {
         config.pool.liveness_check_secs > 0,
         "pool.liveness_check_secs must be > 0 (zero would spin the recv loop)"
     );
+    anyhow::ensure!(
+        config.attachments.max_bytes > 0,
+        "attachments.max_bytes must be > 0"
+    );
+    anyhow::ensure!(
+        config.attachments.max_files > 0,
+        "attachments.max_files must be > 0"
+    );
 
     Ok(config)
 }
@@ -778,6 +824,9 @@ command = "echo"
         assert_eq!(cfg.agent.command, "echo");
         assert_eq!(cfg.pool.max_sessions, 10);
         assert!(cfg.reactions.enabled);
+        assert!(!cfg.attachments.enabled);
+        assert_eq!(cfg.attachments.max_bytes, 10 * 1024 * 1024);
+        assert_eq!(cfg.attachments.max_files, 10);
     }
 
     #[test]
@@ -1046,6 +1095,58 @@ immediate_steer = true
 "#;
         let cfg = parse_config(toml, "test").unwrap();
         assert!(cfg.steering.immediate_steer);
+    }
+
+    #[test]
+    fn attachments_config_parses() {
+        let toml = r#"
+[discord]
+bot_token = "t"
+
+[agent]
+command = "echo"
+
+[attachments]
+enabled = true
+allowed_dirs = ["/workspace/out", "/tmp/openab-images"]
+max_bytes = 1024
+max_files = 2
+"#;
+        let cfg = parse_config(toml, "test").unwrap();
+        assert!(cfg.attachments.enabled);
+        assert_eq!(
+            cfg.attachments.allowed_dirs,
+            vec!["/workspace/out", "/tmp/openab-images"]
+        );
+        assert_eq!(cfg.attachments.max_bytes, 1024);
+        assert_eq!(cfg.attachments.max_files, 2);
+    }
+
+    #[test]
+    fn attachments_rejects_zero_limits() {
+        let toml = r#"
+[discord]
+bot_token = "t"
+
+[agent]
+command = "echo"
+
+[attachments]
+max_bytes = 0
+"#;
+        assert!(parse_config(toml, "test").is_err());
+
+        let toml = r#"
+[discord]
+bot_token = "t"
+
+[agent]
+command = "echo"
+
+[attachments]
+max_files = 0
+"#;
+        assert!(parse_config(toml, "test").is_err());
     }
 
     #[test]

@@ -72,6 +72,15 @@ working_dir = "/home/agent"
 # list them in inherit_env. Keys in [agent].env take precedence over inherited ones.
 # inherit_env = ["API_BASE_URL", "MODEL_NAME"]
 
+# [attachments]
+# enabled = false
+# # Enable agent-generated image uploads via [[attach_image:path]] output directives.
+# # Empty allowed_dirs means only [agent].working_dir is allowed.
+# # For Codex image generation, include "/home/node/.codex/generated_images".
+# # allowed_dirs = ["/home/agent"]
+# # max_bytes = 10485760
+# # max_files = 10
+
 # [agent]
 # # Local patched fork of codex-acp with mid-turn steering support, built via
 # # `cargo build` at /Users/thepioneer/Documents/GitHub/codex-acp. Point the codex

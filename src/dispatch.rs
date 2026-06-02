@@ -1276,6 +1276,8 @@ mod tests {
             crate::markdown::TableMode::Off,
             crate::config::default_prompt_hard_timeout_secs(),
             crate::config::default_liveness_check_secs(),
+            crate::config::AttachmentsConfig::default(),
+            "/tmp".into(),
         ));
         Dispatcher::with_idle_timeout(router, 10, 24_000, grouping, DEFAULT_CONSUMER_IDLE_TIMEOUT)
     }
