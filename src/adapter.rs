@@ -1322,7 +1322,41 @@ fn should_separate_stream_chunk(text_buf: &str, chunk: &str) -> bool {
         return false;
     };
 
+    if is_inside_inline_code_span(text_buf) {
+        return false;
+    }
+
     is_sentence_terminal(prev) && is_text_start(next)
+}
+
+fn is_inside_inline_code_span(text: &str) -> bool {
+    let line = text.rsplit('\n').next().unwrap_or(text);
+    let mut open_tick_run: Option<usize> = None;
+    let mut chars = line.chars().peekable();
+    let mut preceding_backslashes = 0usize;
+
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            preceding_backslashes += 1;
+            continue;
+        }
+
+        if ch == '`' && preceding_backslashes.is_multiple_of(2) {
+            let mut len = 1usize;
+            while chars.peek() == Some(&'`') {
+                chars.next();
+                len += 1;
+            }
+            match open_tick_run {
+                Some(open_len) if open_len == len => open_tick_run = None,
+                None => open_tick_run = Some(len),
+                _ => {}
+            }
+        }
+        preceding_backslashes = 0;
+    }
+
+    open_tick_run.is_some()
 }
 
 fn is_sentence_terminal(ch: char) -> bool {
@@ -1670,6 +1704,27 @@ mod tests {
         let mut text = "調査する。".to_string();
         append_text_chunk(&mut text, "次に確認する。", false);
         assert_eq!(text, "調査する。\n次に確認する。");
+    }
+
+    #[test]
+    fn append_text_chunk_does_not_separate_inside_inline_code() {
+        let mut text = "Use `foo.".to_string();
+        append_text_chunk(&mut text, "bar` now", false);
+        assert_eq!(text, "Use `foo.bar` now");
+    }
+
+    #[test]
+    fn append_text_chunk_does_not_separate_inside_multi_tick_inline_code() {
+        let mut text = "Use ``foo.".to_string();
+        append_text_chunk(&mut text, "bar`` now", false);
+        assert_eq!(text, "Use ``foo.bar`` now");
+    }
+
+    #[test]
+    fn append_text_chunk_separates_after_closed_inline_code() {
+        let mut text = "Use `foo`.".to_string();
+        append_text_chunk(&mut text, "Next step.", false);
+        assert_eq!(text, "Use `foo`.\nNext step.");
     }
 
     #[test]
