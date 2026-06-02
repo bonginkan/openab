@@ -30,9 +30,10 @@ output directive. OpenAB validates the file and uploads it through the Discord b
 └──────────┘                        └──────────────────────────┘
 ```
 
-OpenAB streams text over ACP, but it also parses output directives at the start
-of the agent response. `[[attach_image:path]]` is stripped from visible text and
-used only as delivery metadata.
+OpenAB streams text over ACP, but it also parses output directives from the
+agent response. `[[attach_image:path]]` is stripped from visible text and used
+only as delivery metadata; it can be placed in the initial directive header or
+on its own line later in the response.
 
 ## Step-by-Step
 

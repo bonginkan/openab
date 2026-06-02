@@ -32,7 +32,9 @@ pub struct OutputDirectives {
 pub fn parse_output_directives(content: &str) -> (OutputDirectives, String) {
     let mut directives = OutputDirectives::default();
     let Some(header_start) = output_directive_header_start(content) else {
-        return (directives, content.to_string());
+        let (attach_images, stripped) = extract_embedded_attach_image_directives(content);
+        directives.attach_images.extend(attach_images);
+        return (directives, stripped);
     };
     let mut content_start = header_start;
     let mut trailing_content: Option<&str> = None;
@@ -40,9 +42,11 @@ pub fn parse_output_directives(content: &str) -> (OutputDirectives, String) {
 
     for line in content[header_start..].lines() {
         let trimmed = line.trim();
-        // Try to match [[key:value]] at the start of the line (lenient: allows trailing content)
-        if let Some(after_open) = trimmed.strip_prefix("[[") {
-            if let Some(close_pos) = after_open.find("]]") {
+        // Try to match [[key:value]] at the start of the line (lenient: allows trailing content).
+        // Some markdown transports escape the brackets as \[\[key:value\]\]; treat that as
+        // the same directive while keeping parsing constrained to the response header.
+        if let Some(after_open) = strip_directive_open(trimmed) {
+            if let Some((close_pos, close_len)) = find_directive_close(after_open) {
                 let inner = &after_open[..close_pos];
                 if let Some((key, value)) = inner.split_once(':') {
                     parsed_any = true;
@@ -70,7 +74,7 @@ pub fn parse_output_directives(content: &str) -> (OutputDirectives, String) {
                         }
                     }
                     // Check for trailing content after ]]
-                    let remainder = after_open[close_pos + 2..].trim();
+                    let remainder = after_open[close_pos + close_len..].trim();
                     if !remainder.is_empty() {
                         trailing_content = Some(remainder);
                         // Advance past this line
@@ -105,7 +109,9 @@ pub fn parse_output_directives(content: &str) -> (OutputDirectives, String) {
     }
 
     if !parsed_any {
-        return (directives, content.to_string());
+        let (attach_images, stripped) = extract_embedded_attach_image_directives(content);
+        directives.attach_images.extend(attach_images);
+        return (directives, stripped);
     }
 
     let remaining = if let Some(trailing) = trailing_content {
@@ -119,34 +125,125 @@ pub fn parse_output_directives(content: &str) -> (OutputDirectives, String) {
     } else {
         String::new()
     };
+    let (attach_images, remaining) = extract_embedded_attach_image_directives(&remaining);
+    directives.attach_images.extend(attach_images);
     (directives, remaining)
 }
 
 fn output_directive_header_start(content: &str) -> Option<usize> {
     let mut start = 0;
     for (idx, ch) in content.char_indices() {
-        if ch.is_whitespace() || ch == '\u{feff}' || ch == '\u{200b}' {
+        if is_output_directive_padding_char(ch) {
             start = idx + ch.len_utf8();
         } else {
             break;
         }
     }
 
-    content[start..].starts_with("[[").then_some(start)
+    strip_directive_open(&content[start..])
+        .is_some()
+        .then_some(start)
 }
 
 fn strip_output_directives_for_display(content: &str) -> String {
-    let Some(header_start) = output_directive_header_start(content) else {
-        return content.to_string();
-    };
-
-    let header = &content[header_start..];
-    if header.strip_prefix("[[").is_some_and(|s| !s.contains("]]")) {
-        return content[..header_start].to_string();
+    if let Some(header_start) = output_directive_header_start(content) {
+        let header = &content[header_start..];
+        if strip_directive_open(header).is_some_and(|s| find_directive_close(s).is_none()) {
+            return content[..header_start].to_string();
+        }
     }
 
     let (_, stripped) = parse_output_directives(content);
     stripped
+}
+
+fn extract_embedded_attach_image_directives(content: &str) -> (Vec<String>, String) {
+    let mut attach_images = Vec::new();
+    let mut stripped = String::with_capacity(content.len());
+    let mut in_code_fence = false;
+
+    for line in content.split_inclusive('\n') {
+        let (body, line_ending) = split_line_ending(line);
+        let trimmed = body.trim();
+        if is_markdown_code_fence(trimmed) {
+            in_code_fence = !in_code_fence;
+            stripped.push_str(line);
+            continue;
+        }
+
+        if !in_code_fence {
+            if let Some((path, remainder)) = parse_attach_image_line(trimmed) {
+                attach_images.push(path);
+                if !remainder.is_empty() {
+                    stripped.push_str(remainder);
+                    stripped.push_str(line_ending);
+                }
+                continue;
+            }
+        }
+
+        stripped.push_str(line);
+    }
+
+    (attach_images, stripped)
+}
+
+fn split_line_ending(line: &str) -> (&str, &str) {
+    if let Some(body) = line.strip_suffix("\r\n") {
+        (body, "\r\n")
+    } else if let Some(body) = line.strip_suffix('\n') {
+        (body, "\n")
+    } else {
+        (line, "")
+    }
+}
+
+fn is_markdown_code_fence(trimmed_line: &str) -> bool {
+    trimmed_line.starts_with("```")
+}
+
+fn parse_attach_image_line(trimmed_line: &str) -> Option<(String, &str)> {
+    let after_open = strip_directive_open(trimmed_line)?;
+    let (close_pos, close_len) = find_directive_close(after_open)?;
+    let inner = &after_open[..close_pos];
+    let (key, value) = inner.split_once(':')?;
+    if key.trim() != "attach_image" {
+        return None;
+    }
+    let v = value.trim();
+    if !is_valid_attachment_directive_path(v) {
+        return None;
+    }
+    let remainder = after_open[close_pos + close_len..].trim();
+    Some((v.to_string(), remainder))
+}
+
+fn is_output_directive_padding_char(ch: char) -> bool {
+    ch.is_whitespace()
+        || matches!(
+            ch,
+            '\u{feff}'
+                | '\u{200b}'
+                | '\u{200c}'
+                | '\u{200d}'
+                | '\u{200e}'
+                | '\u{200f}'
+                | '\u{2060}'
+        )
+}
+
+fn strip_directive_open(line: &str) -> Option<&str> {
+    line.strip_prefix("[[")
+        .or_else(|| line.strip_prefix("\\[\\["))
+}
+
+fn find_directive_close(after_open: &str) -> Option<(usize, usize)> {
+    match (after_open.find("]]"), after_open.find("\\]\\]")) {
+        (Some(raw), Some(escaped)) if escaped < raw => Some((escaped, "\\]\\]".len())),
+        (Some(raw), _) => Some((raw, "]]".len())),
+        (None, Some(escaped)) => Some((escaped, "\\]\\]".len())),
+        (None, None) => None,
+    }
 }
 
 fn is_valid_attachment_directive_path(value: &str) -> bool {
@@ -1933,6 +2030,72 @@ mod directive_tests {
     }
 
     #[test]
+    fn parse_attach_image_from_body_directive_line() {
+        let input =
+            "Generated image:\n[[attach_image:/home/node/.codex/generated_images/out.png]]\nDone";
+        let (directives, content) = parse_output_directives(input);
+        assert_eq!(
+            directives.attach_images,
+            vec!["/home/node/.codex/generated_images/out.png".to_string()]
+        );
+        assert_eq!(content, "Generated image:\nDone");
+    }
+
+    #[test]
+    fn parse_attach_image_from_body_escaped_directive_line() {
+        let input =
+            "Generated image:\n\\[\\[attach_image:/home/node/.codex/generated_images/out.png\\]\\]\nDone";
+        let (directives, content) = parse_output_directives(input);
+        assert_eq!(
+            directives.attach_images,
+            vec!["/home/node/.codex/generated_images/out.png".to_string()]
+        );
+        assert_eq!(content, "Generated image:\nDone");
+    }
+
+    #[test]
+    fn parse_attach_image_from_body_preserves_trailing_line_content() {
+        let input =
+            "Generated image:\n[[attach_image:/home/node/.codex/generated_images/out.png]]Done";
+        let (directives, content) = parse_output_directives(input);
+        assert_eq!(
+            directives.attach_images,
+            vec!["/home/node/.codex/generated_images/out.png".to_string()]
+        );
+        assert_eq!(content, "Generated image:\nDone");
+    }
+
+    #[test]
+    fn parse_attach_image_ignores_code_fence_examples() {
+        let input =
+            "Example:\n```\n[[attach_image:/home/node/.codex/generated_images/out.png]]\n```\nDone";
+        let (directives, content) = parse_output_directives(input);
+        assert!(directives.attach_images.is_empty());
+        assert_eq!(content, input);
+    }
+
+    #[test]
+    fn strip_output_directives_for_display_hides_body_attach_image() {
+        let input =
+            "Generated image:\n[[attach_image:/home/node/.codex/generated_images/out.png]]\nDone";
+        assert_eq!(
+            strip_output_directives_for_display(input),
+            "Generated image:\nDone"
+        );
+    }
+
+    #[test]
+    fn parse_attach_image_directive_allows_escaped_brackets() {
+        let input = "\\[\\[attach_image:/home/node/.codex/generated_images/out.png\\]\\]\nDone";
+        let (directives, content) = parse_output_directives(input);
+        assert_eq!(
+            directives.attach_images,
+            vec!["/home/node/.codex/generated_images/out.png".to_string()]
+        );
+        assert_eq!(content, "Done");
+    }
+
+    #[test]
     fn parse_attach_image_allows_leading_blank_line() {
         let input = "\n[[attach_image:/home/node/.codex/generated_images/out.png]]\nDone";
         let (directives, content) = parse_output_directives(input);
@@ -1947,6 +2110,18 @@ mod directive_tests {
     fn parse_attach_image_allows_leading_invisible_chars() {
         let input =
             "\u{feff}\u{200b}[[attach_image:/home/node/.codex/generated_images/out.png]]\nDone";
+        let (directives, content) = parse_output_directives(input);
+        assert_eq!(
+            directives.attach_images,
+            vec!["/home/node/.codex/generated_images/out.png".to_string()]
+        );
+        assert_eq!(content, "Done");
+    }
+
+    #[test]
+    fn parse_attach_image_allows_common_leading_format_chars() {
+        let input =
+            "\u{2060}\u{200e}[[attach_image:/home/node/.codex/generated_images/out.png]]\nDone";
         let (directives, content) = parse_output_directives(input);
         assert_eq!(
             directives.attach_images,
