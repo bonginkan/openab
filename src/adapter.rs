@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Mutex;
 use tracing::{error, warn};
 
@@ -640,7 +641,7 @@ pub struct AdapterRouter {
     pool: Arc<SessionPool>,
     reactions_config: ReactionsConfig,
     table_mode: TableMode,
-    prompt_hard_timeout: std::time::Duration,
+    prompt_hard_timeout: Option<Duration>,
     /// Polling cadence for the recv-loop liveness check (#732).
     liveness_check_interval: std::time::Duration,
     /// Session keys whose next text chunk should start a new visible response
@@ -651,6 +652,10 @@ pub struct AdapterRouter {
     /// latest user message and points future edits at it.
     active_posts: Arc<Mutex<HashMap<String, Arc<StreamingPostController>>>>,
     outbound_attachments: OutboundAttachments,
+}
+
+fn prompt_hard_timeout_from_secs(secs: u64) -> Option<Duration> {
+    (secs > 0).then(|| Duration::from_secs(secs))
 }
 
 struct StreamingPostInner {
@@ -805,7 +810,8 @@ impl AdapterRouter {
         attachments_config: AttachmentsConfig,
         agent_working_dir: String,
     ) -> Self {
-        if liveness_check_secs >= prompt_hard_timeout_secs {
+        let prompt_hard_timeout = prompt_hard_timeout_from_secs(prompt_hard_timeout_secs);
+        if prompt_hard_timeout.is_some() && liveness_check_secs >= prompt_hard_timeout_secs {
             warn!(
                 liveness_check_secs,
                 prompt_hard_timeout_secs,
@@ -818,7 +824,7 @@ impl AdapterRouter {
             pool,
             reactions_config,
             table_mode,
-            prompt_hard_timeout: std::time::Duration::from_secs(prompt_hard_timeout_secs),
+            prompt_hard_timeout,
             liveness_check_interval: std::time::Duration::from_secs(liveness_check_secs),
             pending_steer_separators: Arc::new(Mutex::new(HashSet::new())),
             active_posts: Arc::new(Mutex::new(HashMap::new())),
@@ -1094,8 +1100,8 @@ impl AdapterRouter {
                     };
 
                     // (#732) Liveness-aware recv loop. Filters stale id-bearing
-                    // messages and abandons cleanly on dead agent / hard ceiling
-                    // so late responses cannot leak into the next prompt.
+                    // messages and abandons cleanly on dead agent / optional hard
+                    // ceiling so late responses cannot leak into the next prompt.
                     let mut response_error: Option<String> = None;
                     let prompt_start = tokio::time::Instant::now();
                     loop {
@@ -1111,13 +1117,15 @@ impl AdapterRouter {
                                     conn.abandon_request(request_id).await;
                                     break;
                                 }
-                                if prompt_start.elapsed() > prompt_hard_timeout {
-                                    response_error = Some(format!(
-                                        "Agent exceeded hard timeout ({}s)",
-                                        prompt_hard_timeout.as_secs(),
-                                    ));
-                                    conn.abandon_request(request_id).await;
-                                    break;
+                                if let Some(prompt_hard_timeout) = prompt_hard_timeout {
+                                    if prompt_start.elapsed() > prompt_hard_timeout {
+                                        response_error = Some(format!(
+                                            "Agent exceeded hard timeout ({}s)",
+                                            prompt_hard_timeout.as_secs(),
+                                        ));
+                                        conn.abandon_request(request_id).await;
+                                        break;
+                                    }
                                 }
                                 continue;
                             }
@@ -1758,6 +1766,15 @@ mod tests {
         let adapter = TestAdapter;
         // Verify the method is callable and returns the declared value
         assert!(!adapter.use_streaming(false));
+    }
+
+    #[test]
+    fn prompt_hard_timeout_zero_is_disabled() {
+        assert_eq!(prompt_hard_timeout_from_secs(0), None);
+        assert_eq!(
+            prompt_hard_timeout_from_secs(1),
+            Some(std::time::Duration::from_secs(1))
+        );
     }
 
     #[test]

@@ -202,6 +202,8 @@ env = {}                              # extra env vars passed to the agent
 [pool]
 max_sessions = 10                     # max concurrent sessions
 session_ttl_hours = 24                # idle session TTL
+prompt_hard_timeout_secs = 0          # 0 disables prompt hard timeout
+liveness_check_secs = 30              # agent liveness check cadence
 
 [reactions]
 enabled = true                        # enable emoji status reactions
