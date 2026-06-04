@@ -6,6 +6,8 @@ config.toml
 .DS_Store
 .env
 .kiro/
+openab-restart.log
+openab-restart-scheduler.log
 
 # Claude Code (https://claude.ai/code)
 CLAUDE.md
