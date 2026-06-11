@@ -11,9 +11,11 @@
 
 ---
 
-OpenAB can relay agent-generated images to Discord when outbound attachments are enabled.
-The agent writes an image file, then prefixes its response with an `attach_image`
-output directive. OpenAB validates the file and uploads it through the Discord bot.
+OpenAB can relay agent-generated files and images to Discord when outbound
+attachments are enabled. This page covers image-specific behavior. The agent
+writes an image file, then prefixes its response with an `attach_image` output
+directive. OpenAB validates the file as an image and uploads it through the
+Discord bot.
 
 > For sending non-image files (PDF, CSV, logs, etc.), see [sendfiles.md](sendfiles.md).
 
@@ -123,7 +125,10 @@ These are typically already granted if your bot works with OpenAB.
 A: Yes, when `[attachments].enabled = true` and the agent emits `[[attach_image:path]]`.
 
 **Q: Does this work with Slack / Telegram / LINE?**
-A: Native `attach_image` relay is currently implemented for Discord. Other platforms still need a platform-specific uploader or future adapter support.
+A: Native outbound attachment relay is currently implemented for Discord. Other platforms still need a platform-specific uploader or future adapter support.
+
+**Q: Can OpenAB relay non-image files?**
+A: Yes. Use `[[attach_file:path]]`; see [sendfiles.md](sendfiles.md).
 
 **Q: What image formats are supported?**
 A: PNG, JPEG, GIF, and WebP. The OpenAB default per-file cap is 10 MiB, matching Discord's current default app upload limit.

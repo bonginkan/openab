@@ -11,27 +11,23 @@
 
 ---
 
-OpenAB can relay image attachments via `[[attach_image:path]]`, but it does
-**not** relay non-image file attachments from the agent. To send a non-image file
-back to the user, the agent must call the Discord API directly or send an
-external link.
+OpenAB can relay files from the agent with `[[attach_file:path]]` when outbound
+attachments are enabled. The agent writes a file, emits the directive, and OpenAB
+uploads the file through the Discord bot.
 
 > For image-specific guidance (formats, output directive), see [sendimages.md](sendimages.md).
 
 ## How It Works
 
-### Direct Upload (small files)
-
 ```
-┌──────────┐  text only   ┌──────────┐  ACP stdio   ┌──────────────┐
-│  Discord  │◄────────────│  OpenAB   │◄────────────│  Agent (CLI)  │
-│  Thread   │             └──────────┘              └──────┬───────┘
-│           │                                              │
-│           │         Discord REST API                     │
-│           │◄─────────────────────────────────────────────┘
-│           │  POST /channels/{thread_id}/messages
-│           │  + multipart file attachment
-└──────────┘
+┌──────────┐  message + file   ┌──────────┐  ACP stdio   ┌──────────────┐
+│ Discord  │◄──────────────────│ OpenAB   │◄────────────│ Agent (CLI)  │
+│ Thread   │                   └────┬─────┘             └──────┬───────┘
+│          │                        │                          │
+│          │ Discord REST API       │ read file                 │ writes file
+│          │ POST /messages         │ from allowed dir          │ emits directive
+│          │ + files[n]             │                          │
+└──────────┘                        └──────────────────────────┘
 ```
 
 ### Enterprise / Large Files (presigned URL)
@@ -52,10 +48,61 @@ external link.
                               ◄─────────────────────────────────────────────┘
 ```
 
-OpenAB only streams text via ACP. To send a file, the agent calls the
-Discord API directly using the `thread_id` from `sender_context`.
+OpenAB streams text over ACP, but it also parses output directives from the
+agent response. `[[attach_file:path]]` is stripped from visible text and used
+only as delivery metadata.
 
 ## Step-by-Step
+
+### 1. Enable outbound attachments
+
+Outbound attachments are off by default.
+
+```toml
+[attachments]
+enabled = true
+```
+
+When `allowed_dirs` is omitted or empty, OpenAB only allows files under
+`[agent].working_dir`. Add any artifact output directory the agent should be
+allowed to share:
+
+```toml
+[agent]
+working_dir = "/home/node"
+
+[attachments]
+enabled = true
+allowed_dirs = ["/home/node", "/home/node/reports"]
+max_bytes = 10485760
+max_files = 10
+```
+
+### 2. Have the agent emit `attach_file`
+
+```
+[[attach_file:/home/node/reports/delivery-note.docx]]
+Here is the delivery note.
+```
+
+Relative paths are resolved from `[agent].working_dir`.
+
+### 3. Permissions
+
+OpenAB uses the existing Discord bot token from `[discord] bot_token`; the token
+is not forwarded to the agent subprocess.
+
+The bot needs:
+
+- `Send Messages`
+- `Send Messages in Threads`
+- `Attach Files`
+
+## Legacy Direct Upload Pattern
+
+Older deployments can still use an out-of-band uploader or sidecar that calls the
+Discord Create Message endpoint directly with `multipart/form-data`. Native
+OpenAB relay is preferred because the agent does not need a Discord token.
 
 ### 1. Get the Target Channel from `sender_context`
 

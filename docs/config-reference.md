@@ -107,17 +107,18 @@ The AI agent subprocess that OpenAB spawns to handle messages via ACP.
 
 ## `[attachments]`
 
-Outbound image attachments from the agent back to the user.
+Outbound file/image attachments from the agent back to the user.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `enabled` | bool | `false` | Enable `[[attach_image:path]]` output directives. Disabled by default to preserve text-only behavior. |
-| `allowed_dirs` | string[] | `[]` | Directories OpenAB may read outbound image files from. Empty means only `[agent].working_dir`. |
-| `max_bytes` | u64 | `10485760` | Maximum bytes per outbound image. Default is 10 MiB. |
-| `max_files` | usize | `10` | Maximum outbound image files per ACP response. |
+| `enabled` | bool | `false` | Enable `[[attach_image:path]]` and `[[attach_file:path]]` output directives. Disabled by default to preserve text-only behavior. |
+| `allowed_dirs` | string[] | `[]` | Directories OpenAB may read outbound files from. Empty means only `[agent].working_dir`. |
+| `max_bytes` | u64 | `10485760` | Maximum bytes per outbound file. Default is 10 MiB. |
+| `max_files` | usize | `10` | Maximum outbound files per ACP response. |
 
-Supported image formats are PNG, JPEG, GIF, and WebP. Relative directive paths
-are resolved from `[agent].working_dir`.
+`attach_image` validates PNG, JPEG, GIF, and WebP. `attach_file` accepts other
+regular files such as DOCX, PDF, CSV, ZIP, logs, and reports. Relative directive
+paths are resolved from `[agent].working_dir`.
 
 ```toml
 [agent]
@@ -130,10 +131,11 @@ max_bytes = 10485760
 max_files = 10
 ```
 
-Agents attach a generated image by prefixing their output with:
+Agents attach generated artifacts by prefixing their output with:
 
 ```text
 [[attach_image:/home/node/.codex/generated_images/out.png]]
+[[attach_file:/home/node/reports/delivery-note.docx]]
 Here is the generated image.
 ```
 

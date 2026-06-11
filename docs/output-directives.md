@@ -9,6 +9,7 @@ Agents can control platform-specific message delivery by prefixing their output 
 ```
 [[reply_to:1502606076451885136]]
 [[attach_image:/home/node/.codex/generated_images/out.png]]
+[[attach_file:/home/node/reports/delivery-note.docx]]
 [[ephemeral:true]]              ← future
 Actual message content starts here...
 ```
@@ -16,11 +17,11 @@ Actual message content starts here...
 Rules:
 - Consecutive `[[key:value]]` lines at the start of output = directive header block
 - First line that doesn't match `[[key:value]]` (with colon) = content begins
-- `attach_image` may also appear later outside code blocks, including inline with surrounding text; this supports generated-image workflows where the agent writes explanatory text before the path is known
+- `attach_image` and `attach_file` may also appear later outside code blocks, including inline with surrounding text; this supports workflows where the agent writes explanatory text before the path is known
 - `[[X]]` without colon is NOT a directive — stops parsing, preserved as content
 - Directives are stripped from the final message (never visible to users)
 - Unknown keys are silently ignored (forward compatible, logged at debug level)
-- If the same key appears multiple times, the last value wins
+- `reply_to` uses the last valid value; attachment directives accumulate
 
 ## Available Directives
 
@@ -114,3 +115,33 @@ allowed_dirs = ["/home/node", "/home/node/.codex/generated_images"]
 - If validation or upload fails, OpenAB sends a warning instead of exposing the directive.
 
 **Security**: OpenAB canonicalizes the requested file path and only reads files under `attachments.allowed_dirs` (or `[agent].working_dir` by default). Do not set `allowed_dirs` wider than the directory where agents intentionally write shareable artifacts.
+
+### `attach_file`
+
+Attach a local non-image file produced by the agent to the outgoing user-facing response.
+
+```
+[[attach_file:/home/node/reports/delivery-note.docx]]
+Here is the delivery note.
+```
+
+**Value**: Local file path visible to the OpenAB process. Relative paths are resolved from `[agent].working_dir`.
+
+**Configuration**: Uses the same `[attachments]` settings as `attach_image`:
+
+```toml
+[attachments]
+enabled = true
+allowed_dirs = ["/home/node", "/home/node/reports"]
+```
+
+**Behavior**:
+- Supported output platforms: Discord.
+- Intended for non-image files such as DOCX, PDF, CSV, ZIP, logs, and reports.
+- Files are read by OpenAB, capped by `attachments.max_bytes`, then uploaded as Discord message attachments.
+- Multiple `attach_file` directives are allowed; `attachments.max_files` caps total image/file attachments per response.
+- Like `attach_image`, `attach_file` can be emitted either in the initial directive header or later in the response outside code blocks.
+- Directives are stripped from visible text.
+- If validation or upload fails, OpenAB sends a warning instead of exposing the directive.
+
+**Security**: OpenAB canonicalizes the requested file path and only reads files under `attachments.allowed_dirs` (or `[agent].working_dir` by default). Do not set `allowed_dirs` wider than directories where agents intentionally write shareable artifacts.

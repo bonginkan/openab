@@ -148,9 +148,12 @@ kubectl exec -it deployment/openab-codex -- \
 
 ## Sending Generated Images Back to Discord
 
-OpenAB streams text over ACP only. It does **not** relay image attachments from
-Codex back to Discord. To send a generated image, Codex must call the Discord
-REST API directly. See [sendimages.md](sendimages.md) for the full protocol.
+OpenAB can relay generated image/file attachments from Codex back to Discord
+when `[attachments].enabled = true`. See [sendimages.md](sendimages.md) for
+image output and [sendfiles.md](sendfiles.md) for non-image files.
+
+Older deployments that do not support outbound attachment directives can still
+use the direct Discord REST API pattern below.
 
 The agent should:
 

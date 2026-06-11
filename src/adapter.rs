@@ -26,6 +26,8 @@ pub struct OutputDirectives {
     pub reply_to: Option<String>,
     /// Local image files produced by the agent and safe-listed for outbound upload.
     pub attach_images: Vec<String>,
+    /// Local files produced by the agent and safe-listed for outbound upload.
+    pub attach_files: Vec<String>,
 }
 
 /// Parse `[[key:value]]` directives from the beginning of agent output.
@@ -33,8 +35,10 @@ pub struct OutputDirectives {
 pub fn parse_output_directives(content: &str) -> (OutputDirectives, String) {
     let mut directives = OutputDirectives::default();
     let Some(header_start) = output_directive_header_start(content) else {
-        let (attach_images, stripped) = extract_embedded_attach_image_directives(content);
+        let (attach_images, attach_files, stripped) =
+            extract_embedded_attachment_directives(content);
         directives.attach_images.extend(attach_images);
+        directives.attach_files.extend(attach_files);
         return (directives, stripped);
     };
     let mut content_start = header_start;
@@ -68,6 +72,12 @@ pub fn parse_output_directives(content: &str) -> (OutputDirectives, String) {
                             let v = value.trim();
                             if is_valid_attachment_directive_path(v) {
                                 directives.attach_images.push(v.to_string());
+                            }
+                        }
+                        "attach_file" => {
+                            let v = value.trim();
+                            if is_valid_attachment_directive_path(v) {
+                                directives.attach_files.push(v.to_string());
                             }
                         }
                         _ => {
@@ -110,8 +120,10 @@ pub fn parse_output_directives(content: &str) -> (OutputDirectives, String) {
     }
 
     if !parsed_any {
-        let (attach_images, stripped) = extract_embedded_attach_image_directives(content);
+        let (attach_images, attach_files, stripped) =
+            extract_embedded_attachment_directives(content);
         directives.attach_images.extend(attach_images);
+        directives.attach_files.extend(attach_files);
         return (directives, stripped);
     }
 
@@ -126,8 +138,10 @@ pub fn parse_output_directives(content: &str) -> (OutputDirectives, String) {
     } else {
         String::new()
     };
-    let (attach_images, remaining) = extract_embedded_attach_image_directives(&remaining);
+    let (attach_images, attach_files, remaining) =
+        extract_embedded_attachment_directives(&remaining);
     directives.attach_images.extend(attach_images);
+    directives.attach_files.extend(attach_files);
     (directives, remaining)
 }
 
@@ -158,8 +172,9 @@ fn strip_output_directives_for_display(content: &str) -> String {
     stripped
 }
 
-fn extract_embedded_attach_image_directives(content: &str) -> (Vec<String>, String) {
+fn extract_embedded_attachment_directives(content: &str) -> (Vec<String>, Vec<String>, String) {
     let mut attach_images = Vec::new();
+    let mut attach_files = Vec::new();
     let mut stripped = String::with_capacity(content.len());
     let mut in_code_fence = false;
 
@@ -173,9 +188,11 @@ fn extract_embedded_attach_image_directives(content: &str) -> (Vec<String>, Stri
         }
 
         if !in_code_fence {
-            let (paths, stripped_body) = strip_attach_image_directives_from_line(body);
-            if !paths.is_empty() {
-                attach_images.extend(paths);
+            let (image_paths, file_paths, stripped_body) =
+                strip_attachment_directives_from_line(body);
+            if !image_paths.is_empty() || !file_paths.is_empty() {
+                attach_images.extend(image_paths);
+                attach_files.extend(file_paths);
                 if !stripped_body.is_empty() {
                     stripped.push_str(&stripped_body);
                     stripped.push_str(line_ending);
@@ -187,7 +204,7 @@ fn extract_embedded_attach_image_directives(content: &str) -> (Vec<String>, Stri
         stripped.push_str(line);
     }
 
-    (attach_images, stripped)
+    (attach_images, attach_files, stripped)
 }
 
 fn split_line_ending(line: &str) -> (&str, &str) {
@@ -204,8 +221,9 @@ fn is_markdown_code_fence(trimmed_line: &str) -> bool {
     trimmed_line.starts_with("```")
 }
 
-fn strip_attach_image_directives_from_line(line: &str) -> (Vec<String>, String) {
+fn strip_attachment_directives_from_line(line: &str) -> (Vec<String>, Vec<String>, String) {
     let mut attach_images = Vec::new();
+    let mut attach_files = Vec::new();
     let mut stripped = String::with_capacity(line.len());
     let mut copied_until = 0;
     let mut search_start = 0;
@@ -222,7 +240,8 @@ fn strip_attach_image_directives_from_line(line: &str) -> (Vec<String>, String) 
             search_start = after_open_idx;
             continue;
         };
-        if key.trim() != "attach_image" {
+        let key = key.trim();
+        if key != "attach_image" && key != "attach_file" {
             search_start = after_open_idx;
             continue;
         }
@@ -233,13 +252,17 @@ fn strip_attach_image_directives_from_line(line: &str) -> (Vec<String>, String) 
         }
 
         stripped.push_str(&line[copied_until..open_idx]);
-        attach_images.push(v.to_string());
+        match key {
+            "attach_image" => attach_images.push(v.to_string()),
+            "attach_file" => attach_files.push(v.to_string()),
+            _ => unreachable!("directive key checked above"),
+        }
         search_start = after_open_idx + close_pos + close_len;
         copied_until = search_start;
     }
 
     stripped.push_str(&line[copied_until..]);
-    (attach_images, stripped)
+    (attach_images, attach_files, stripped)
 }
 
 fn has_unclosed_output_directive(text: &str) -> bool {
@@ -504,6 +527,21 @@ struct OutboundAttachments {
     max_files: usize,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum OutboundAttachmentKind {
+    Image,
+    File,
+}
+
+impl OutboundAttachmentKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Image => "image",
+            Self::File => "file",
+        }
+    }
+}
+
 impl OutboundAttachments {
     fn new(config: AttachmentsConfig, agent_working_dir: impl Into<PathBuf>) -> Self {
         let agent_working_dir = agent_working_dir.into();
@@ -521,39 +559,57 @@ impl OutboundAttachments {
         }
     }
 
-    async fn load_images(&self, paths: &[String]) -> (Vec<OutboundAttachment>, Vec<String>) {
+    async fn load_attachments(
+        &self,
+        image_paths: &[String],
+        file_paths: &[String],
+    ) -> (Vec<OutboundAttachment>, Vec<String>) {
         let mut warnings = Vec::new();
-        if paths.is_empty() {
+        let total_paths = image_paths.len() + file_paths.len();
+        if total_paths == 0 {
             return (Vec::new(), warnings);
         }
         if !self.enabled {
             warnings.push(
-                "⚠️ Outbound image attachment skipped because [attachments].enabled is false."
+                "⚠️ Outbound attachment skipped because [attachments].enabled is false."
                     .to_string(),
             );
             return (Vec::new(), warnings);
         }
 
         let mut attachments = Vec::new();
-        for raw_path in paths.iter().take(self.max_files) {
-            match self.load_one_image(raw_path).await {
+        let requested = image_paths
+            .iter()
+            .map(|path| (path, OutboundAttachmentKind::Image))
+            .chain(
+                file_paths
+                    .iter()
+                    .map(|path| (path, OutboundAttachmentKind::File)),
+            );
+        for (raw_path, kind) in requested.take(self.max_files) {
+            match self.load_one_attachment(raw_path, kind).await {
                 Ok(file) => attachments.push(file),
                 Err(e) => warnings.push(format!(
-                    "⚠️ Outbound image attachment skipped for `{}`: {e}",
+                    "⚠️ Outbound {} attachment skipped for `{}`: {e}",
+                    kind.label(),
                     sanitize_attachment_label(raw_path)
                 )),
             }
         }
-        if paths.len() > self.max_files {
+        if total_paths > self.max_files {
             warnings.push(format!(
-                "⚠️ Outbound image attachment limit reached; skipped {} file(s).",
-                paths.len() - self.max_files
+                "⚠️ Outbound attachment limit reached; skipped {} file(s).",
+                total_paths - self.max_files
             ));
         }
         (attachments, warnings)
     }
 
-    async fn load_one_image(&self, raw_path: &str) -> Result<OutboundAttachment> {
+    async fn load_one_attachment(
+        &self,
+        raw_path: &str,
+        kind: OutboundAttachmentKind,
+    ) -> Result<OutboundAttachment> {
         let candidate = self.resolve_agent_path(raw_path);
         let canonical = tokio::fs::canonicalize(&candidate)
             .await
@@ -576,7 +632,9 @@ impl OutboundAttachments {
             data.len(),
             self.max_bytes
         );
-        ensure_supported_image(&data)?;
+        if matches!(kind, OutboundAttachmentKind::Image) {
+            ensure_supported_image(&data)?;
+        }
 
         let filename = canonical
             .file_name()
@@ -1228,9 +1286,10 @@ impl AdapterRouter {
                     // Directives are agent meta-layer, not content — must be stripped
                     // before tool lines are composed into the display output.
                     let (directives, stripped_text) = parse_output_directives(&text_buf);
-                    let has_attachment_directives = !directives.attach_images.is_empty();
+                    let has_attachment_directives =
+                        !directives.attach_images.is_empty() || !directives.attach_files.is_empty();
                     let (attachments, attachment_warnings) = outbound_attachments
-                        .load_images(&directives.attach_images)
+                        .load_attachments(&directives.attach_images, &directives.attach_files)
                         .await;
                     let text_buf = stripped_text;
 
@@ -2001,13 +2060,58 @@ mod tests {
         let outbound = OutboundAttachments::new(cfg, dir.path().to_string_lossy().to_string());
 
         let (files, warnings) = outbound
-            .load_images(&[image_path.to_string_lossy().to_string()])
+            .load_attachments(&[image_path.to_string_lossy().to_string()], &[])
             .await;
 
         assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].filename, "generated.png");
         assert!(!files[0].data.is_empty());
+    }
+
+    #[tokio::test]
+    async fn outbound_attachments_loads_file_without_image_validation() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("delivery-note.docx");
+        std::fs::write(&file_path, b"not an image").unwrap();
+        let cfg = AttachmentsConfig {
+            enabled: true,
+            allowed_dirs: vec![dir.path().to_string_lossy().to_string()],
+            max_bytes: 1024 * 1024,
+            max_files: 10,
+        };
+        let outbound = OutboundAttachments::new(cfg, dir.path().to_string_lossy().to_string());
+
+        let (files, warnings) = outbound
+            .load_attachments(&[], &[file_path.to_string_lossy().to_string()])
+            .await;
+
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].filename, "delivery-note.docx");
+        assert_eq!(files[0].data, b"not an image");
+    }
+
+    #[tokio::test]
+    async fn outbound_attachments_rejects_non_image_for_attach_image() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("delivery-note.docx");
+        std::fs::write(&file_path, b"not an image").unwrap();
+        let cfg = AttachmentsConfig {
+            enabled: true,
+            allowed_dirs: vec![dir.path().to_string_lossy().to_string()],
+            max_bytes: 1024 * 1024,
+            max_files: 10,
+        };
+        let outbound = OutboundAttachments::new(cfg, dir.path().to_string_lossy().to_string());
+
+        let (files, warnings) = outbound
+            .load_attachments(&[file_path.to_string_lossy().to_string()], &[])
+            .await;
+
+        assert!(files.is_empty());
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("not a supported image"));
     }
 
     #[tokio::test]
@@ -2025,7 +2129,7 @@ mod tests {
         let outbound = OutboundAttachments::new(cfg, allowed.path().to_string_lossy().to_string());
 
         let (files, warnings) = outbound
-            .load_images(&[image_path.to_string_lossy().to_string()])
+            .load_attachments(&[image_path.to_string_lossy().to_string()], &[])
             .await;
 
         assert!(files.is_empty());
@@ -2045,7 +2149,9 @@ mod tests {
         };
         let outbound = OutboundAttachments::new(cfg, dir.path().to_string_lossy().to_string());
 
-        let (files, warnings) = outbound.load_images(&["relative.png".to_string()]).await;
+        let (files, warnings) = outbound
+            .load_attachments(&["relative.png".to_string()], &[])
+            .await;
 
         assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
         assert_eq!(files.len(), 1);
@@ -2063,7 +2169,9 @@ mod tests {
         };
         let outbound = OutboundAttachments::new(cfg, dir.path().to_string_lossy().to_string());
 
-        let (files, warnings) = outbound.load_images(&["missing.png".to_string()]).await;
+        let (files, warnings) = outbound
+            .load_attachments(&["missing.png".to_string()], &[])
+            .await;
 
         assert!(files.is_empty());
         assert_eq!(warnings.len(), 1);
@@ -2097,6 +2205,7 @@ mod directive_tests {
         let (directives, content) = parse_output_directives(input);
         assert_eq!(directives.reply_to, Some("123456".to_string()));
         assert!(directives.attach_images.is_empty());
+        assert!(directives.attach_files.is_empty());
         assert_eq!(content, "Content here");
     }
 
@@ -2109,6 +2218,47 @@ mod directive_tests {
             vec!["/home/node/.codex/generated_images/out.png".to_string()]
         );
         assert_eq!(content, "Done");
+    }
+
+    #[test]
+    fn parse_attach_file_directive() {
+        let input = "[[attach_file:/home/node/reports/delivery-note.docx]]\nDone";
+        let (directives, content) = parse_output_directives(input);
+        assert_eq!(
+            directives.attach_files,
+            vec!["/home/node/reports/delivery-note.docx".to_string()]
+        );
+        assert_eq!(content, "Done");
+    }
+
+    #[test]
+    fn parse_attach_file_directive_allows_escaped_brackets() {
+        let input = "\\[\\[attach_file:/home/node/reports/delivery-note.docx\\]\\]\nDone";
+        let (directives, content) = parse_output_directives(input);
+        assert_eq!(
+            directives.attach_files,
+            vec!["/home/node/reports/delivery-note.docx".to_string()]
+        );
+        assert_eq!(content, "Done");
+    }
+
+    #[test]
+    fn parse_attach_file_directive_rejects_empty_path() {
+        let input = "[[attach_file:]]\nDone";
+        let (directives, content) = parse_output_directives(input);
+        assert!(directives.attach_files.is_empty());
+        assert_eq!(content, "Done");
+    }
+
+    #[test]
+    fn parse_attach_file_from_body_directive_line() {
+        let input = "Generated file:\n[[attach_file:/home/node/reports/delivery-note.docx]]\nDone";
+        let (directives, content) = parse_output_directives(input);
+        assert_eq!(
+            directives.attach_files,
+            vec!["/home/node/reports/delivery-note.docx".to_string()]
+        );
+        assert_eq!(content, "Generated file:\nDone");
     }
 
     #[test]
@@ -2171,11 +2321,31 @@ mod directive_tests {
     }
 
     #[test]
+    fn parse_attach_file_from_inline_body_escaped_text() {
+        let input = "Generated file.\\[\\[attach_file:/home/node/reports/delivery-note.docx\\]\\]";
+        let (directives, content) = parse_output_directives(input);
+        assert_eq!(
+            directives.attach_files,
+            vec!["/home/node/reports/delivery-note.docx".to_string()]
+        );
+        assert_eq!(content, "Generated file.");
+    }
+
+    #[test]
     fn parse_attach_image_ignores_code_fence_examples() {
         let input =
             "Example:\n```\n[[attach_image:/home/node/.codex/generated_images/out.png]]\n```\nDone";
         let (directives, content) = parse_output_directives(input);
         assert!(directives.attach_images.is_empty());
+        assert_eq!(content, input);
+    }
+
+    #[test]
+    fn parse_attach_file_ignores_code_fence_examples() {
+        let input =
+            "Example:\n```\n[[attach_file:/home/node/reports/delivery-note.docx]]\n```\nDone";
+        let (directives, content) = parse_output_directives(input);
+        assert!(directives.attach_files.is_empty());
         assert_eq!(content, input);
     }
 
@@ -2253,10 +2423,27 @@ mod directive_tests {
     }
 
     #[test]
+    fn parse_mixed_attachment_directives() {
+        let input = "[[attach_image:preview.png]]\n[[attach_file:delivery-note.docx]]\nDone";
+        let (directives, content) = parse_output_directives(input);
+        assert_eq!(directives.attach_images, vec!["preview.png"]);
+        assert_eq!(directives.attach_files, vec!["delivery-note.docx"]);
+        assert_eq!(content, "Done");
+    }
+
+    #[test]
     fn parse_attach_image_rejects_empty_path() {
         let input = "[[attach_image:]]\nDone";
         let (directives, content) = parse_output_directives(input);
         assert!(directives.attach_images.is_empty());
+        assert_eq!(content, "Done");
+    }
+
+    #[test]
+    fn parse_attach_file_rejects_empty_path() {
+        let input = "[[attach_file:]]\nDone";
+        let (directives, content) = parse_output_directives(input);
+        assert!(directives.attach_files.is_empty());
         assert_eq!(content, "Done");
     }
 

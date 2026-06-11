@@ -205,19 +205,19 @@ pub struct SttConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct AttachmentsConfig {
-    /// Enable agent-to-user outbound image attachments via output directives.
+    /// Enable agent-to-user outbound attachments via output directives.
     /// Default: false to preserve existing text-only behavior.
     #[serde(default)]
     pub enabled: bool,
-    /// Directories from which outbound images may be attached. Empty means the
+    /// Directories from which outbound files may be attached. Empty means the
     /// agent working directory only.
     #[serde(default)]
     pub allowed_dirs: Vec<String>,
-    /// Max bytes per outbound image. Default matches Discord's default app file
+    /// Max bytes per outbound file. Default matches Discord's default app file
     /// upload limit.
     #[serde(default = "default_attachment_max_bytes")]
     pub max_bytes: u64,
-    /// Max outbound image files per ACP response.
+    /// Max outbound files per ACP response.
     #[serde(default = "default_attachment_max_files")]
     pub max_files: usize,
 }
