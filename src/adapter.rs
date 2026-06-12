@@ -1085,6 +1085,13 @@ impl AdapterRouter {
         let thread_channel = thread_channel.clone();
         let message_limit = adapter.message_limit();
         let streaming = adapter.use_streaming(other_bot_present);
+        if !streaming {
+            tracing::info!(
+                thread_key,
+                other_bot_present,
+                "streaming disabled for this prompt; output will post once when the turn ends"
+            );
+        }
         let table_mode = self.table_mode;
         let tool_display = self.reactions_config.tool_display;
         let prompt_hard_timeout = self.prompt_hard_timeout;
@@ -1195,6 +1202,11 @@ impl AdapterRouter {
                                 // real subprocess emits a late response after the broker
                                 // already called abandon_request — covered by manual
                                 // repro against a live agent (see #732 PR description).
+                                tracing::warn!(
+                                    notification_id,
+                                    request_id,
+                                    "dropping stale id-bearing response from an earlier prompt"
+                                );
                                 continue;
                             }
                             if let Some(ref err) = notification.error {
@@ -1278,6 +1290,14 @@ impl AdapterRouter {
                         }
                     }
 
+                    tracing::info!(
+                        request_id,
+                        elapsed_secs = prompt_start.elapsed().as_secs(),
+                        text_len = text_buf.len(),
+                        streaming,
+                        error = ?response_error,
+                        "prompt turn finished"
+                    );
                     conn.prompt_done().await;
                     // Stop the edit loop
                     drop(buf_tx);

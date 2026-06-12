@@ -441,6 +441,23 @@ async fn main() -> anyhow::Result<()> {
             .join("reminders.json");
         let reminder_store = remind::ReminderStore::load(reminder_path);
 
+        // Seed the participation cache from persisted resumable sessions so
+        // threads that survive a process restart keep responding without an
+        // @mention (the in-memory cache alone is lost on restart).
+        let mut seeded_participation: std::collections::HashMap<String, tokio::time::Instant> =
+            std::collections::HashMap::new();
+        for key in pool.persisted_thread_keys().await {
+            if let Some(channel_id) = key.strip_prefix("discord:") {
+                seeded_participation.insert(channel_id.to_string(), tokio::time::Instant::now());
+            }
+        }
+        if !seeded_participation.is_empty() {
+            info!(
+                threads = seeded_participation.len(),
+                "seeded thread participation cache from persisted sessions"
+            );
+        }
+
         let handler = discord::Handler {
             router,
             allow_all_channels,
@@ -453,7 +470,7 @@ async fn main() -> anyhow::Result<()> {
             trusted_bot_ids,
             allow_user_messages: discord_cfg.allow_user_messages,
             allowed_role_ids,
-            participated_threads: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            participated_threads: tokio::sync::Mutex::new(seeded_participation),
             multibot_threads: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             session_ttl: std::time::Duration::from_secs(ttl_secs),
             max_bot_turns: discord_cfg.max_bot_turns,

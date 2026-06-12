@@ -116,6 +116,15 @@ impl SessionPool {
         }
     }
 
+    /// Thread keys (e.g. `discord:<channel_id>`) that have a persisted
+    /// resumable session. Lets adapters treat those threads as already
+    /// participated-in across a process restart, since the in-memory
+    /// participation caches start empty.
+    pub async fn persisted_thread_keys(&self) -> Vec<String> {
+        let state = self.state.read().await;
+        state.persisted.keys().cloned().collect()
+    }
+
     pub async fn get_or_create(&self, thread_id: &str) -> Result<()> {
         let create_gate = {
             let mut state = self.state.write().await;
