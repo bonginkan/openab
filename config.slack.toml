@@ -19,6 +19,11 @@ args = [
   "-c", "approval_policy=\"never\"",
   "-c", "sandbox_mode=\"danger-full-access\"",
   "-c", "features.fast_mode=true",
+  # Store MCP OAuth tokens in CODEX_HOME/.credentials.json instead of the macOS
+  # keychain: the locally rebuilt codex-acp binary is never in the keychain
+  # item's ACL, so every access raises a SecurityAgent password dialog that
+  # nobody can answer on an unattended bridge (turns then time out).
+  "-c", "mcp_oauth_credentials_store=\"file\"",
 ]
 working_dir = "/Users/thepioneer/Documents/GitHub"
 
