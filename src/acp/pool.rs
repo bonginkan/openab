@@ -35,6 +35,9 @@ struct PoolState {
     /// Serializes create/resume work per thread so rapid same-thread requests
     /// cannot race each other into duplicate `session/load` attempts.
     creating: HashMap<String, Arc<Mutex<()>>>,
+    /// Per-session working directory overrides (from control directives).
+    /// thread_key → canonical workspace path.
+    session_workdirs: HashMap<String, String>,
 }
 
 pub struct SessionPool {
@@ -42,6 +45,7 @@ pub struct SessionPool {
     config: AgentConfig,
     max_sessions: usize,
     mapping_path: PathBuf,
+    meta_path: PathBuf,
 }
 
 type EvictionCandidate = (String, Arc<Mutex<AcpConnection>>, Instant, Option<String>);
@@ -75,7 +79,9 @@ impl SessionPool {
             .join(".openab");
         let _ = std::fs::create_dir_all(&openab_dir);
         let mapping_path = openab_dir.join("thread_map.json");
+        let meta_path = openab_dir.join("session_meta.json");
         let suspended = Self::load_mapping(&mapping_path);
+        let session_workdirs = Self::load_mapping(&meta_path);
         Self {
             state: RwLock::new(PoolState {
                 active: HashMap::new(),
@@ -83,17 +89,19 @@ impl SessionPool {
                 persisted: suspended.clone(),
                 suspended,
                 creating: HashMap::new(),
+                session_workdirs,
             }),
             config,
             max_sessions,
             mapping_path,
+            meta_path,
         }
     }
 
     fn load_mapping(path: &Path) -> HashMap<String, String> {
         match std::fs::read_to_string(path) {
             Ok(data) => serde_json::from_str(&data).unwrap_or_else(|e| {
-                warn!(path = %path.display(), error = %e, "corrupt thread_map.json, starting fresh");
+                warn!(path = %path.display(), error = %e, "corrupt mapping file, starting fresh");
                 HashMap::new()
             }),
             Err(_) => HashMap::new(),
@@ -125,7 +133,44 @@ impl SessionPool {
         state.persisted.keys().cloned().collect()
     }
 
-    pub async fn get_or_create(&self, thread_id: &str) -> Result<()> {
+    fn save_meta(&self, workdirs: &HashMap<String, String>) {
+        let data = match serde_json::to_string_pretty(workdirs) {
+            Ok(d) => d,
+            Err(e) => {
+                warn!(error = %e, "failed to serialize session metadata");
+                return;
+            }
+        };
+        let tmp = self.meta_path.with_extension("json.tmp");
+        if let Err(e) =
+            std::fs::write(&tmp, &data).and_then(|_| std::fs::rename(&tmp, &self.meta_path))
+        {
+            warn!(path = %self.meta_path.display(), error = %e, "failed to persist session metadata");
+        }
+    }
+
+    /// Check if session state exists for this thread (active, suspended, or persisted).
+    #[allow(dead_code)]
+    pub async fn has_active_session(&self, thread_id: &str) -> bool {
+        let state = self.state.read().await;
+        // Any of these means the thread already has session state.
+        if state.suspended.contains_key(thread_id) || state.persisted.contains_key(thread_id) {
+            return true;
+        }
+        if let Some(conn) = state.active.get(thread_id) {
+            match conn.try_lock() {
+                Ok(c) => return c.alive(),
+                Err(_) => return true, // lock held = connection busy streaming = alive
+            }
+        }
+        false
+    }
+
+    pub async fn get_or_create(
+        &self,
+        thread_id: &str,
+        working_dir_override: Option<&str>,
+    ) -> Result<bool> {
         let create_gate = {
             let mut state = self.state.write().await;
             get_or_insert_gate(&mut state.creating, thread_id)
@@ -145,7 +190,7 @@ impl SessionPool {
         if let Some(conn) = existing.clone() {
             let conn = conn.lock().await;
             if conn.alive() {
-                return Ok(());
+                return Ok(false);
             }
             if saved_session_id.is_none() {
                 saved_session_id = conn.acp_session_id.clone();
@@ -185,12 +230,27 @@ impl SessionPool {
             }
         }
 
+        // Resolve effective working directory: stored per-session > explicit override > global config.
+        // Stored value has highest priority to enforce immutability (ADR §4.5).
+        let stored_workdir = {
+            let state = self.state.read().await;
+            state.session_workdirs.get(thread_id).cloned()
+        };
+
+        let effective_workdir = if let Some(stored) = stored_workdir {
+            stored
+        } else if let Some(wd) = working_dir_override {
+            wd.to_string()
+        } else {
+            self.config.working_dir.clone()
+        };
+
         // Build the replacement connection outside the state lock so one stuck
         // initialization does not block all unrelated sessions.
         let mut new_conn = AcpConnection::spawn(
             &self.config.command,
             &self.config.args,
-            &self.config.working_dir,
+            &effective_workdir,
             &self.config.env,
             &self.config.inherit_env,
         )
@@ -201,7 +261,7 @@ impl SessionPool {
         let mut resumed = false;
         if let Some(ref sid) = saved_session_id {
             if new_conn.supports_load_session {
-                match new_conn.session_load(sid, &self.config.working_dir).await {
+                match new_conn.session_load(sid, &effective_workdir).await {
                     Ok(()) => {
                         info!(thread_id, session_id = %sid, "session resumed via session/load");
                         resumed = true;
@@ -214,7 +274,7 @@ impl SessionPool {
         }
 
         if !resumed {
-            new_conn.session_new(&self.config.working_dir).await?;
+            new_conn.session_new(&effective_workdir).await?;
             // Surface the reset banner both for restored sessions and for stale
             // live entries that died before we could recover a resumable
             // session id. In both cases the caller is continuing after an
@@ -235,10 +295,10 @@ impl SessionPool {
         // initializing this one.
         if let Some(existing) = state.active.get(thread_id).cloned() {
             let Ok(existing) = existing.try_lock() else {
-                return Ok(());
+                return Ok(false);
             };
             if existing.alive() {
-                return Ok(());
+                return Ok(false);
             }
             warn!(thread_id, "stale connection, rebuilding");
             drop(existing);
@@ -289,7 +349,21 @@ impl SessionPool {
             );
         }
         self.save_mapping(&state.persisted);
-        Ok(())
+
+        // Persist workspace override only after session spawn succeeded (口渡 F2).
+        if working_dir_override.is_some() {
+            state
+                .session_workdirs
+                .entry(thread_id.to_string())
+                .or_insert_with(|| effective_workdir.clone());
+            self.save_meta(&state.session_workdirs);
+        }
+
+        // Return true only for genuinely new sessions — not resumed or reconnected ones.
+        // A session with prior state (saved_session_id or had_existing) is a resume,
+        // even if we had to spawn a new ACP process. ADR §2.2: directives are first-message-only.
+        let is_fresh = !had_existing && saved_session_id.is_none();
+        Ok(is_fresh)
     }
 
     /// Get mutable access to a connection. Caller must have called get_or_create first.
@@ -452,7 +526,9 @@ impl SessionPool {
         state.suspended.remove(thread_id);
         state.persisted.remove(thread_id);
         state.creating.remove(thread_id);
+        state.session_workdirs.remove(thread_id);
         self.save_mapping(&state.persisted);
+        self.save_meta(&state.session_workdirs);
         if had_active {
             info!(thread_id, "session reset");
             Ok(())
@@ -500,10 +576,12 @@ impl SessionPool {
                     state.suspended.insert(key, sid);
                 } else {
                     state.persisted.remove(&key);
+                    state.session_workdirs.remove(&key);
                 }
             }
         }
         self.save_mapping(&state.persisted);
+        self.save_meta(&state.session_workdirs);
     }
 
     pub async fn shutdown(&self) {

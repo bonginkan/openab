@@ -3,6 +3,7 @@ mod adapter;
 mod bot_turns;
 mod config;
 mod cron;
+mod directives;
 mod discord;
 mod dispatch;
 mod error_display;
@@ -13,6 +14,7 @@ mod markdown;
 mod media;
 mod reactions;
 mod remind;
+mod secrets;
 mod setup;
 mod slack;
 mod stt;
@@ -76,6 +78,19 @@ enum Commands {
         #[arg(short, long)]
         output: Option<String>,
     },
+    /// Internal: AgentCore WebSocket shell bridge (ACP↔WebSocket)
+    #[cfg(feature = "agentcore")]
+    AgentcoreBridge {
+        /// AgentCore Runtime ARN
+        #[arg(long)]
+        runtime_arn: String,
+        /// AWS region
+        #[arg(long, default_value = "us-east-1")]
+        region: String,
+        /// ACP agent command to run in the PTY (default: kiro-cli acp --trust-all-tools)
+        #[arg(long, default_value = "kiro-cli acp --trust-all-tools")]
+        command: String,
+    },
 }
 
 #[tokio::main]
@@ -96,21 +111,32 @@ async fn main() -> anyhow::Result<()> {
             setup::run_setup(output.map(PathBuf::from))?;
             return Ok(());
         }
+        #[cfg(feature = "agentcore")]
+        Commands::AgentcoreBridge {
+            runtime_arn,
+            region,
+            command,
+        } => {
+            return acp::agentcore::run_bridge(&runtime_arn, &region, &command).await;
+        }
         Commands::Run { config } => config,
     };
 
     // -- Run path --
     let config_source = config_arg.unwrap_or_else(|| "config.toml".into());
 
-    let mut cfg = if config_source.starts_with("https://") {
+    // First pass: load config (env vars expanded, secrets NOT resolved yet)
+    let raw_expanded = if config_source.starts_with("https://") {
         info!(url = %config_source, "fetching remote config");
-        config::load_config_from_url(&config_source).await?
+        config::load_config_raw_from_url(&config_source).await?
     } else if config_source.starts_with("http://") {
         warn!(url = %config_source, "fetching remote config over plaintext HTTP — use HTTPS in production");
-        config::load_config_from_url(&config_source).await?
+        config::load_config_raw_from_url(&config_source).await?
     } else {
-        config::load_config(&PathBuf::from(&config_source))?
+        config::load_config_raw(&PathBuf::from(&config_source))?
     };
+
+    let mut cfg = config::parse_config_str(&raw_expanded, &config_source)?;
     info!(
         agent_cmd = %cfg.agent.command,
         pool_max = cfg.pool.max_sessions,
@@ -134,6 +160,14 @@ async fn main() -> anyhow::Result<()> {
     if let Some(ref hook) = cfg.hooks.pre_shutdown {
         hooks::validate_hook("pre_shutdown", hook)?;
     }
+
+    // Resolve secrets (after pre_boot hooks so exec:// scripts are available)
+    if !cfg.secrets.refs.is_empty() {
+        let resolved = secrets::resolve(&cfg.secrets).await?;
+        let substituted = secrets::substitute(&raw_expanded, &resolved);
+        cfg = config::parse_config_str(&substituted, &config_source)?;
+    }
+
     let shutdown_hook = cfg.hooks.pre_shutdown.clone();
 
     // Immediate-steer applies to every adapter's dispatcher; capture it before
@@ -168,6 +202,14 @@ async fn main() -> anyhow::Result<()> {
         cfg.pool.liveness_check_secs,
         cfg.attachments,
         agent_working_dir,
+        cfg.workspace.aliases,
+        std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| {
+            tracing::warn!(
+                "HOME environment variable is not set — falling back to /tmp as bot_home. \
+                 This weakens the workspace security boundary."
+            );
+            "/tmp".into()
+        })),
     ));
 
     // Shutdown signal for Slack adapter
@@ -206,6 +248,7 @@ async fn main() -> anyhow::Result<()> {
             s.bot_token.clone(),
             session_ttl_dur,
             s.allow_bot_messages,
+            s.assistant_mode,
         ))
     });
 
@@ -323,6 +366,7 @@ async fn main() -> anyhow::Result<()> {
             ),
             allowed_users: gw_cfg.allowed_users,
             streaming: gw_cfg.streaming,
+            streaming_placeholder: gw_cfg.streaming_placeholder,
             stt: cfg.stt.clone(),
         };
         let gw_router = router.clone();

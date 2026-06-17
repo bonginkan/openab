@@ -99,18 +99,18 @@ User in thread: can you also do Y?
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `allow_user_messages` | string | `"involved"` | Controls when bots respond without @mention. See Layer 3 for all modes. |
+| `allow_user_messages` | string | `"multibot-mentions"` | Controls when bots respond without @mention. See Layer 3 for all modes. |
 
-In this single-bot scenario, the default `"involved"` means the bot responds to all messages in threads it has participated in.
+In this single-bot scenario, the default `"multibot-mentions"` behaves the same as `"involved"` — the bot responds to all messages in threads it has participated in.
 
 ### Example config.toml
 
 ```toml
 [discord]
 bot_token = "${DISCORD_BOT_TOKEN}"
-# allow_user_messages defaults to "involved":
-# bot responds to all messages in threads it has participated in,
-# no @mention needed for follow-ups.
+# allow_user_messages defaults to "multibot-mentions":
+# bot responds to all messages in single-bot threads it has participated in;
+# in multi-bot threads, @mention is required.
 ```
 
 ---
@@ -123,20 +123,20 @@ How involved bots behave on subsequent messages is controlled by `allow_user_mes
 
 | Mode | Behavior |
 |------|----------|
-| `involved` (default) | All involved bots respond to every message — no @mention required. |
+| `multibot-mentions` (default) | Like `involved`, but once a second bot has posted in the thread, you must @mention the bot(s) you want to respond. |
+| `involved` | All involved bots respond to every message — no @mention required. |
 | `mentions` | Always require an explicit @mention, even in threads. |
-| `multibot-mentions` | Like `involved`, but once a second bot has posted in the thread, you must @mention the bot(s) you want to respond. |
 
 ```
-# allow_user_messages = "involved" (default)
+# allow_user_messages = "multibot-mentions" (default)
 User in thread: @BotB what do you think?
   → BotB replies, now "involved"
 User in thread: any other ideas?
-  → Both BotA and BotB reply
-
-# allow_user_messages = "multibot-mentions"
-User in thread: any other ideas?
   → No bot replies (need explicit @mention)
+
+# allow_user_messages = "involved"
+User in thread: any other ideas?
+  → Both BotA and BotB reply
 User in thread: @BotA any other ideas?
   → Only BotA replies
 ```
@@ -145,7 +145,7 @@ User in thread: @BotA any other ideas?
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `allow_user_messages` | string | `"involved"` | `"involved"` — reply without @mention in participated threads. `"mentions"` — always require @mention. `"multibot-mentions"` — require @mention once 2+ bots are in the thread. |
+| `allow_user_messages` | string | `"multibot-mentions"` | `"multibot-mentions"` — require @mention once 2+ bots are in the thread. `"involved"` — reply without @mention in participated threads. `"mentions"` — always require @mention. |
 
 > **Note:** This is a **global setting** — it cannot be changed per thread. Configure it in `config.toml` or via `values.yaml` for Helm.
 
@@ -154,8 +154,8 @@ User in thread: @BotA any other ideas?
 ```toml
 [discord]
 bot_token = "${DISCORD_BOT_TOKEN}"
-# Default is "involved" — all involved bots respond without @mention.
-# Use "multibot-mentions" for precise control in multi-bot threads.
+# Default is "multibot-mentions" — require @mention in multi-bot threads.
+# Use "involved" to let all bots respond without @mention.
 allow_user_messages = "multibot-mentions"
 ```
 
@@ -187,7 +187,7 @@ BotA in thread: here's my analysis
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `allow_bot_messages` | string | `"off"` | `"off"` — ignore bot messages. `"mentions"` — only process bot messages that @mention this bot. `"all"` — process all bot messages (capped by `max_bot_turns`). |
-| `trusted_bot_ids` | string[] | `[]` | Whitelist of bot IDs. For Slack, entries may be Bot User IDs (`U...`) or Bot IDs (`B...`); `U...` matching requires `users:read` so OpenAB can call `bots.info`. Empty = any bot (mode permitting). Ignored when `allow_bot_messages = "off"`. |
+| `trusted_bot_ids` | string[] | `[]` | Whitelist of bot IDs. For Slack, entries may be Bot User IDs (`U...`) or Bot IDs (`B...`); `U...` matching requires `users:read` so OpenAB can call `bots.info`. Empty = any bot (mode permitting). **Admission override:** a trusted bot that @mentions this bot bypasses `allow_bot_messages` mode entirely (treated as human @mention). |
 | `max_bot_turns` | u32 | `20` | Max consecutive bot turns per thread before throttling. A human message resets the counter. |
 
 > **Safety:** When `allow_bot_messages = "all"`, a separate hardcoded cap of 10 consecutive bot turns applies regardless of `max_bot_turns`.
@@ -267,7 +267,7 @@ All message routing in OpenAB is guarded by the **involvement gate** — a pre-d
 
 ### Design principle
 
-**Humans are the gatekeepers.** A bot cannot participate in a thread until a human explicitly pulls it in via @mention. Bots cannot pull other bots into threads — only humans can.
+**Humans are the gatekeepers.** A bot cannot participate in a thread until a human explicitly pulls it in via @mention. Bots cannot pull other bots into threads — only humans can, **unless** the sending bot is in the target bot's `trusted_bot_ids` (see [Trusted bot admission override](#trusted-bot-admission-override) below).
 
 ### How a bot becomes involved
 
@@ -297,7 +297,11 @@ Inbound message in thread
   │               │
   │               ├─ From a human → pass (bot will reply and become involved)
   │               │
-  │               └─ From another bot → ❌ DROP (bot-to-bot cannot break the gate)
+  │               └─ From another bot:
+  │                     │
+  │                     ├─ Sender in trusted_bot_ids → pass (same as human @mention)
+  │                     │
+  │                     └─ Otherwise → ❌ DROP (bot-to-bot cannot break the gate)
   │
   └─ Message dropped — never reaches Dispatcher or SessionPool
 ```
@@ -318,8 +322,26 @@ This is an intentional safety constraint:
 | Bot A @mentions Bot B (Bot B not yet involved) | ❌ Silently dropped |
 | Bot A @mentions Bot B (Bot B already involved) | ✅ Processed per `allow_bot_messages` mode |
 | Human @mentions Bot B, then Bot A @mentions Bot B | ✅ Works — Bot B is already involved |
+| **Trusted** Bot A @mentions Bot B (Bot A in Bot B's `trusted_bot_ids`) | ✅ Treated as human @mention — Bot B becomes involved |
 
-### Workaround for bot-to-bot handoff
+### Trusted bot admission override
+
+When a bot is listed in another bot's `trusted_bot_ids` and explicitly @mentions that bot, the mention is treated identically to a human @mention:
+
+- The target bot becomes **involved** in the thread
+- The `allow_bot_messages` mode check is **bypassed** entirely
+- The message is dispatched to the session
+
+This enables bot-to-bot coordination (e.g. a coordinator bot pulling reviewer bots into threads) without requiring human intervention for every thread.
+
+**Requirements:**
+- The sending bot must be in the target bot's `trusted_bot_ids` config
+- The sending bot must explicitly @mention the target bot
+- Messages from trusted bots **without** @mention still follow normal `allow_bot_messages` gating
+
+**Safety:** `trusted_bot_ids` defaults to empty — this feature is entirely opt-in. The `max_bot_turns` cap still applies after involvement to prevent runaway loops.
+
+### Workaround for bot-to-bot handoff (without trusted_bot_ids)
 
 If you need Bot A to hand off to Bot B in a thread where Bot B is not yet involved:
 

@@ -53,6 +53,16 @@ const USER_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(300);
 /// Maximum entries in the participation cache before eviction.
 const PARTICIPATION_CACHE_MAX: usize = 1000;
 
+/// Maximum entries in the streams map before eviction (safety net for
+/// aborted turns that begin a stream but never reach stream_finish).
+const STREAM_CACHE_MAX: usize = 1024;
+
+#[derive(Default)]
+struct StreamEntry {
+    active: bool,
+    degraded_buf: String,
+}
+
 pub struct SlackAdapter {
     client: reqwest::Client,
     bot_token: String,
@@ -67,6 +77,12 @@ pub struct SlackAdapter {
     multibot_threads: tokio::sync::Mutex<HashMap<String, tokio::time::Instant>>,
     /// TTL for participation cache entries (matches session_ttl_hours from config).
     session_ttl: std::time::Duration,
+    /// Assistant mode: stream via chat.startStream + assistant.threads.setStatus.
+    assistant_mode: bool,
+    /// streaming message ts → state. active=false = degraded (post+edit fallback).
+    /// Lifecycle: stream_begin inserts, stream_finish removes; insert_stream
+    /// bounds the map (STREAM_CACHE_MAX) as a safety net against aborted turns.
+    streams: tokio::sync::Mutex<HashMap<String, StreamEntry>>,
 }
 
 impl SlackAdapter {
@@ -74,6 +90,7 @@ impl SlackAdapter {
         bot_token: String,
         session_ttl: std::time::Duration,
         _allow_bot_messages: AllowBots,
+        assistant_mode: bool,
     ) -> Self {
         Self {
             client: reqwest::Client::new(),
@@ -84,6 +101,8 @@ impl SlackAdapter {
             participated_threads: tokio::sync::Mutex::new(HashMap::new()),
             multibot_threads: tokio::sync::Mutex::new(HashMap::new()),
             session_ttl,
+            assistant_mode,
+            streams: tokio::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -101,6 +120,37 @@ impl SlackAdapter {
             .entry(thread_ts.to_string())
             .or_insert_with(tokio::time::Instant::now);
         enforce_cache_bounds(&mut cache, self.session_ttl);
+    }
+
+    /// Insert a stream entry, bounding the map so aborted turns (begin without a
+    /// matching finish) can't leak unboundedly. Normal lifecycle: stream_begin
+    /// inserts, stream_finish removes.
+    async fn insert_stream(&self, ts: String, entry: StreamEntry) {
+        let mut map = self.streams.lock().await;
+        if map.len() >= STREAM_CACHE_MAX {
+            // Only evict inactive (degraded/stale) streams to avoid cutting off
+            // active streams mid-turn. If no inactive entries exist, fall through
+            // and allow the map to grow slightly beyond the soft cap.
+            let evict: Vec<String> = map
+                .iter()
+                .filter(|(_, e)| !e.active)
+                .map(|(k, _)| k.clone())
+                .collect();
+            for k in evict {
+                map.remove(&k);
+            }
+        }
+        map.insert(ts, entry);
+    }
+
+    /// Accumulate a delta into a degraded stream's buffer and return the new
+    /// cumulative text. Returns None if no (degraded) stream entry exists for
+    /// `ts` — never resurrects a removed/absent stream. No network I/O.
+    async fn accumulate_degraded(&self, ts: &str, delta: &str) -> Option<String> {
+        let mut map = self.streams.lock().await;
+        let entry = map.get_mut(ts)?;
+        entry.degraded_buf.push_str(delta);
+        Some(entry.degraded_buf.clone())
     }
 
     /// Get the bot's own Slack user ID (cached after first call).
@@ -365,19 +415,31 @@ impl ChatAdapter for SlackAdapter {
     }
 
     fn message_limit(&self) -> usize {
-        4000
+        // Match the Block Kit `markdown` block cap (12k) minus headroom. Messages
+        // are sent as markdown blocks, so the old 4000 mrkdwn-era limit would
+        // split long replies (and Markdown tables) across messages needlessly —
+        // a mid-table split renders as raw pipes. 11_900 keeps typical tables in
+        // one block and cuts message-spam on long replies.
+        MARKDOWN_BLOCK_LIMIT
     }
 
     async fn send_message(&self, channel: &ChannelRef, content: &str) -> Result<MessageRef> {
-        let mrkdwn = markdown_to_mrkdwn(content);
-        let mut body = serde_json::json!({
-            "channel": channel.channel_id,
-            "text": mrkdwn,
-        });
-        if let Some(thread_ts) = &channel.thread_id {
-            body["thread_ts"] = serde_json::Value::String(thread_ts.clone());
-        }
-        let resp = self.api_post("chat.postMessage", body).await?;
+        let thread_ts = channel.thread_id.as_deref();
+        let body = build_post_message_body(&channel.channel_id, thread_ts, content);
+        let resp = match self.api_post("chat.postMessage", body).await {
+            Ok(r) => r,
+            // Graceful degradation: if the `blocks` payload is rejected (workspace
+            // lacks the markdown block, or content exceeds the cumulative block
+            // cap), retry text-only so the message still lands (mrkdwn fallback)
+            // instead of failing outright.
+            Err(e) if is_block_payload_rejected(&e) => {
+                warn!(error = %e, "markdown block rejected; retrying chat.postMessage text-only");
+                let fallback =
+                    build_post_message_text_only(&channel.channel_id, thread_ts, content);
+                self.api_post("chat.postMessage", fallback).await?
+            }
+            Err(e) => return Err(e),
+        };
         let ts = resp["ts"]
             .as_str()
             .ok_or_else(|| anyhow!("no ts in chat.postMessage response"))?;
@@ -448,21 +510,169 @@ impl ChatAdapter for SlackAdapter {
     }
 
     async fn edit_message(&self, msg: &MessageRef, content: &str) -> Result<()> {
-        let mrkdwn = markdown_to_mrkdwn(content);
-        self.api_post(
-            "chat.update",
-            serde_json::json!({
-                "channel": msg.channel.channel_id,
-                "ts": msg.message_id,
-                "text": mrkdwn,
-            }),
-        )
-        .await?;
-        Ok(())
+        let body = build_update_body(&msg.channel.channel_id, &msg.message_id, content);
+        match self.api_post("chat.update", body).await {
+            Ok(_) => Ok(()),
+            // See send_message: degrade to text-only if the blocks payload is rejected.
+            Err(e) if is_block_payload_rejected(&e) => {
+                warn!(error = %e, "markdown block rejected; retrying chat.update text-only");
+                let fallback =
+                    build_update_text_only(&msg.channel.channel_id, &msg.message_id, content);
+                self.api_post("chat.update", fallback).await?;
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
     }
 
     fn use_streaming(&self, other_bot_present: bool) -> bool {
         !other_bot_present
+    }
+
+    fn renders_native_tables(&self) -> bool {
+        true
+    }
+
+    fn uses_assistant_status(&self) -> bool {
+        self.assistant_mode
+    }
+
+    fn uses_native_streaming(&self, other_bot_present: bool) -> bool {
+        let native = self.assistant_mode && !other_bot_present;
+        debug!(
+            assistant_mode = self.assistant_mode,
+            other_bot_present, native, "slack assistant_mode decision (per turn)"
+        );
+        native
+    }
+
+    async fn stream_begin(
+        &self,
+        channel: &ChannelRef,
+        recipient: Option<(String, String)>,
+    ) -> Result<MessageRef> {
+        let thread_ts = channel.thread_id.clone().unwrap_or_default();
+        // recipient is bound to this turn (captured at message arrival, carried on
+        // BufferedMessage) — no shared thread cache, so no cross-turn race.
+        let make_ref = |ts: String| MessageRef {
+            channel: ChannelRef {
+                platform: "slack".into(),
+                channel_id: channel.channel_id.clone(),
+                thread_id: channel.thread_id.clone(),
+                parent_id: None,
+                origin_event_id: None,
+            },
+            message_id: ts,
+        };
+
+        if let Some((user_id, team_id)) = recipient {
+            let body = build_start_stream_body(&channel.channel_id, &thread_ts, &user_id, &team_id);
+            match self.api_post("chat.startStream", body).await {
+                Ok(resp) => {
+                    if let Some(ts) = resp["ts"].as_str() {
+                        self.insert_stream(
+                            ts.to_string(),
+                            StreamEntry {
+                                active: true,
+                                degraded_buf: String::new(),
+                            },
+                        )
+                        .await;
+                        return Ok(make_ref(ts.to_string()));
+                    }
+                    error!("chat.startStream ok but no ts; falling back to post+edit");
+                }
+                Err(e) => {
+                    error!(error = %e, "chat.startStream failed; falling back to post+edit for this turn");
+                }
+            }
+        } else {
+            // Expected for bot-authored turns (no recipient bound) and non-user
+            // triggers, so warn! rather than error! to avoid on-call noise.
+            warn!(
+                thread_ts,
+                "no recipient for turn; falling back to post+edit"
+            );
+        }
+
+        // Degraded fallback: plain placeholder via send_message; mark inactive.
+        let msg = self.send_message(channel, "…").await?;
+        self.insert_stream(
+            msg.message_id.clone(),
+            StreamEntry {
+                active: false,
+                degraded_buf: String::new(),
+            },
+        )
+        .await;
+        Ok(msg)
+    }
+
+    async fn stream_append(&self, msg: &MessageRef, delta: &str) -> Result<()> {
+        let ts = &msg.message_id;
+        let active = {
+            let map = self.streams.lock().await;
+            map.get(ts).map(|e| e.active).unwrap_or(false)
+        };
+        if active {
+            let body = build_append_stream_body(&msg.channel.channel_id, ts, delta);
+            if let Err(e) = self.api_post("chat.appendStream", body).await {
+                warn!(error = %e, "chat.appendStream failed (cosmetic; final replace will correct)");
+            }
+        } else if let Some(cumulative) = self.accumulate_degraded(ts, delta).await {
+            let _ = self.edit_message(msg, &cumulative).await; // cosmetic mid-stream
+        }
+        Ok(())
+    }
+
+    async fn stream_finish(&self, msg: &MessageRef, final_content: &str) -> Result<()> {
+        let ts = &msg.message_id;
+        let active = {
+            let map = self.streams.lock().await;
+            map.get(ts).map(|e| e.active).unwrap_or(false)
+        };
+        if active {
+            // Close the native stream WITHOUT re-sending content. The reply was
+            // already streamed live via chat.appendStream; stopStream's
+            // `markdown_text` *appends* (it does not replace), so passing the full
+            // content here duplicates the whole reply (#1055). Close only, then
+            // replace with the finalized content via chat.update below.
+            let close = serde_json::json!({ "channel": msg.channel.channel_id, "ts": ts });
+            if let Err(e) = self.api_post("chat.stopStream", close).await {
+                warn!(error = %e, "chat.stopStream(close) failed; continuing to final replace");
+            }
+        }
+        // Replace with the finalized content (Block Kit markdown). For the active
+        // path this overwrites the streamed preview with a single clean copy
+        // (rich rendering + native tables); for the degraded path it is the final
+        // post+edit update. chat.update replaces, so there is no duplication.
+        if let Err(e) = self.edit_message(msg, final_content).await {
+            if active {
+                // The native stream already delivered the reply (chat.appendStream),
+                // and stopStream left it in place. Do NOT postMessage a fallback
+                // here — that would post a duplicate copy. Keep the streamed
+                // content as the final message.
+                warn!(error = %e, "final chat.update failed; keeping streamed content (no duplicate post)");
+            } else {
+                // Degraded path: no streamed content exists (post+edit placeholder),
+                // so post the final as a new message to avoid losing the reply.
+                warn!(error = %e, "final chat.update failed; trying postMessage");
+                if let Err(e2) = self.send_message(&msg.channel, final_content).await {
+                    error!(error = %e2, "final postMessage also failed; reply may be incomplete");
+                }
+            }
+        }
+        self.streams.lock().await.remove(ts);
+        Ok(())
+    }
+
+    async fn set_status(&self, channel: &ChannelRef, status: &str) -> Result<()> {
+        let thread_ts = channel.thread_id.clone().unwrap_or_default();
+        let body = build_set_status_body(&channel.channel_id, &thread_ts, status);
+        if let Err(e) = self.api_post("assistant.threads.setStatus", body).await {
+            warn!(error = %e, status, "assistant.threads.setStatus failed (cosmetic)");
+        }
+        Ok(())
     }
 }
 
@@ -583,9 +793,14 @@ pub async fn run_slack_adapter(
                                                 let allowed_users = allowed_users.clone();
                                                 let stt_config = stt_config.clone();
                                                 let dispatcher = dispatcher.clone();
+                                                let team_id = envelope["payload"]["team_id"]
+                                                    .as_str()
+                                                    .unwrap_or("")
+                                                    .to_string();
                                                 tokio::spawn(async move {
                                                     handle_message(
                                                         &event,
+                                                        &team_id,
                                                         &adapter,
                                                         &bot_token,
                                                         allow_all_channels,
@@ -805,6 +1020,10 @@ pub async fn run_slack_adapter(
                                                 // Dispatch to handle_message (per-thread serialization comes
                                                 // from Dispatcher consumer task in batched mode and from
                                                 // pool.with_connection in per-message mode).
+                                                let team_id = envelope["payload"]["team_id"]
+                                                    .as_str()
+                                                    .unwrap_or("")
+                                                    .to_string();
                                                 let event = event.clone();
                                                 let adapter = adapter.clone();
                                                 let bot_token = bot_token.clone();
@@ -815,6 +1034,7 @@ pub async fn run_slack_adapter(
                                                 tokio::spawn(async move {
                                                     handle_message(
                                                         &event,
+                                                        &team_id,
                                                         &adapter,
                                                         &bot_token,
                                                         allow_all_channels,
@@ -886,6 +1106,7 @@ async fn get_socket_mode_url(app_token: &str) -> Result<String> {
 #[allow(clippy::too_many_arguments)]
 async fn handle_message(
     event: &serde_json::Value,
+    team_id: &str,
     adapter: &Arc<SlackAdapter>,
     bot_token: &str,
     allow_all_channels: bool,
@@ -937,6 +1158,21 @@ async fn handle_message(
         let _ = adapter.add_reaction(&msg_ref, "🚫").await;
         return;
     }
+
+    // Capture the native-streaming recipient for THIS turn, now that the sender has
+    // passed the channel + user allow-list checks above (so denied/unauthorized
+    // senders are never recorded). It rides on the per-turn BufferedMessage to
+    // stream_begin — no shared thread cache, no cross-turn race. Real users only:
+    // bot IDs (B...) are rejected by chat.startStream's recipient_user_id, and an
+    // empty team_id would silently degrade, so we surface that.
+    let stream_recipient = if is_bot_msg {
+        None
+    } else {
+        if team_id.is_empty() {
+            warn!("empty team_id; chat.startStream will degrade to post+edit");
+        }
+        Some((user_id.clone(), team_id.to_string()))
+    };
 
     // Resolve mentions: strip only this bot's own trigger mention so the LLM
     // can still @-mention other users in its reply.
@@ -1217,6 +1453,7 @@ async fn handle_message(
         arrived_at: std::time::Instant::now(),
         estimated_tokens,
         other_bot_present,
+        recipient: stream_recipient,
     };
     if let Err(e) = dispatcher
         .submit(thread_key, thread_channel, adapter_dyn, buf_msg)
@@ -1348,7 +1585,113 @@ fn is_plain_user_message(subtype: &str, text: &str) -> bool {
     )
 }
 
+/// Slack caps a single Block Kit `markdown` block at 12,000 characters; we use
+/// 11,900 to keep ~100 chars of headroom. Doubles as the Slack `message_limit`
+/// so the router splits long replies into separate messages at the same bound
+/// (one markdown block per message stays under the API cap).
+const MARKDOWN_BLOCK_LIMIT: usize = 11_900;
+
+/// True if a Slack API error indicates the `blocks` payload was rejected, so the
+/// caller should retry text-only:
+/// - `invalid_blocks` — workspace can't render the Block Kit `markdown` block
+///   (malformed/unsupported payload).
+/// - `msg_blocks_too_long` — content exceeds Slack's cumulative ~12k cap across
+///   all `markdown` blocks in one message. Reachable by direct `send_message`
+///   callers that bypass the router's `message_limit` pre-split (e.g. STT echo).
+///
+/// `invalid_arguments` is deliberately excluded — it's a Slack catch-all (bad
+/// channel, missing/invalid `ts`, malformed `thread_ts`, …) and would trigger a
+/// pointless text-only retry that fails identically.
+///
+/// Matches the Slack error *code* exactly (the trailing token of `api_post`'s
+/// `"Slack API <method>: <code>"` message), not a substring of the message —
+/// so a future code like `invalid_blocks_field` does not falsely match.
+fn is_block_payload_rejected(e: &anyhow::Error) -> bool {
+    let s = e.to_string();
+    let code = s.rsplit(": ").next().unwrap_or(s.as_str()).trim();
+    code == "invalid_blocks" || code == "msg_blocks_too_long"
+}
+
+/// Build Block Kit `markdown` blocks from raw Markdown. Slack renders these
+/// natively — real headings, lists, tables, blockquotes, and language-tagged
+/// code fences — unlike the legacy `text` mrkdwn field, which flattens headings
+/// to bold and cannot render tables. Long content is split at the block limit,
+/// reusing `format::split_message` so code-fence balance is preserved.
+///
+/// Follow-up (non-blocking): `split_message` is not table-aware — a single
+/// Markdown table exceeding `MARKDOWN_BLOCK_LIMIT` (11,900 chars) splits at line
+/// boundaries, so continuation blocks lack the header/separator rows and render
+/// as raw pipes. The 4000→11,900 bump makes this rare; a future improvement is
+/// to re-emit the table header at the top of each continuation chunk.
+fn build_markdown_blocks(content: &str) -> Vec<serde_json::Value> {
+    let chunks = if content.len() <= MARKDOWN_BLOCK_LIMIT {
+        vec![content.to_string()]
+    } else {
+        crate::format::split_message(content, MARKDOWN_BLOCK_LIMIT)
+    };
+    chunks
+        .into_iter()
+        .map(|chunk| serde_json::json!({ "type": "markdown", "text": chunk }))
+        .collect()
+}
+
+/// Body for `chat.postMessage`: Block Kit `markdown` blocks (rich rendering)
+/// plus a `text` fallback used for notifications and accessibility.
+fn build_post_message_body(
+    channel_id: &str,
+    thread_ts: Option<&str>,
+    content: &str,
+) -> serde_json::Value {
+    let mut body = serde_json::json!({
+        "channel": channel_id,
+        "blocks": build_markdown_blocks(content),
+        "text": markdown_to_mrkdwn(content),
+    });
+    if let Some(ts) = thread_ts {
+        body["thread_ts"] = serde_json::Value::String(ts.to_string());
+    }
+    body
+}
+
+/// Body for `chat.update`: same Block Kit `markdown` blocks + `text` fallback.
+fn build_update_body(channel_id: &str, ts: &str, content: &str) -> serde_json::Value {
+    serde_json::json!({
+        "channel": channel_id,
+        "ts": ts,
+        "blocks": build_markdown_blocks(content),
+        "text": markdown_to_mrkdwn(content),
+    })
+}
+
+/// Text-only `chat.postMessage` body (no `blocks`) — degradation path when a
+/// workspace rejects the Block Kit `markdown` block.
+fn build_post_message_text_only(
+    channel_id: &str,
+    thread_ts: Option<&str>,
+    content: &str,
+) -> serde_json::Value {
+    let mut body = serde_json::json!({
+        "channel": channel_id,
+        "text": markdown_to_mrkdwn(content),
+    });
+    if let Some(ts) = thread_ts {
+        body["thread_ts"] = serde_json::Value::String(ts.to_string());
+    }
+    body
+}
+
+/// Text-only `chat.update` body (no `blocks`) — see `build_post_message_text_only`.
+fn build_update_text_only(channel_id: &str, ts: &str, content: &str) -> serde_json::Value {
+    serde_json::json!({
+        "channel": channel_id,
+        "ts": ts,
+        "text": markdown_to_mrkdwn(content),
+    })
+}
+
 /// Convert Markdown (as output by Claude Code) to Slack mrkdwn format.
+/// Used for the `text` fallback field that accompanies Block Kit blocks
+/// (shown in notification previews and to assistive tech).
 fn markdown_to_mrkdwn(text: &str) -> String {
     static BOLD_RE: LazyLock<regex::Regex> =
         LazyLock::new(|| regex::Regex::new(r"\*\*(.+?)\*\*").unwrap());
@@ -1372,9 +1715,93 @@ fn markdown_to_mrkdwn(text: &str) -> String {
     text.into_owned()
 }
 
+fn build_start_stream_body(
+    channel: &str,
+    thread_ts: &str,
+    user_id: &str,
+    team_id: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "channel": channel,
+        "thread_ts": thread_ts,
+        "recipient_user_id": user_id,
+        "recipient_team_id": team_id,
+    })
+}
+
+fn build_append_stream_body(channel: &str, ts: &str, delta: &str) -> serde_json::Value {
+    serde_json::json!({
+        "channel": channel,
+        "ts": ts,
+        "markdown_text": delta,
+    })
+}
+
+fn build_set_status_body(channel_id: &str, thread_ts: &str, status: &str) -> serde_json::Value {
+    serde_json::json!({
+        "channel_id": channel_id,
+        "thread_ts": thread_ts,
+        "status": status,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- builder tests ---
+
+    #[test]
+    fn build_start_stream_body_has_recipient() {
+        let b = build_start_stream_body("C1", "1700.1", "U2", "T3");
+        assert_eq!(b["channel"], "C1");
+        assert_eq!(b["thread_ts"], "1700.1");
+        assert_eq!(b["recipient_user_id"], "U2");
+        assert_eq!(b["recipient_team_id"], "T3");
+    }
+
+    #[test]
+    fn build_append_stream_body_is_markdown_text_chunk() {
+        let b = build_append_stream_body("C1", "1700.9", "hello");
+        assert_eq!(b["channel"], "C1");
+        assert_eq!(b["ts"], "1700.9");
+        assert_eq!(b["markdown_text"], "hello");
+    }
+
+    #[test]
+    fn build_set_status_body_shape() {
+        let b = build_set_status_body("C1", "1700.1", "Thinking\u{2026}");
+        assert_eq!(b["channel_id"], "C1");
+        assert_eq!(b["thread_ts"], "1700.1");
+        assert_eq!(b["status"], "Thinking\u{2026}");
+    }
+
+    #[tokio::test]
+    async fn degraded_stream_append_accumulates() {
+        let adapter = SlackAdapter::new(
+            "xoxb-test".into(),
+            std::time::Duration::from_secs(60),
+            AllowBots::Off,
+            true,
+        );
+        adapter.streams.lock().await.insert(
+            "TS".into(),
+            StreamEntry {
+                active: false,
+                degraded_buf: String::new(),
+            },
+        );
+        assert_eq!(
+            adapter.accumulate_degraded("TS", "a").await.as_deref(),
+            Some("a")
+        );
+        assert_eq!(
+            adapter.accumulate_degraded("TS", "b").await.as_deref(),
+            Some("ab")
+        );
+        // missing stream is not resurrected:
+        assert_eq!(adapter.accumulate_degraded("MISSING", "x").await, None);
+    }
     use crate::adapter::ChatAdapter;
 
     /// Bot's own `<@UID>` trigger mention is stripped.
@@ -1679,7 +2106,7 @@ mod tests {
     #[test]
     fn streaming_per_thread() {
         let ttl = std::time::Duration::from_secs(300);
-        let adapter = SlackAdapter::new("xoxb-test".into(), ttl, AllowBots::Mentions);
+        let adapter = SlackAdapter::new("xoxb-test".into(), ttl, AllowBots::Mentions, false);
 
         assert!(
             adapter.use_streaming(false),
@@ -1689,5 +2116,162 @@ mod tests {
             !adapter.use_streaming(true),
             "should NOT stream when other bot present"
         );
+    }
+
+    #[tokio::test]
+    async fn assistant_mode_gates_status_and_native_streaming() {
+        let ttl = std::time::Duration::from_secs(60);
+        // assistant_mode=true → status API on; native streaming on (no other bot),
+        // off when another bot is present; post+edit streaming on regardless.
+        let adapter = SlackAdapter::new("xoxb-test".into(), ttl, AllowBots::Off, true);
+        assert!(
+            adapter.uses_assistant_status(),
+            "assistant_mode enables status API"
+        );
+        assert!(
+            adapter.use_streaming(false),
+            "post+edit streaming on when no other bot"
+        );
+        assert!(
+            adapter.uses_native_streaming(false),
+            "native streaming on when no other bot"
+        );
+        assert!(
+            !adapter.uses_native_streaming(true),
+            "other bot present disables native"
+        );
+        // assistant_mode=false → no status API, no native streaming; post+edit still streams.
+        let adapter2 = SlackAdapter::new("xoxb-test".into(), ttl, AllowBots::Off, false);
+        assert!(!adapter2.uses_assistant_status());
+        assert!(
+            adapter2.use_streaming(false),
+            "post+edit streaming independent of assistant_mode"
+        );
+        assert!(
+            !adapter2.uses_native_streaming(false),
+            "native streaming requires assistant_mode"
+        );
+    }
+
+    /// chat.postMessage body carries Block Kit `markdown` blocks with the raw
+    /// Markdown preserved (NOT downgraded), plus a `text` fallback and thread_ts.
+    #[test]
+    fn post_message_body_uses_raw_markdown_blocks() {
+        let b = build_post_message_body("C1", Some("1700.1"), "## Heading\n- item");
+        assert_eq!(b["channel"], "C1");
+        assert_eq!(b["thread_ts"], "1700.1");
+        assert_eq!(b["blocks"][0]["type"], "markdown");
+        // Raw markdown preserved — heading is NOT flattened to `*Heading*`.
+        assert_eq!(b["blocks"][0]["text"], "## Heading\n- item");
+        assert!(
+            b["text"].is_string(),
+            "text fallback present for a11y/notifs"
+        );
+    }
+
+    /// thread_ts is omitted (top-level post) when the channel has no thread.
+    #[test]
+    fn post_message_body_omits_thread_ts_when_none() {
+        let b = build_post_message_body("C1", None, "hi");
+        assert!(b.get("thread_ts").is_none());
+    }
+
+    /// chat.update body also uses Block Kit `markdown` blocks with raw markdown.
+    #[test]
+    fn update_body_uses_raw_markdown_blocks() {
+        let b = build_update_body("C1", "1700.9", "**bold**");
+        assert_eq!(b["channel"], "C1");
+        assert_eq!(b["ts"], "1700.9");
+        assert_eq!(b["blocks"][0]["type"], "markdown");
+        assert_eq!(b["blocks"][0]["text"], "**bold**");
+    }
+
+    /// Content over the per-block cap (11,900) splits into multiple markdown
+    /// blocks, each within the limit. Assert on char count — `split_message`
+    /// enforces `chars().count() <= limit`, not byte length.
+    #[test]
+    fn long_content_splits_into_multiple_markdown_blocks() {
+        let big = "lorem ipsum dolor\n".repeat(1000); // > MARKDOWN_BLOCK_LIMIT
+        assert!(big.chars().count() > MARKDOWN_BLOCK_LIMIT);
+        let blocks = build_markdown_blocks(&big);
+        assert!(blocks.len() >= 2, "should split into multiple blocks");
+        for blk in &blocks {
+            assert_eq!(blk["type"], "markdown");
+            assert!(blk["text"].as_str().unwrap().chars().count() <= MARKDOWN_BLOCK_LIMIT);
+        }
+    }
+
+    /// Regression for the long-table split: a Markdown table that overflows the
+    /// old 4000 limit but fits the new 11,900 message_limit must stay in a single
+    /// chunk, so it isn't split mid-table into raw pipe text.
+    #[test]
+    fn typical_long_table_stays_in_one_chunk() {
+        let ttl = std::time::Duration::from_secs(300);
+        let adapter = SlackAdapter::new("xoxb-test".into(), ttl, AllowBots::Mentions, true);
+        let limit = adapter.message_limit();
+        assert_eq!(limit, MARKDOWN_BLOCK_LIMIT);
+        let mut table = String::from("| col a | col b | col c |\n|---|---|---|\n");
+        for i in 0..150 {
+            table.push_str(&format!("| row {i} aaaa | bbbb {i} | cccc {i} |\n"));
+        }
+        assert!(table.chars().count() > 4000, "table must exceed old limit");
+        assert!(table.chars().count() < limit, "but fit the new one");
+        assert_eq!(
+            crate::format::split_message(&table, limit).len(),
+            1,
+            "table within message_limit must not be split mid-table"
+        );
+    }
+
+    /// Text-only fallback bodies carry `text` and no `blocks` — used when a
+    /// workspace rejects the Block Kit markdown block.
+    #[test]
+    fn text_only_fallback_bodies_have_no_blocks() {
+        let post = build_post_message_text_only("C1", Some("1700.1"), "## H\n- x");
+        assert!(post.get("blocks").is_none());
+        assert!(post["text"].is_string());
+        assert_eq!(post["thread_ts"], "1700.1");
+        let upd = build_update_text_only("C1", "1700.9", "**b**");
+        assert!(upd.get("blocks").is_none());
+        assert!(upd["text"].is_string());
+    }
+
+    /// Error classifier matches `invalid_blocks` (malformed/unsupported blocks)
+    /// and `msg_blocks_too_long` (over the cumulative block cap) → degrade to
+    /// text. `invalid_arguments` is a Slack catch-all and must NOT trigger a
+    /// pointless text-only retry; unrelated errors are ignored too.
+    #[test]
+    fn detects_block_payload_rejected_errors() {
+        assert!(is_block_payload_rejected(&anyhow!(
+            "Slack API chat.postMessage: invalid_blocks"
+        )));
+        assert!(
+            is_block_payload_rejected(&anyhow!("Slack API chat.postMessage: msg_blocks_too_long")),
+            "oversize block payload should degrade to text-only"
+        );
+        assert!(
+            !is_block_payload_rejected(&anyhow!("Slack API chat.update: invalid_arguments")),
+            "invalid_arguments is a catch-all, not a block-rejection signal"
+        );
+        assert!(!is_block_payload_rejected(&anyhow!(
+            "Slack API chat.postMessage: channel_not_found"
+        )));
+        // Exact error-code match, not substring: a future code that merely
+        // contains `invalid_blocks` must NOT trigger a text-only retry.
+        assert!(
+            !is_block_payload_rejected(&anyhow!(
+                "Slack API chat.postMessage: invalid_blocks_field"
+            )),
+            "must match the error code exactly, not as a substring"
+        );
+    }
+
+    /// Slack opts into native table rendering (Block Kit markdown / markdown_text
+    /// stream chunks), so the router skips the table→code-block conversion.
+    #[test]
+    fn slack_renders_native_tables() {
+        let ttl = std::time::Duration::from_secs(300);
+        let adapter = SlackAdapter::new("xoxb-test".into(), ttl, AllowBots::Mentions, true);
+        assert!(adapter.renders_native_tables());
     }
 }

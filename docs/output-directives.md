@@ -145,3 +145,10 @@ allowed_dirs = ["/home/node", "/home/node/reports"]
 - If validation or upload fails, OpenAB sends a warning instead of exposing the directive.
 
 **Security**: OpenAB canonicalizes the requested file path and only reads files under `attachments.allowed_dirs` (or `[agent].working_dir` by default). Do not set `allowed_dirs` wider than directories where agents intentionally write shareable artifacts.
+
+### Slack behavior
+
+> **Note:** `reply_to` is currently implemented for Discord and Feishu (gateway). Slack behavior depends on `assistant_mode`:
+>
+> - **`assistant_mode = true` (default):** When native streaming is active, the `reply_to` directive is **bypassed** — the streamed message is itself the in-thread reply and cannot target a different message. The directive is silently ignored (no error).
+> - **`assistant_mode = false`:** The Slack adapter does not implement `reply_to` — it falls back to plain send (same as previous behavior). Slack support for targeted replies can be added in a future PR.

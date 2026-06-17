@@ -15,7 +15,7 @@ use schema::GatewayReply;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::{broadcast, Mutex, Semaphore};
 use tracing::{info, warn};
 
 // --- Reply token cache for LINE hybrid Reply/Push dispatch ---
@@ -33,6 +33,11 @@ pub const REPLY_TOKEN_TTL_SECS: u64 = 50;
 /// if webhooks arrive faster than OAB can reply (e.g. OAB offline, spam burst).
 pub const REPLY_TOKEN_CACHE_MAX: usize = 10_000;
 
+/// Maximum number of post-ack LINE webhook payloads processed concurrently.
+/// Keeps image download/decode work bounded during bursts without giving up the
+/// fast 200 OK response path.
+pub const LINE_WEBHOOK_CONCURRENCY_MAX: usize = 8;
+
 // --- App state (shared across all adapters) ---
 
 pub struct AppState {
@@ -40,6 +45,8 @@ pub struct AppState {
     pub telegram_bot_token: Option<String>,
     /// Telegram webhook secret token for request validation
     pub telegram_secret_token: Option<String>,
+    /// Use sendRichMessage for complex content (Bot API 10.1+)
+    pub telegram_rich_messages: bool,
     /// LINE channel secret for signature validation
     pub line_channel_secret: Option<String>,
     /// LINE channel access token for reply API
@@ -62,6 +69,9 @@ pub struct AppState {
     /// the first client to `remove()` a token wins the free Reply API call;
     /// other clients for the same event naturally fall back to Push API.
     pub reply_token_cache: ReplyTokenCache,
+    /// Limits concurrent post-ack LINE webhook processing so image bursts do not
+    /// turn into unbounded download/decode work.
+    pub line_webhook_semaphore: Arc<Semaphore>,
     /// Shared HTTP client for media downloads and API calls
     pub client: reqwest::Client,
 }
@@ -130,6 +140,7 @@ async fn handle_oab_connection(state: Arc<AppState>, socket: axum::extract::ws::
                                         &client,
                                         &state_for_recv.event_tx,
                                         &reaction_state,
+                                        state_for_recv.telegram_rich_messages,
                                     )
                                     .await;
                                 } else {
@@ -164,7 +175,12 @@ async fn handle_oab_connection(state: Arc<AppState>, socket: axum::extract::ws::
                             }
                             "feishu" => {
                                 if let Some(ref feishu) = state_for_recv.feishu {
-                                    adapters::feishu::handle_reply(&reply, feishu, &state_for_recv.event_tx).await;
+                                    adapters::feishu::handle_reply(
+                                        &reply,
+                                        feishu,
+                                        &state_for_recv.event_tx,
+                                    )
+                                    .await;
                                 } else {
                                     warn!("reply for feishu but adapter not configured");
                                 }
@@ -228,6 +244,9 @@ async fn main() -> Result<()> {
     // Telegram adapter
     let telegram_bot_token = std::env::var("TELEGRAM_BOT_TOKEN").ok();
     let telegram_secret_token = std::env::var("TELEGRAM_SECRET_TOKEN").ok();
+    let telegram_rich_messages = std::env::var("TELEGRAM_RICH_MESSAGES")
+        .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+        .unwrap_or(true);
     if telegram_bot_token.is_some() {
         let webhook_path =
             std::env::var("TELEGRAM_WEBHOOK_PATH").unwrap_or_else(|_| "/webhook/telegram".into());
@@ -318,10 +337,16 @@ async fn main() -> Result<()> {
             warn!("GOOGLE_CHAT_ACCESS_TOKEN / GOOGLE_CHAT_SA_KEY_JSON not set — replies will be logged but not sent");
         }
         if jwt_verifier.is_none() {
-            warn!("GOOGLE_CHAT_AUDIENCE not set — webhook requests are NOT authenticated (insecure)");
+            warn!(
+                "GOOGLE_CHAT_AUDIENCE not set — webhook requests are NOT authenticated (insecure)"
+            );
         }
 
-        Some(adapters::googlechat::GoogleChatAdapter::new(token_cache, access_token, jwt_verifier))
+        Some(adapters::googlechat::GoogleChatAdapter::new(
+            token_cache,
+            access_token,
+            jwt_verifier,
+        ))
     } else {
         None
     };
@@ -334,7 +359,10 @@ async fn main() -> Result<()> {
     });
     if let Some(ref w) = wecom {
         app = app
-            .route(&w.config.webhook_path, axum::routing::get(adapters::wecom::verify))
+            .route(
+                &w.config.webhook_path,
+                axum::routing::get(adapters::wecom::verify),
+            )
             .route(&w.config.webhook_path, post(adapters::wecom::webhook));
     }
 
@@ -356,6 +384,7 @@ async fn main() -> Result<()> {
     let state = Arc::new(AppState {
         telegram_bot_token,
         telegram_secret_token,
+        telegram_rich_messages,
         line_channel_secret,
         line_access_token,
         teams,
@@ -366,6 +395,7 @@ async fn main() -> Result<()> {
         ws_token,
         event_tx,
         reply_token_cache,
+        line_webhook_semaphore: Arc::new(Semaphore::new(LINE_WEBHOOK_CONCURRENCY_MAX)),
         client,
     });
 
@@ -425,7 +455,13 @@ async fn main() -> Result<()> {
     let (feishu_shutdown_tx, feishu_shutdown_rx) = tokio::sync::watch::channel(false);
     if feishu_ws_mode {
         if let Some(ref feishu) = state.feishu {
-            match adapters::feishu::start_websocket(feishu, state.event_tx.clone(), feishu_shutdown_rx).await {
+            match adapters::feishu::start_websocket(
+                feishu,
+                state.event_tx.clone(),
+                feishu_shutdown_rx,
+            )
+            .await
+            {
                 Ok(_handle) => info!("feishu websocket task spawned"),
                 Err(e) => tracing::error!(err = %e, "feishu websocket startup failed"),
             }
@@ -461,6 +497,26 @@ mod tests {
                 attachments: Vec::new(),
             },
             command: None,
+            request_id: None,
+            quote_message_id: None,
+        }
+    }
+
+    fn make_reply_with_command(event_id: &str, command: &str, text: &str) -> schema::GatewayReply {
+        schema::GatewayReply {
+            schema: "openab.gateway.reply.v1".into(),
+            reply_to: event_id.into(),
+            platform: "line".into(),
+            channel: schema::ReplyChannel {
+                id: "U1234".into(),
+                thread_id: None,
+            },
+            content: schema::Content {
+                content_type: "text".into(),
+                text: text.into(),
+                attachments: Vec::new(),
+            },
+            command: Some(command.into()),
             request_id: None,
             quote_message_id: None,
         }
@@ -510,6 +566,50 @@ mod tests {
         .await;
 
         assert!(used, "should report Reply API was used");
+    }
+
+    /// All unsupported LINE commands should be ignored without consuming the cached reply token.
+    #[tokio::test]
+    async fn line_ignores_unsupported_commands_without_touching_cache() {
+        let unsupported = &["add_reaction", "remove_reaction", "create_topic"];
+
+        for cmd in unsupported {
+            let server = MockServer::start().await;
+            let _reply = Mock::given(method("POST"))
+                .and(path("/v2/bot/message/reply"))
+                .respond_with(ResponseTemplate::new(200))
+                .expect(0)
+                .mount_as_scoped(&server)
+                .await;
+            let _push = Mock::given(method("POST"))
+                .and(path("/v2/bot/message/push"))
+                .respond_with(ResponseTemplate::new(200))
+                .expect(0)
+                .mount_as_scoped(&server)
+                .await;
+
+            let cache = make_cache();
+            cache
+                .lock()
+                .unwrap()
+                .insert("evt_unsup".into(), ("tok_unsup".into(), Instant::now()));
+
+            let client = reqwest::Client::new();
+            let used = adapters::line::dispatch_line_reply(
+                &client,
+                "test_access_token",
+                &cache,
+                &make_reply_with_command("evt_unsup", cmd, "payload"),
+                &server.uri(),
+            )
+            .await;
+
+            assert!(!used, "{cmd}: should not report reply usage");
+            assert!(
+                cache.lock().unwrap().contains_key("evt_unsup"),
+                "{cmd}: should not consume the cached reply token"
+            );
+        }
     }
 
     /// Cache miss: falls back to Push API with correct "to", bearer token, and message body.

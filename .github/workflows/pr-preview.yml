@@ -13,6 +13,7 @@ on:
         type: choice
         options:
           - default
+          - agentcore
           - antigravity
           - claude
           - codex
@@ -21,6 +22,7 @@ on:
           - gemini
           - grok
           - hermes
+          - mimocode
           - native
           - opencode
           - pi

@@ -199,7 +199,11 @@ In supergroups with topics enabled, each new conversation auto-creates a forum t
 
 ### Markdown rendering
 
-Agent replies are rendered with Telegram Markdown: **bold**, `code`, and code blocks work. Headers (`##`) and tables render as plain text (Telegram limitation).
+Agent replies are rendered with Telegram Markdown: **bold**, `code`, and code blocks work natively.
+
+With **Rich Messages** enabled (default, requires Bot API 10.1+), headings (`##`) and tables render with full formatting via `sendRichMessage`. Code blocks remain on the legacy path for syntax highlighting and copy-button support. Content exceeding 4096 characters is automatically handled via rich messages (up to 32768 chars).
+
+Set `TELEGRAM_RICH_MESSAGES=false` to disable rich messages and use legacy `sendMessage` for all replies.
 
 ## Environment Variables (Gateway)
 
@@ -207,6 +211,7 @@ Agent replies are rendered with Telegram Markdown: **bold**, `code`, and code bl
 |---|---|---|---|
 | `TELEGRAM_BOT_TOKEN` | Yes | — | Bot API token from @BotFather |
 | `TELEGRAM_SECRET_TOKEN` | No | — | Webhook signature validation |
+| `TELEGRAM_RICH_MESSAGES` | No | `true` | Use `sendRichMessage` for tables/headings/long content (Bot API 10.1+). Set `false` to opt out. |
 | `GATEWAY_WS_TOKEN` | No | — | WebSocket auth token |
 | `GATEWAY_LISTEN` | No | `0.0.0.0:8080` | Listen address |
 | `TELEGRAM_WEBHOOK_PATH` | No | `/webhook/telegram` | Webhook endpoint path |

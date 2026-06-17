@@ -32,9 +32,8 @@ helm install openab openab/openab \
 
 ```toml
 [agent]
-command = "codex-acp"
-args = []
-working_dir = "/home/node"
+# command defaults from OPENAB_AGENT_COMMAND="codex"
+# Only override if you need non-default behavior
 ```
 
 ### Local patched fork (mid-turn steering)
@@ -58,7 +57,7 @@ forwards in-flight-arriving messages straight through as steer prompts.
 ## Authentication
 
 ```bash
-kubectl exec -it deployment/openab-codex -- codex login --device-auth
+kubectl exec -it deployment/openab-codex -- sh -c "$OPENAB_AGENT_AUTH_COMMAND"
 ```
 
 Follow the device code flow in your browser, then restart the pod:
@@ -185,9 +184,8 @@ itself, explicitly expose an upload token to the agent:
 
 ```toml
 [agent]
-command = "codex-acp"
-args = []
-working_dir = "/home/node"
+# command defaults from OPENAB_AGENT_COMMAND="codex"
+# Only override if you need non-default behavior
 env = { DISCORD_FILE_BOT_TOKEN = "${DISCORD_FILE_BOT_TOKEN}" }
 ```
 
@@ -226,34 +224,46 @@ Use $discord-imagegen-deliver to generate a warm hand-painted sky with birds and
 
 ## Approval Policy & Auto-review
 
-Codex offers three approval modes that control what happens when the agent
-tries to act outside the sandbox (network calls, running scripts, etc.):
+Codex separates **when** to ask for approval (`approval_policy`) from **who**
+reviews the request (`approvals_reviewer`):
 
-| Mode | Behaviour | Best for |
-|------|-----------|----------|
-| **Manual** (`approval_policy = "on-request"`) | Every out-of-sandbox action waits for a human to approve | Interactive, attended sessions |
-| **Auto-review** (`approval_policy = "auto-review"`) | A separate reviewer agent (GPT-5.4 Thinking) approves or denies automatically | **OpenAB / unattended agents** |
-| **Full Access** (`approval_policy = "full-access"`) | No sandbox enforcement at all | Trusted, isolated environments only |
+| Key | Valid values | Purpose |
+|-----|-------------|---------|
+| `approval_policy` | `untrusted`, `on-failure` (deprecated), `on-request`, `granular`, `never` | When Codex must request approval before acting |
+| `approvals_reviewer` | `"user"` (default), `"auto_review"` | Who handles the approval — human or GPT-5.4 Thinking reviewer |
 
 For OpenAB deployments, **Auto-review is the recommended mode**. OpenAB agents
 run as long-lived background processes with no human watching the terminal, so
-manual approval is impractical and Full Access removes all guardrails.
+manual approval is impractical and `"never"` removes all guardrails.
 
 Enable Auto-review in `/home/node/.codex/config.toml`:
 
 ```toml
-[sandbox]
-approval_policy = "auto-review"
+# Full recommended config for OpenAB agents
+sandbox_mode = "danger-full-access"
+approval_policy = "on-request"
+approvals_reviewer = "auto_review"
+
+[features]
+image_generation = true
 ```
 
-Or pass it at install time via Helm:
+> `sandbox_mode`, `approval_policy`, and `approvals_reviewer` are **top-level**
+> keys in `config.toml`, not under a `[sandbox]` section. Codex silently ignores
+> them if nested.
+
+Or seed the config into the running pod's PVC with `kubectl cp` (writable,
+persists across restarts):
 
 ```bash
-helm install openab openab/openab \
-  --set agents.codex.discord.enabled=true \
-  # ... other flags ...
-  --set-json 'agents.codex.extraConfig={"sandbox":{"approval_policy":"auto-review"}}'
+kubectl cp config.toml <pod-name>:/home/node/.codex/config.toml
+kubectl rollout restart deployment/openab-codex
 ```
+
+> **Do not mount a ConfigMap directly to `/home/node/.codex/config.toml`.**
+> ConfigMap mounts are read-only — Codex cannot write back to them (e.g.
+> `codex features enable` will fail with permission denied). Always use
+> `kubectl cp` to seed config onto the PVC, which remains writable at runtime.
 
 ### What Auto-review does
 
@@ -303,10 +313,28 @@ runtime already provides isolation):
 
 ```toml
 # /home/node/.codex/config.toml
-[sandbox]
 sandbox_mode = "danger-full-access"
 approval_policy = "on-request"
+approvals_reviewer = "auto_review"
 ```
+
+> `sandbox_mode`, `approval_policy`, and `approvals_reviewer` are **top-level**
+> keys in `config.toml`. A `[sandbox]` section header is silently ignored by
+> Codex 0.137+ — verified empirically: with the nested form in place, `codex
+> exec` still fails with `bwrap: No permissions to create new namespace`; moving
+> the same keys to the top level makes `codex exec` report
+> `sandbox: danger-full-access` and run.
+
+> **Do NOT pair `danger-full-access` with `approval_policy = "on-request"` and
+> `approvals_reviewer = "user"` on an OpenAB deployment.** Without auto-review,
+> `on-request` pauses each tool call to wait for an interactive human approval,
+> and OpenAB agents have no terminal attached — every tool call hangs in
+> `in_progress` until openab's 1800 s hard timeout fires. Use
+> `approvals_reviewer = "auto_review"` (recommended, see
+> [§Approval Policy](#approval-policy--auto-review)) or
+> `approval_policy = "never"` for trusted and already-isolated pods (`"never"`
+> removes all per-call guardrails — the outer pod isolation is the only
+> remaining boundary).
 
 Or launch with:
 
@@ -314,11 +342,12 @@ Or launch with:
 codex --sandbox danger-full-access
 ```
 
-Or via Helm:
+Or seed via `kubectl cp` (see [above](#approval-policy--auto-review) for why
+ConfigMap mounts should not be used for `.codex/config.toml`):
 
 ```bash
-helm install openab openab/openab \
-  --set-json 'agents.codex.extraConfig={"sandbox":{"sandbox_mode":"danger-full-access","approval_policy":"on-request"}}'
+kubectl cp config.toml <pod-name>:/home/node/.codex/config.toml
+kubectl rollout restart deployment/openab-codex
 ```
 
 > **Important:** `danger-full-access` disables only Codex's *inner* sandbox. It

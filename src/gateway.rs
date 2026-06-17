@@ -135,6 +135,7 @@ pub struct GatewayAdapter {
     pending: PendingRequests,
     platform_name: &'static str,
     streaming: bool,
+    streaming_placeholder: bool,
 }
 
 impl GatewayAdapter {
@@ -143,12 +144,14 @@ impl GatewayAdapter {
         pending: PendingRequests,
         platform_name: &'static str,
         streaming: bool,
+        streaming_placeholder: bool,
     ) -> Self {
         Self {
             ws_tx,
             pending,
             platform_name,
             streaming,
+            streaming_placeholder,
         }
     }
 
@@ -524,6 +527,10 @@ impl ChatAdapter for GatewayAdapter {
     fn use_streaming(&self, _other_bot_present: bool) -> bool {
         self.streaming
     }
+
+    fn show_streaming_placeholder(&self) -> bool {
+        self.streaming_placeholder
+    }
 }
 
 // --- Run the gateway adapter (connects to gateway WS, routes events to AdapterRouter) ---
@@ -539,6 +546,7 @@ pub struct GatewayParams {
     pub allow_all_users: bool,
     pub allowed_users: Vec<String>,
     pub streaming: bool,
+    pub streaming_placeholder: bool,
     pub stt: crate::config::SttConfig,
 }
 
@@ -558,6 +566,7 @@ pub async fn run_gateway_adapter(
     let allow_all_users = params.allow_all_users;
     let allowed_users = params.allowed_users;
     let streaming = params.streaming;
+    let streaming_placeholder = params.streaming_placeholder;
     let stt_config = params.stt;
 
     let connect_url = match &params.token {
@@ -607,6 +616,7 @@ pub async fn run_gateway_adapter(
             pending.clone(),
             platform,
             streaming,
+            streaming_placeholder,
         ));
         let slash_ws_tx = ws_tx.clone(); // for fire-and-forget slash command responses
         let mut tasks: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
@@ -868,6 +878,7 @@ pub async fn run_gateway_adapter(
                                             estimated_tokens,
                                             // TODO: implement gateway multibot detection
                                             other_bot_present: false,
+                                            recipient: None, // Slack-only (assistant mode); N/A for gateway
                                         };
                                         if let Err(e) = dispatcher
                                             .submit(thread_key, thread_channel, adapter, buf_msg)

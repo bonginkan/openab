@@ -73,12 +73,12 @@ pub enum AllowBots {
 #[derive(Debug, Clone, PartialEq, Default)]
 pub enum AllowUsers {
     /// Bot responds in threads it has participated in without @mention.
-    #[default]
     Involved,
     /// Always require @mention, even in participated threads.
     Mentions,
     /// Like Involved, but if another bot has also posted in the thread,
     /// require @mention to avoid all bots responding.
+    #[default]
     MultibotMentions,
 }
 
@@ -150,14 +150,14 @@ impl FeishuConfig {
         };
         let trusted_bot_ids = parse_csv("FEISHU_TRUSTED_BOT_IDS");
         let allow_user_messages = match std::env::var("FEISHU_ALLOW_USER_MESSAGES")
-            .unwrap_or_else(|_| "involved".into())
+            .unwrap_or_else(|_| "multibot_mentions".into())
             .to_lowercase()
             .replace('-', "_")
             .as_str()
         {
+            "involved" => AllowUsers::Involved,
             "mentions" => AllowUsers::Mentions,
-            "multibot_mentions" => AllowUsers::MultibotMentions,
-            _ => AllowUsers::Involved,
+            _ => AllowUsers::MultibotMentions,
         };
         let max_bot_turns = std::env::var("FEISHU_MAX_BOT_TURNS")
             .ok()
@@ -2420,7 +2420,7 @@ mod tests {
             allowed_users: vec![],
             require_mention: true,
             allow_bots: AllowBots::Off,
-            allow_user_messages: AllowUsers::Involved,
+            allow_user_messages: AllowUsers::MultibotMentions,
             trusted_bot_ids: vec![],
             max_bot_turns: 20,
             dedupe_ttl_secs: 300,

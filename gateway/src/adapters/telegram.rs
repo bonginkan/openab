@@ -213,6 +213,144 @@ pub async fn webhook(
     axum::http::StatusCode::OK
 }
 
+/// Split text into chunks of at most `limit` characters, breaking at newlines when possible.
+fn chunk_text(text: &str, limit: usize) -> Vec<String> {
+    if text.chars().count() <= limit {
+        return vec![text.to_string()];
+    }
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    for line in text.lines() {
+        if !current.is_empty() && current.chars().count() + line.chars().count() + 1 > limit {
+            chunks.push(std::mem::take(&mut current));
+        }
+        if !current.is_empty() {
+            current.push('\n');
+        }
+        if line.chars().count() > limit {
+            // Line itself exceeds limit — hard split
+            for ch in line.chars() {
+                current.push(ch);
+                if current.chars().count() >= limit {
+                    chunks.push(std::mem::take(&mut current));
+                }
+            }
+        } else {
+            current.push_str(line);
+        }
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
+}
+
+fn is_markdown_parse_error(description: &str) -> bool {
+    let desc_lower = description.to_lowercase();
+    desc_lower.contains("can't find end")
+        || desc_lower.contains("can't parse")
+        || desc_lower.contains("parse entities")
+}
+
+/// Returns true if the content is complex enough to benefit from sendRichMessage.
+///
+/// Design decisions:
+/// - We classify at the adapter layer (not agent) so agents don't need prompt changes.
+/// - Conservative: only route to rich when legacy sendMessage would visibly break.
+/// - False positives are acceptable (rich renders simple text fine too), but we avoid
+///   unnecessary API switches for plain prose to reduce risk surface.
+/// - LaTeX and blockquotes are intentionally omitted for now (Phase 2).
+fn is_complex_markdown(text: &str) -> bool {
+    // 🟡 Code blocks intentionally NOT routed to rich — sendMessage preserves
+    // syntax highlighting (language header + copy button) which RichBlockPreformatted lacks.
+
+    // sendMessage hard limit is 4096 chars. Rich messages support 32768.
+    if text.chars().count() > 4096 {
+        return true;
+    }
+    text.lines().any(|line| {
+        let trimmed = line.trim_start();
+        // ATX headings (h1-h6): sendMessage has zero heading support.
+        if trimmed.starts_with("# ")
+            || trimmed.starts_with("## ")
+            || trimmed.starts_with("### ")
+            || trimmed.starts_with("#### ")
+            || trimmed.starts_with("##### ")
+            || trimmed.starts_with("###### ")
+        {
+            return true;
+        }
+        // GFM table separator row detection.
+        if trimmed.starts_with('|') && trimmed.ends_with('|') {
+            let inner = &trimmed[1..trimmed.len() - 1];
+            if inner.split('|').all(|cell| {
+                let c = cell.trim().trim_matches(':');
+                !c.is_empty() && c.chars().all(|ch| ch == '-')
+            }) {
+                return true;
+            }
+        }
+        false
+    })
+}
+
+/// Send a rich message via Bot API 10.1 sendRichMessage.
+///
+/// Design: we pass agent markdown directly via InputRichMessage.markdown.
+/// Rich Markdown is GFM-compatible, so no conversion layer is needed.
+/// The API handles rendering (tables, syntax highlighting, headings, etc.)
+async fn send_rich_message(
+    client: &reqwest::Client,
+    bot_token: &str,
+    chat_id: &str,
+    thread_id: &Option<String>,
+    text: &str,
+) -> Result<serde_json::Value, String> {
+    let url = format!("{TELEGRAM_API_BASE}/bot{bot_token}/sendRichMessage");
+    let body = serde_json::json!({
+        "chat_id": chat_id,
+        "message_thread_id": thread_id,
+        "rich_message": { "markdown": text },
+    });
+    let resp = client.post(&url).json(&body).send().await.map_err(|e| e.to_string())?;
+    let json: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+    if json["ok"].as_bool() == Some(true) {
+        Ok(json)
+    } else {
+        Err(json["description"].as_str().unwrap_or("unknown error").to_string())
+    }
+}
+
+/// Stream a partial rich message via sendRichMessageDraft.
+///
+/// Design: ephemeral 30-second preview. Caller must follow up with
+/// sendRichMessage to persist. Same draft_id = animated transition.
+/// Wired but unused until gateway streaming infrastructure integrates.
+#[allow(dead_code)]
+async fn send_rich_message_draft(
+    client: &reqwest::Client,
+    bot_token: &str,
+    chat_id: &str,
+    thread_id: &Option<String>,
+    draft_id: i64,
+    text: &str,
+) -> Result<(), String> {
+    let url = format!("{TELEGRAM_API_BASE}/bot{bot_token}/sendRichMessageDraft");
+    let body = serde_json::json!({
+        "chat_id": chat_id,
+        "message_thread_id": thread_id,
+        "draft_id": draft_id,
+        "rich_message": if text.contains("<tg-") { serde_json::json!({ "html": text }) } else { serde_json::json!({ "markdown": text }) },
+    });
+    let resp = client.post(&url).json(&body).send().await.map_err(|e| e.to_string())?;
+    let json: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+    if json["ok"].as_bool() == Some(true) {
+        Ok(())
+    } else {
+        Err(json["description"].as_str().unwrap_or("unknown error").to_string())
+    }
+}
+
 // --- Reply handler ---
 
 pub async fn handle_reply(
@@ -221,6 +359,7 @@ pub async fn handle_reply(
     client: &reqwest::Client,
     event_tx: &tokio::sync::broadcast::Sender<String>,
     reaction_state: &Arc<Mutex<HashMap<String, Vec<String>>>>,
+    rich_messages: bool,
 ) {
     // Handle create_topic command
     if reply.command.as_deref() == Some("create_topic") {
@@ -278,10 +417,68 @@ pub async fn handle_reply(
         return;
     }
 
+    // Handle edit_message
+    if reply.command.as_deref() == Some("edit_message") {
+        if reply.reply_to == "draft" {
+            // Dummy "draft" ref from streaming without placeholder.
+            if rich_messages {
+                // Skip short updates — let thinking animation show until meaningful content arrives
+                if reply.content.text.len() < 30 {
+                    return;
+                }
+                let text = if reply.content.text.len() > 32768 {
+                    &reply.content.text[..reply.content.text.floor_char_boundary(32768)]
+                } else {
+                    &reply.content.text
+                };
+                // Combine channel + thread to avoid draft_id collision in forum topics
+                let chan: i64 = reply.channel.id.parse::<i64>().unwrap_or(1).abs();
+                let tid: i64 = reply.channel.thread_id.as_deref().and_then(|t| t.parse::<i64>().ok()).unwrap_or(0).abs();
+                let draft_id: i64 = (chan.wrapping_add(tid)) % 1_000_000 + 1;
+                let _ = send_rich_message_draft(client, bot_token, &reply.channel.id, &reply.channel.thread_id, draft_id, text).await;
+            }
+            // else: rich_messages=false with dummy ref — silently drop (no real msg to edit)
+            return;
+        }
+        // Real message_id — perform actual editMessageText (legacy streaming path)
+        let url = format!("{TELEGRAM_API_BASE}/bot{bot_token}/editMessageText");
+        let _ = client
+            .post(&url)
+            .json(&serde_json::json!({
+                "chat_id": reply.channel.id,
+                "message_id": reply.reply_to,
+                "text": &reply.content.text,
+                "parse_mode": "Markdown",
+            }))
+            .send()
+            .await;
+        return;
+    }
+
     // Handle add_reaction / remove_reaction
     if reply.command.as_deref() == Some("add_reaction")
         || reply.command.as_deref() == Some("remove_reaction")
     {
+        // Send thinking draft on reaction changes — reflects agent state
+        if rich_messages && reply.command.as_deref() == Some("add_reaction") {
+            let thinking_text = match reply.content.text.as_str() {
+                "👀" => Some("<tg-thinking>Looking...</tg-thinking>"),
+                "🤔" => Some("<tg-thinking>Thinking...</tg-thinking>"),
+                "👨\u{200d}💻" => Some("<tg-thinking>Writing code...</tg-thinking>"),
+                "🔥" => Some("<tg-thinking>Working...</tg-thinking>"),
+                "⚡" => Some("<tg-thinking>Running tools...</tg-thinking>"),
+                _ => None,
+            };
+            if let Some(text) = thinking_text {
+                let chan: i64 = reply.channel.id.parse::<i64>().unwrap_or(1).abs();
+                let tid: i64 = reply.channel.thread_id.as_deref().and_then(|t| t.parse::<i64>().ok()).unwrap_or(0).abs();
+                let draft_id: i64 = (chan.wrapping_add(tid)) % 1_000_000 + 1;
+                let _ = send_rich_message_draft(
+                    client, bot_token, &reply.channel.id, &reply.channel.thread_id, draft_id, text,
+                ).await;
+            }
+        }
+
         let msg_key = format!("{}:{}", reply.channel.id, reply.reply_to);
         let emoji = &reply.content.text;
         let tg_emoji = match emoji.as_str() {
@@ -331,18 +528,79 @@ pub async fn handle_reply(
         thread_id = ?reply.channel.thread_id,
         "gateway → telegram"
     );
-    let url = format!("{TELEGRAM_API_BASE}/bot{bot_token}/sendMessage");
-    let _ = client
-        .post(&url)
-        .json(&serde_json::json!({
-            "chat_id": reply.channel.id,
-            "text": reply.content.text,
-            "message_thread_id": reply.channel.thread_id,
-            "parse_mode": "Markdown",
-        }))
-        .send()
-        .await
-        .map_err(|e| error!("telegram send error: {e}"));
+
+    // --- Rich Message routing ---
+    // Design: try sendRichMessage first for complex content. On ANY failure
+    // (unsupported client, API version mismatch, network error), fall back to
+    // legacy sendMessage (chunked). This ensures zero-downtime rollout.
+    if rich_messages && is_complex_markdown(&reply.content.text) {
+        // Bot API limit: 32768 UTF-8 characters (not bytes).
+        let text = &reply.content.text;
+        let rich_text: String = if text.chars().count() > 32768 {
+            text.chars().take(32768).collect()
+        } else {
+            text.to_string()
+        };
+        match send_rich_message(client, bot_token, &reply.channel.id, &reply.channel.thread_id, &rich_text).await {
+            Ok(_) => return,
+            Err(e) => warn!("sendRichMessage failed ({e}), falling back to sendMessage"),
+        }
+    }
+
+    // Legacy sendMessage — chunk at 4096 chars to avoid rejection.
+    let chunks = chunk_text(&reply.content.text, 4096);
+    for chunk in &chunks {
+        let url = format!("{TELEGRAM_API_BASE}/bot{bot_token}/sendMessage");
+        let resp = client
+            .post(&url)
+            .json(&serde_json::json!({
+                "chat_id": reply.channel.id,
+                "text": chunk,
+                "message_thread_id": reply.channel.thread_id,
+                "parse_mode": "Markdown",
+            }))
+            .send()
+            .await;
+
+        match resp {
+            Ok(r) => {
+                let body: serde_json::Value = r.json().await.unwrap_or_default();
+                if body["ok"].as_bool() != Some(true) {
+                    let desc = body["description"].as_str().unwrap_or("unknown error");
+                    if is_markdown_parse_error(desc) {
+                        warn!("Markdown send failed: {desc}, retrying as plain text");
+                        match client
+                            .post(&url)
+                            .json(&serde_json::json!({
+                                "chat_id": reply.channel.id,
+                                "text": chunk,
+                                "message_thread_id": reply.channel.thread_id,
+                            }))
+                            .send()
+                            .await
+                        {
+                            Ok(retry_r) => {
+                                let retry_body: serde_json::Value =
+                                    retry_r.json().await.unwrap_or_default();
+                                if retry_body["ok"].as_bool() != Some(true) {
+                                    error!(
+                                        "telegram plain-text retry failed: {}",
+                                        retry_body["description"]
+                                            .as_str()
+                                            .unwrap_or("unknown error")
+                                    );
+                                }
+                            }
+                            Err(e) => error!("telegram plain-text send error: {e}"),
+                        }
+                    } else {
+                        error!("telegram send failed: {desc}");
+                    }
+                }
+            }
+            Err(e) => error!("telegram send error: {e}"),
+        }
+    }
 }
 
 /// Download media from Telegram via getFile → store to filesystem (colocate mode).
@@ -482,4 +740,43 @@ async fn download_telegram_document(
         size: bytes.len() as u64,
         path: Some(path),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_markdown_parse_error() {
+        assert!(is_markdown_parse_error("Bad Request: can't find end of italic entity at byte offset 37"));
+        assert!(is_markdown_parse_error("Bad Request: can't parse entities: Can't find end of bold entity"));
+        assert!(is_markdown_parse_error("can't parse entities in message text"));
+        assert!(!is_markdown_parse_error("Unauthorized"));
+        assert!(!is_markdown_parse_error("Bad Request: chat not found"));
+    }
+
+    #[test]
+    fn test_is_complex_markdown() {
+        // Tables
+        assert!(is_complex_markdown("| Col1 | Col2 |\n|---|---|\n| a | b |"));
+        assert!(is_complex_markdown("| Col1 | Col2 |\n| :--- | ---: |\n| a | b |"));
+        assert!(is_complex_markdown("| A | B |\n| :---: | :---: |\n| x | y |"));
+        // Code blocks — intentionally NOT complex (preserves syntax highlighting on legacy path)
+        assert!(!is_complex_markdown("```rust\nfn main() {}\n```"));
+        assert!(!is_complex_markdown("~~~\ncode\n~~~"));
+        // Headings
+        assert!(is_complex_markdown("# Heading\n\nSome text"));
+        assert!(is_complex_markdown("## Heading 2 at start"));
+        assert!(is_complex_markdown("### Heading 3 at start"));
+        assert!(is_complex_markdown("#### Heading 4"));
+        assert!(is_complex_markdown("text\n##### Heading 5"));
+        assert!(is_complex_markdown("  ## Indented heading"));
+        // Size
+        assert!(is_complex_markdown(&"x".repeat(4097)));
+        // Negatives
+        assert!(!is_complex_markdown("Hello world"));
+        assert!(!is_complex_markdown("*bold* and _italic_"));
+        assert!(!is_complex_markdown("#hashtag no space"));
+        assert!(!is_complex_markdown("| just | pipes |"));
+    }
 }
