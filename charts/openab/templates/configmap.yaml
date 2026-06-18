@@ -159,6 +159,10 @@ data:
     [attachments]
     enabled = {{ if hasKey ($cfg.attachments) "enabled" }}{{ ($cfg.attachments).enabled }}{{ else }}false{{ end }}
     allowed_dirs = {{ ($cfg.attachments).allowedDirs | default list | toJson }}
+    auto_stage_generated_images = {{ if hasKey ($cfg.attachments) "autoStageGeneratedImages" }}{{ ($cfg.attachments).autoStageGeneratedImages }}{{ else }}false{{ end }}
+    {{- if ($cfg.attachments).autoStageDir }}
+    auto_stage_dir = {{ ($cfg.attachments).autoStageDir | quote }}
+    {{- end }}
     max_bytes = {{ ($cfg.attachments).maxBytes | default 10485760 | int }}
     max_files = {{ ($cfg.attachments).maxFiles | default 10 | int }}
     {{- end }}

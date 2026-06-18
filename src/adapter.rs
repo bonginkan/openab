@@ -522,6 +522,8 @@ pub struct OutboundAttachment {
 struct OutboundAttachments {
     enabled: bool,
     allowed_dirs: Vec<PathBuf>,
+    auto_stage_generated_images: bool,
+    auto_stage_dir: Option<PathBuf>,
     agent_working_dir: PathBuf,
     max_bytes: u64,
     max_files: usize,
@@ -553,6 +555,8 @@ impl OutboundAttachments {
         Self {
             enabled: config.enabled,
             allowed_dirs,
+            auto_stage_generated_images: config.auto_stage_generated_images,
+            auto_stage_dir: config.auto_stage_dir.map(PathBuf::from),
             agent_working_dir,
             max_bytes: config.max_bytes,
             max_files: config.max_files,
@@ -614,7 +618,21 @@ impl OutboundAttachments {
         let canonical = tokio::fs::canonicalize(&candidate)
             .await
             .map_err(|e| anyhow::anyhow!("cannot resolve path {}: {e}", candidate.display()))?;
-        self.ensure_allowed_path(&canonical).await?;
+        let canonical = match self.ensure_allowed_path(&canonical).await {
+            Ok(()) => canonical,
+            Err(e)
+                if matches!(kind, OutboundAttachmentKind::Image)
+                    && self.auto_stage_generated_images =>
+            {
+                match self.stage_generated_image(&canonical).await {
+                    Ok(staged) => staged,
+                    Err(stage_error) => {
+                        return Err(anyhow::anyhow!("{e}; auto-stage failed: {stage_error}"));
+                    }
+                }
+            }
+            Err(e) => return Err(e),
+        };
 
         let metadata = tokio::fs::metadata(&canonical).await?;
         anyhow::ensure!(metadata.is_file(), "path is not a regular file");
@@ -665,6 +683,95 @@ impl OutboundAttachments {
             "path is outside attachments.allowed_dirs (default: agent.working_dir)"
         ))
     }
+
+    async fn stage_generated_image(&self, canonical_file: &Path) -> Result<PathBuf> {
+        self.ensure_generated_image_source(canonical_file).await?;
+
+        let metadata = tokio::fs::metadata(canonical_file).await?;
+        anyhow::ensure!(metadata.is_file(), "path is not a regular file");
+        anyhow::ensure!(
+            metadata.len() <= self.max_bytes,
+            "file is {} bytes, over the {} byte limit",
+            metadata.len(),
+            self.max_bytes
+        );
+
+        let data = tokio::fs::read(canonical_file).await?;
+        anyhow::ensure!(
+            data.len() as u64 <= self.max_bytes,
+            "file is {} bytes, over the {} byte limit",
+            data.len(),
+            self.max_bytes
+        );
+        ensure_supported_image(&data)?;
+
+        let stage_dir = self.resolve_auto_stage_dir().await?;
+        let file_name = canonical_file
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| anyhow::anyhow!("path has no valid filename"))?;
+        let safe_filename = sanitize_stage_filename(file_name);
+        let destination = next_available_stage_path(&stage_dir, &safe_filename).await?;
+        move_file(canonical_file, &destination).await?;
+        let staged = tokio::fs::canonicalize(&destination).await?;
+        self.ensure_allowed_path(&staged).await?;
+
+        tracing::warn!(
+            source = %canonical_file.display(),
+            destination = %staged.display(),
+            "outbound image path outside allowed dirs; moved into allowed auto-stage directory"
+        );
+        Ok(staged)
+    }
+
+    async fn ensure_generated_image_source(&self, canonical_file: &Path) -> Result<()> {
+        for dir in self.generated_image_source_dirs() {
+            if let Ok(canonical_dir) = tokio::fs::canonicalize(dir).await {
+                if canonical_file.starts_with(&canonical_dir) {
+                    return Ok(());
+                }
+            }
+        }
+        Err(anyhow::anyhow!(
+            "path is outside generated-image auto-stage source directories"
+        ))
+    }
+
+    fn generated_image_source_dirs(&self) -> Vec<PathBuf> {
+        let mut dirs = Vec::new();
+        if let Some(home) = std::env::var_os("HOME") {
+            let home = PathBuf::from(home);
+            dirs.push(home.join(".codex/generated_images"));
+            dirs.push(home.join(".codex/openab-images"));
+        }
+        dirs.push(std::env::temp_dir().join("openab-images"));
+        #[cfg(unix)]
+        dirs.push(PathBuf::from("/tmp/openab-images"));
+        dirs
+    }
+
+    async fn resolve_auto_stage_dir(&self) -> Result<PathBuf> {
+        let candidate = self
+            .auto_stage_dir
+            .as_deref()
+            .or_else(|| self.allowed_dirs.first().map(PathBuf::as_path))
+            .ok_or_else(|| anyhow::anyhow!("no attachments.allowed_dirs available"))?;
+        let canonical = tokio::fs::canonicalize(candidate).await.map_err(|e| {
+            anyhow::anyhow!(
+                "cannot resolve auto-stage directory {}: {e}",
+                candidate.display()
+            )
+        })?;
+        let metadata = tokio::fs::metadata(&canonical).await?;
+        anyhow::ensure!(
+            metadata.is_dir(),
+            "auto-stage destination is not a directory"
+        );
+        self.ensure_allowed_path(&canonical).await.map_err(|e| {
+            anyhow::anyhow!("auto-stage destination is outside attachments.allowed_dirs: {e}")
+        })?;
+        Ok(canonical)
+    }
 }
 
 fn ensure_supported_image(data: &[u8]) -> Result<()> {
@@ -689,6 +796,99 @@ fn ensure_supported_image(data: &[u8]) -> Result<()> {
 fn sanitize_attachment_label(value: &str) -> String {
     let flat = value.replace(['\r', '\n'], " ");
     format::truncate_chars_tail(&flat, 160)
+}
+
+fn sanitize_stage_filename(value: &str) -> String {
+    let path = Path::new(value);
+    let stem = path
+        .file_stem()
+        .and_then(|part| part.to_str())
+        .map(sanitize_stage_component)
+        .filter(|part| !part.is_empty())
+        .unwrap_or_else(|| "attachment".to_string());
+    let extension = path
+        .extension()
+        .and_then(|part| part.to_str())
+        .map(sanitize_stage_component)
+        .filter(|part| !part.is_empty());
+
+    match extension {
+        Some(extension) => format!("{stem}.{extension}"),
+        None => stem,
+    }
+}
+
+fn sanitize_stage_component(value: &str) -> String {
+    value
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string()
+}
+
+async fn next_available_stage_path(stage_dir: &Path, file_name: &str) -> Result<PathBuf> {
+    let initial = stage_dir.join(file_name);
+    match tokio::fs::metadata(&initial).await {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(initial),
+        Err(e) => return Err(e.into()),
+    }
+
+    let path = Path::new(file_name);
+    let stem = path
+        .file_stem()
+        .and_then(|part| part.to_str())
+        .filter(|part| !part.is_empty())
+        .unwrap_or("attachment");
+    let extension = path
+        .extension()
+        .and_then(|part| part.to_str())
+        .filter(|part| !part.is_empty())
+        .map(|part| format!(".{part}"))
+        .unwrap_or_default();
+
+    for index in 1..1000 {
+        let candidate = stage_dir.join(format!("{stem}-{index}{extension}"));
+        match tokio::fs::metadata(&candidate).await {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(candidate),
+            Err(e) => return Err(e.into()),
+        }
+    }
+
+    Err(anyhow::anyhow!(
+        "could not find an unused auto-stage filename in {}",
+        stage_dir.display()
+    ))
+}
+
+async fn move_file(source: &Path, destination: &Path) -> Result<()> {
+    match tokio::fs::rename(source, destination).await {
+        Ok(()) => Ok(()),
+        Err(rename_error) => {
+            tokio::fs::copy(source, destination)
+                .await
+                .map_err(|copy_error| {
+                    anyhow::anyhow!(
+                        "rename failed: {rename_error}; copy fallback failed: {copy_error}"
+                    )
+                })?;
+            tokio::fs::remove_file(source).await.map_err(|remove_error| {
+                anyhow::anyhow!(
+                    "rename failed: {rename_error}; copied to {}, but failed to remove source: {remove_error}",
+                    destination.display()
+                )
+            })?;
+            Ok(())
+        }
+    }
 }
 
 // --- AdapterRouter ---
@@ -2225,6 +2425,8 @@ mod tests {
         let cfg = AttachmentsConfig {
             enabled: true,
             allowed_dirs: vec![dir.path().to_string_lossy().to_string()],
+            auto_stage_generated_images: false,
+            auto_stage_dir: None,
             max_bytes: 1024 * 1024,
             max_files: 10,
         };
@@ -2248,6 +2450,8 @@ mod tests {
         let cfg = AttachmentsConfig {
             enabled: true,
             allowed_dirs: vec![dir.path().to_string_lossy().to_string()],
+            auto_stage_generated_images: false,
+            auto_stage_dir: None,
             max_bytes: 1024 * 1024,
             max_files: 10,
         };
@@ -2271,6 +2475,8 @@ mod tests {
         let cfg = AttachmentsConfig {
             enabled: true,
             allowed_dirs: vec![dir.path().to_string_lossy().to_string()],
+            auto_stage_generated_images: false,
+            auto_stage_dir: None,
             max_bytes: 1024 * 1024,
             max_files: 10,
         };
@@ -2294,6 +2500,8 @@ mod tests {
         let cfg = AttachmentsConfig {
             enabled: true,
             allowed_dirs: vec![allowed.path().to_string_lossy().to_string()],
+            auto_stage_generated_images: false,
+            auto_stage_dir: None,
             max_bytes: 1024 * 1024,
             max_files: 10,
         };
@@ -2309,12 +2517,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn outbound_attachments_auto_stages_generated_image_into_allowed_dir() {
+        let allowed = tempfile::tempdir().unwrap();
+        let generated_root = std::env::temp_dir().join("openab-images");
+        std::fs::create_dir_all(&generated_root).unwrap();
+        let generated_dir = tempfile::tempdir_in(&generated_root).unwrap();
+        let image_path = generated_dir.path().join("generated.png");
+        std::fs::write(&image_path, test_png_bytes()).unwrap();
+        let cfg = AttachmentsConfig {
+            enabled: true,
+            allowed_dirs: vec![allowed.path().to_string_lossy().to_string()],
+            auto_stage_generated_images: true,
+            auto_stage_dir: Some(allowed.path().to_string_lossy().to_string()),
+            max_bytes: 1024 * 1024,
+            max_files: 10,
+        };
+        let outbound = OutboundAttachments::new(cfg, allowed.path().to_string_lossy().to_string());
+
+        let (files, warnings) = outbound
+            .load_attachments(&[image_path.to_string_lossy().to_string()], &[])
+            .await;
+
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].filename, "generated.png");
+        assert!(allowed.path().join("generated.png").exists());
+        assert!(!image_path.exists());
+    }
+
+    #[tokio::test]
+    async fn outbound_attachments_auto_stage_rejects_untrusted_outside_image() {
+        let allowed = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let image_path = outside.path().join("secret.png");
+        std::fs::write(&image_path, test_png_bytes()).unwrap();
+        let cfg = AttachmentsConfig {
+            enabled: true,
+            allowed_dirs: vec![allowed.path().to_string_lossy().to_string()],
+            auto_stage_generated_images: true,
+            auto_stage_dir: Some(allowed.path().to_string_lossy().to_string()),
+            max_bytes: 1024 * 1024,
+            max_files: 10,
+        };
+        let outbound = OutboundAttachments::new(cfg, allowed.path().to_string_lossy().to_string());
+
+        let (files, warnings) = outbound
+            .load_attachments(&[image_path.to_string_lossy().to_string()], &[])
+            .await;
+
+        assert!(files.is_empty());
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("outside attachments.allowed_dirs"));
+        assert!(image_path.exists());
+    }
+
+    #[tokio::test]
     async fn outbound_attachments_relative_path_uses_agent_working_dir() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("relative.png"), test_png_bytes()).unwrap();
         let cfg = AttachmentsConfig {
             enabled: true,
             allowed_dirs: Vec::new(),
+            auto_stage_generated_images: false,
+            auto_stage_dir: None,
             max_bytes: 1024 * 1024,
             max_files: 10,
         };
@@ -2335,6 +2600,8 @@ mod tests {
         let cfg = AttachmentsConfig {
             enabled: false,
             allowed_dirs: vec![dir.path().to_string_lossy().to_string()],
+            auto_stage_generated_images: false,
+            auto_stage_dir: None,
             max_bytes: 1024 * 1024,
             max_files: 10,
         };

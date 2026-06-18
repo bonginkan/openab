@@ -63,6 +63,18 @@ max_bytes = 10485760
 max_files = 10
 ```
 
+If agents sometimes emit image paths from temporary staging folders, keep
+`allowed_dirs` restricted and opt in to auto-staging instead of widening the
+allowlist:
+
+```toml
+[attachments]
+enabled = true
+allowed_dirs = ["/home/node"]
+auto_stage_generated_images = true
+auto_stage_dir = "/home/node/out"
+```
+
 ### 2. Have the agent emit `attach_image`
 
 ```

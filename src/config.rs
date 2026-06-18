@@ -213,6 +213,15 @@ pub struct AttachmentsConfig {
     /// agent working directory only.
     #[serde(default)]
     pub allowed_dirs: Vec<String>,
+    /// Move generated images from known staging locations into an allowed
+    /// directory before upload. Disabled by default to preserve the allowlist
+    /// boundary for existing deployments.
+    #[serde(default)]
+    pub auto_stage_generated_images: bool,
+    /// Destination directory for auto-staged generated images. Must resolve
+    /// inside `allowed_dirs`. Empty means the first allowed directory.
+    #[serde(default)]
+    pub auto_stage_dir: Option<String>,
     /// Max bytes per outbound file. Default matches Discord's default app file
     /// upload limit.
     #[serde(default = "default_attachment_max_bytes")]
@@ -227,6 +236,8 @@ impl Default for AttachmentsConfig {
         Self {
             enabled: false,
             allowed_dirs: Vec::new(),
+            auto_stage_generated_images: false,
+            auto_stage_dir: None,
             max_bytes: default_attachment_max_bytes(),
             max_files: default_attachment_max_files(),
         }
@@ -1126,6 +1137,8 @@ command = "echo"
 [attachments]
 enabled = true
 allowed_dirs = ["/workspace/out", "/tmp/openab-images"]
+auto_stage_generated_images = true
+auto_stage_dir = "/workspace/out"
 max_bytes = 1024
 max_files = 2
 "#;
@@ -1134,6 +1147,11 @@ max_files = 2
         assert_eq!(
             cfg.attachments.allowed_dirs,
             vec!["/workspace/out", "/tmp/openab-images"]
+        );
+        assert!(cfg.attachments.auto_stage_generated_images);
+        assert_eq!(
+            cfg.attachments.auto_stage_dir.as_deref(),
+            Some("/workspace/out")
         );
         assert_eq!(cfg.attachments.max_bytes, 1024);
         assert_eq!(cfg.attachments.max_files, 2);
