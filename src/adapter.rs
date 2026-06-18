@@ -1,7 +1,7 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::Serialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -702,13 +702,11 @@ pub struct AdapterRouter {
     prompt_hard_timeout: Option<Duration>,
     /// Polling cadence for the recv-loop liveness check (#732).
     liveness_check_interval: std::time::Duration,
-    /// Session keys whose next text chunk should start a new visible response
-    /// section because a mid-turn steer prompt was accepted.
-    pending_steer_separators: Arc<Mutex<HashSet<String>>>,
-    /// Streaming post controllers keyed by session. A mid-turn steer cannot move
-    /// a Discord message, so the controller creates a fresh active post after the
-    /// latest user message and points future edits at it.
-    active_posts: Arc<Mutex<HashMap<String, Arc<StreamingPostController>>>>,
+    /// Session keys with an accepted mid-turn steer awaiting its first post-steer
+    /// text chunk, mapped to the steer prompt text. On that chunk the recv loop
+    /// seals the pre-steer message in place and starts a fresh continuation post
+    /// (below the user's steer message) headed by the steer content.
+    pending_steer_separators: Arc<Mutex<HashMap<String, String>>>,
     outbound_attachments: OutboundAttachments,
 }
 
@@ -779,28 +777,37 @@ impl StreamingPostController {
         inner.current_msgs = updated_msgs;
     }
 
-    async fn move_after_latest(&self) -> Result<()> {
-        let (adapter, thread_channel, old_msgs, chunks) = {
+    /// Seal the current (pre-steer) message(s) in place and start a fresh
+    /// continuation post below the user's steer message, headed by `header`
+    /// (the rendered steer content). Future edits target the new message(s),
+    /// so the pre-steer content stays visible above as its own section instead
+    /// of being deleted and reflowed.
+    ///
+    /// If the pre-steer content is still just the streaming placeholder (no real
+    /// output yet), the old message(s) are deleted instead of sealed so an empty
+    /// "…" bubble is not left behind.
+    async fn seal_and_start_continuation(&self, header: &str) -> Result<()> {
+        let (adapter, thread_channel, old_msgs, pre_steer_empty) = {
             let inner = self.inner.lock().await;
             (
                 inner.adapter.clone(),
                 inner.thread_channel.clone(),
                 inner.current_msgs.clone(),
-                split_streaming_display(&inner.latest_display, inner.message_limit),
+                is_placeholder_display(&inner.latest_display),
             )
         };
 
-        let mut new_msgs = Vec::with_capacity(chunks.len());
-        for chunk in &chunks {
-            new_msgs.push(adapter.send_message(&thread_channel, chunk).await?);
-        }
+        let new_msg = adapter.send_message(&thread_channel, header).await?;
         {
             let mut inner = self.inner.lock().await;
-            inner.current_msgs = new_msgs;
+            inner.current_msgs = vec![new_msg];
+            inner.latest_display = header.to_string();
         }
-        for msg in &old_msgs {
-            if let Err(e) = adapter.delete_message(msg).await {
-                tracing::warn!(error = ?e, "delete superseded streaming post failed");
+        if pre_steer_empty {
+            for msg in &old_msgs {
+                if let Err(e) = adapter.delete_message(msg).await {
+                    tracing::warn!(error = ?e, "delete placeholder pre-steer post failed");
+                }
             }
         }
         Ok(())
@@ -816,45 +823,6 @@ impl StreamingPostController {
                 tracing::warn!(error = ?e, "delete streaming post failed");
             }
         }
-    }
-}
-
-struct ActivePostGuard {
-    map: Arc<Mutex<HashMap<String, Arc<StreamingPostController>>>>,
-    session_key: String,
-    controller: Arc<StreamingPostController>,
-}
-
-impl ActivePostGuard {
-    async fn enter(
-        map: Arc<Mutex<HashMap<String, Arc<StreamingPostController>>>>,
-        session_key: String,
-        controller: Arc<StreamingPostController>,
-    ) -> Self {
-        map.lock()
-            .await
-            .insert(session_key.clone(), controller.clone());
-        Self {
-            map,
-            session_key,
-            controller,
-        }
-    }
-}
-
-impl Drop for ActivePostGuard {
-    fn drop(&mut self) {
-        let map = self.map.clone();
-        let session_key = self.session_key.clone();
-        let controller = self.controller.clone();
-        tokio::spawn(async move {
-            let mut map = map.lock().await;
-            if let Some(current) = map.get(&session_key) {
-                if Arc::ptr_eq(current, &controller) {
-                    map.remove(&session_key);
-                }
-            }
-        });
     }
 }
 
@@ -884,8 +852,7 @@ impl AdapterRouter {
             table_mode,
             prompt_hard_timeout,
             liveness_check_interval: std::time::Duration::from_secs(liveness_check_secs),
-            pending_steer_separators: Arc::new(Mutex::new(HashSet::new())),
-            active_posts: Arc::new(Mutex::new(HashMap::new())),
+            pending_steer_separators: Arc::new(Mutex::new(HashMap::new())),
             outbound_attachments: OutboundAttachments::new(attachments_config, agent_working_dir),
         }
     }
@@ -1025,25 +992,20 @@ impl AdapterRouter {
         thread_key: &str,
         content_blocks: Vec<ContentBlock>,
     ) -> Result<()> {
+        // Record the steer prompt text so the in-flight recv loop can seal the
+        // pre-steer message and head the continuation post with it. The actual
+        // post split happens on the first post-steer text chunk (in the recv
+        // loop), so the new continuation message lands below the user's steer.
+        let steer_text = steer_prompt_text(&content_blocks);
         {
             let mut pending = self.pending_steer_separators.lock().await;
-            pending.insert(thread_key.to_string());
+            pending.insert(thread_key.to_string(), steer_text);
         }
 
         if let Err(e) = self.pool.steer_session(thread_key, &content_blocks).await {
             let mut pending = self.pending_steer_separators.lock().await;
             pending.remove(thread_key);
             return Err(e);
-        }
-
-        let active_post = {
-            let posts = self.active_posts.lock().await;
-            posts.get(thread_key).cloned()
-        };
-        if let Some(post) = active_post {
-            if let Err(e) = post.move_after_latest().await {
-                warn!(error = ?e, "failed to move streaming post after latest message");
-            }
         }
 
         Ok(())
@@ -1098,8 +1060,6 @@ impl AdapterRouter {
         let liveness_check_interval = self.liveness_check_interval;
         let pending_steer_separators = self.pending_steer_separators.clone();
         let thread_key_for_separator = thread_key.to_string();
-        let active_posts = self.active_posts.clone();
-        let thread_key_for_post = thread_key.to_string();
         let outbound_attachments = self.outbound_attachments.clone();
 
         self.pool
@@ -1120,7 +1080,7 @@ impl AdapterRouter {
                     }
 
                     // Streaming edit: send placeholder, spawn edit loop
-                    let (buf_tx, placeholder_post, _active_post_guard) = if streaming {
+                    let (buf_tx, placeholder_post) = if streaming {
                         let initial = if reset {
                             "⚠️ _Session expired, starting fresh..._\n\n…".to_string()
                         } else {
@@ -1135,13 +1095,9 @@ impl AdapterRouter {
                             rx.borrow().clone(),
                             message_limit,
                         ));
-                        let active_post_guard = ActivePostGuard::enter(
-                            active_posts.clone(),
-                            thread_key_for_post.clone(),
-                            post.clone(),
-                        )
-                        .await;
-                        let placeholder_post = active_post_guard.controller.clone();
+                        // The recv loop keeps `placeholder_post` (same controller) to
+                        // seal+roll the post on a mid-turn steer and to finalize.
+                        let placeholder_post = post.clone();
                         let mut buf_rx = rx;
                         tokio::spawn(async move {
                             let mut last = String::new();
@@ -1159,9 +1115,9 @@ impl AdapterRouter {
                                 }
                             }
                         });
-                        (Some(tx), Some(placeholder_post), Some(active_post_guard))
+                        (Some(tx), Some(placeholder_post))
                     } else {
-                        (None, None, None)
+                        (None, None)
                     };
 
                     // (#732) Liveness-aware recv loop. Filters stale id-bearing
@@ -1218,11 +1174,39 @@ impl AdapterRouter {
                         if let Some(event) = classify_notification(&notification) {
                             match event {
                                 AcpEvent::Text(t) => {
-                                    let separate = {
+                                    let steer = {
                                         let mut pending = pending_steer_separators.lock().await;
                                         pending.remove(&thread_key_for_separator)
                                     };
-                                    append_text_chunk(&mut text_buf, &t, separate);
+                                    if let Some(steer_text) = steer {
+                                        // First post-steer chunk: open a new section
+                                        // headed by the steer content.
+                                        let header = render_steer_header(&steer_text);
+                                        if let Some(post) = &placeholder_post {
+                                            // Streaming: seal the pre-steer message in
+                                            // place and roll edits onto a fresh post
+                                            // below the user's steer message.
+                                            tool_lines.clear();
+                                            text_buf.clear();
+                                            text_buf.push_str(&header);
+                                            text_buf.push_str("\n\n");
+                                            if let Err(e) =
+                                                post.seal_and_start_continuation(&header).await
+                                            {
+                                                warn!(error = ?e, "failed to start steer continuation post");
+                                            }
+                                            text_buf.push_str(&t);
+                                        } else {
+                                            // Non-streaming: inline the steer section
+                                            // into the single end-of-turn post.
+                                            ensure_response_separator(&mut text_buf, &header);
+                                            text_buf.push_str(&header);
+                                            text_buf.push_str("\n\n");
+                                            text_buf.push_str(&t);
+                                        }
+                                    } else {
+                                        append_text_chunk(&mut text_buf, &t, false);
+                                    }
                                     if let Some(tx) = &buf_tx {
                                         let _ = tx.send(compose_streaming_display(
                                             &tool_lines,
@@ -1403,11 +1387,30 @@ impl AdapterRouter {
                                 post.delete_current_messages().await;
                             }
                         } else {
-                            // Normal streaming: edit the placeholder post set into
-                            // the final split content. No truncation: long content
-                            // remains visible across multiple Discord messages.
+                            // Normal streaming: edit the placeholder post into the
+                            // final content. Mention-bearing paragraphs are pulled
+                            // out and posted as a fresh message so the ping fires —
+                            // Discord does not notify on edits, so a mention folded
+                            // into the edited post would never notify the target.
                             if !final_content.is_empty() {
-                                post.edit(&final_content).await;
+                                let (body, mentions) =
+                                    split_off_mention_paragraphs(&final_content);
+                                if mentions.is_empty() {
+                                    post.edit(&final_content).await;
+                                } else {
+                                    if body.is_empty() {
+                                        post.delete_current_messages().await;
+                                    } else {
+                                        post.edit(&body).await;
+                                    }
+                                    for chunk in
+                                        format::split_message(&mentions, message_limit)
+                                    {
+                                        let _ = adapter
+                                            .send_message(&thread_channel, &chunk)
+                                            .await;
+                                    }
+                                }
                             }
                             if !attachments.is_empty() {
                                 match send_outbound_attachments(
@@ -1569,6 +1572,92 @@ fn append_text_chunk(text_buf: &mut String, chunk: &str, separate_response: bool
         text_buf.push('\n');
     }
     text_buf.push_str(chunk);
+}
+
+/// Concatenate the text of a steer prompt's content blocks (non-text blocks,
+/// e.g. images, are ignored for the header).
+fn steer_prompt_text(blocks: &[ContentBlock]) -> String {
+    blocks
+        .iter()
+        .filter_map(|b| match b {
+            ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string()
+}
+
+/// Render the steer content as the header of the continuation post — a Markdown
+/// quote so the "Steer内容" section reads clearly above the post-steer output.
+fn render_steer_header(steer_text: &str) -> String {
+    let trimmed = steer_text.trim();
+    if trimmed.is_empty() {
+        return "↪ **Steer**".to_string();
+    }
+    let quoted = trimmed
+        .lines()
+        .map(|l| format!("> {l}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("↪ **Steer**\n{quoted}")
+}
+
+/// True when the streaming post still only holds the placeholder ("…") or the
+/// session-reset notice — i.e. no real pre-steer output to keep.
+fn is_placeholder_display(display: &str) -> bool {
+    let t = display.trim();
+    if t.is_empty() || t == "…" || t == "\u{200b}" {
+        return true;
+    }
+    let stripped = t
+        .trim_start_matches("⚠️ _Session expired, starting fresh..._")
+        .trim();
+    stripped.is_empty() || stripped == "…"
+}
+
+/// True when `s` contains a Discord mention that would notify on a fresh post:
+/// `@everyone`/`@here`, or an id mention `<@id>` / `<@!id>` / `<@&id>`.
+fn contains_mention(s: &str) -> bool {
+    s.contains("@everyone") || s.contains("@here") || has_id_mention(s)
+}
+
+fn has_id_mention(s: &str) -> bool {
+    let mut rest = s;
+    while let Some(pos) = rest.find("<@") {
+        let after = &rest[pos + 2..];
+        let after = after
+            .strip_prefix('!')
+            .or_else(|| after.strip_prefix('&'))
+            .unwrap_or(after);
+        let digit_len = after.chars().take_while(|c| c.is_ascii_digit()).count();
+        if digit_len > 0 && after[digit_len..].starts_with('>') {
+            return true;
+        }
+        rest = &rest[pos + 2..];
+    }
+    false
+}
+
+/// Split rendered content into (body, mentions): paragraphs (blank-line
+/// separated) that contain a mention are pulled out, preserving order, so they
+/// can be posted as a fresh message — Discord does not notify on edits, so a
+/// mention folded into the edited streaming post would never ping.
+fn split_off_mention_paragraphs(content: &str) -> (String, String) {
+    let mut body: Vec<&str> = Vec::new();
+    let mut mentions: Vec<&str> = Vec::new();
+    for para in content.split("\n\n") {
+        if contains_mention(para) {
+            mentions.push(para);
+        } else {
+            body.push(para);
+        }
+    }
+    (
+        body.join("\n\n").trim().to_string(),
+        mentions.join("\n\n").trim().to_string(),
+    )
 }
 
 fn should_separate_stream_chunk(text_buf: &str, chunk: &str) -> bool {
@@ -2057,6 +2146,68 @@ mod tests {
     fn split_streaming_display_empty_uses_zero_width_space() {
         let chunks = split_streaming_display("", 2000);
         assert_eq!(chunks, vec!["\u{200b}".to_string()]);
+    }
+
+    #[test]
+    fn steer_prompt_text_joins_text_blocks_only() {
+        let blocks = vec![
+            ContentBlock::Text {
+                text: "  use bun instead".to_string(),
+            },
+            ContentBlock::Text {
+                text: "and add a test  ".to_string(),
+            },
+        ];
+        assert_eq!(steer_prompt_text(&blocks), "use bun instead\nand add a test");
+    }
+
+    #[test]
+    fn render_steer_header_quotes_each_line() {
+        let header = render_steer_header("change the title\nkeep the body");
+        assert_eq!(header, "↪ **Steer**\n> change the title\n> keep the body");
+    }
+
+    #[test]
+    fn render_steer_header_empty_falls_back_to_label() {
+        assert_eq!(render_steer_header("   "), "↪ **Steer**");
+    }
+
+    #[test]
+    fn is_placeholder_display_detects_placeholders() {
+        assert!(is_placeholder_display(""));
+        assert!(is_placeholder_display("…"));
+        assert!(is_placeholder_display("\u{200b}"));
+        assert!(is_placeholder_display(
+            "⚠️ _Session expired, starting fresh..._\n\n…"
+        ));
+        assert!(!is_placeholder_display("real pre-steer output"));
+    }
+
+    #[test]
+    fn contains_mention_detects_all_mention_forms() {
+        assert!(contains_mention("ping <@123456789>"));
+        assert!(contains_mention("nick <@!123456789> form"));
+        assert!(contains_mention("role <@&987654321> form"));
+        assert!(contains_mention("attention @everyone please"));
+        assert!(contains_mention("hey @here now"));
+        assert!(!contains_mention("just <@notanid> and an email a@b.com"));
+        assert!(!contains_mention("plain text with no mention"));
+    }
+
+    #[test]
+    fn split_off_mention_paragraphs_separates_only_mention_paragraphs() {
+        let content = "intro paragraph\n\nping <@123456789> please\n\nclosing paragraph";
+        let (body, mentions) = split_off_mention_paragraphs(content);
+        assert_eq!(body, "intro paragraph\n\nclosing paragraph");
+        assert_eq!(mentions, "ping <@123456789> please");
+    }
+
+    #[test]
+    fn split_off_mention_paragraphs_no_mention_keeps_body() {
+        let content = "first\n\nsecond";
+        let (body, mentions) = split_off_mention_paragraphs(content);
+        assert_eq!(body, "first\n\nsecond");
+        assert!(mentions.is_empty());
     }
 
     fn test_png_bytes() -> Vec<u8> {
