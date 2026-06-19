@@ -27,10 +27,10 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tracing::{error, info, warn};
 
-/// Wait for SIGINT (ctrl_c) or, on unix, SIGTERM. SIGTERM is what Kubernetes
-/// sends during pod termination, so handling it lets us run the full cleanup
-/// path (shard manager, ACP pool drain) instead of getting SIGKILL'd after the
-/// grace period.
+/// Wait for SIGINT (ctrl_c) or, on unix, SIGTERM/SIGHUP. SIGTERM is what
+/// Kubernetes sends during pod termination; SIGHUP is common when a controlling
+/// tmux pane/session is closed. Handling both lets us run the full cleanup path
+/// (shard manager, ACP pool drain) instead of orphaning agent subprocesses.
 async fn shutdown_signal() {
     #[cfg(unix)]
     {
@@ -43,9 +43,21 @@ async fn shutdown_signal() {
                 return;
             }
         };
+        let mut hup = match signal(SignalKind::hangup()) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(error = %e, "failed to install SIGHUP handler, falling back to SIGTERM/ctrl_c only");
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = term.recv() => { info!("SIGTERM received"); }
+                }
+                return;
+            }
+        };
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {}
             _ = term.recv() => { info!("SIGTERM received"); }
+            _ = hup.recv() => { info!("SIGHUP received"); }
         }
     }
     #[cfg(not(unix))]
@@ -386,6 +398,8 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
+    let mut run_error: Option<anyhow::Error> = None;
+
     // Run Discord adapter (foreground, blocking) or wait for ctrl_c
     if let Some(discord_cfg) = cfg.discord {
         let allow_all_channels = config::resolve_allow_all(
@@ -501,24 +515,25 @@ async fn main() -> anyhow::Result<()> {
         });
 
         info!("discord bot running");
-        match client.start().await {
-            Err(serenity::Error::Gateway(GatewayError::DisallowedGatewayIntents)) => {
-                error!(
+        let discord_result = client.start().await;
+        if let Err(e) = discord_result {
+            match &e {
+                serenity::Error::Gateway(GatewayError::DisallowedGatewayIntents) => {
+                    error!(
                     "Discord rejected privileged intents. \
                      Enable MESSAGE CONTENT INTENT at: \
                      https://discord.com/developers/applications → Bot → Privileged Gateway Intents"
                 );
-                std::process::exit(1);
-            }
-            Err(serenity::Error::Gateway(GatewayError::InvalidAuthentication)) => {
-                error!(
-                    "Discord rejected bot token. \
+                }
+                serenity::Error::Gateway(GatewayError::InvalidAuthentication) => {
+                    error!(
+                        "Discord rejected bot token. \
                      Verify your bot_token in config.toml is correct and has not been reset."
-                );
-                std::process::exit(1);
+                    );
+                }
+                _ => {}
             }
-            Err(e) => return Err(e.into()),
-            Ok(_) => {}
+            run_error = Some(e.into());
         }
     } else {
         // No Discord — wait for SIGINT or SIGTERM
@@ -554,6 +569,9 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     info!("openab shut down");
+    if let Some(e) = run_error {
+        return Err(e);
+    }
     Ok(())
 }
 
