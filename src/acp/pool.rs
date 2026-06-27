@@ -1,4 +1,4 @@
-use crate::acp::connection::AcpConnection;
+use crate::acp::connection::{AcpConnection, PendingMap, PendingResponse};
 use crate::acp::protocol::ConfigOption;
 use crate::config::AgentConfig;
 use anyhow::{anyhow, Result};
@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{oneshot, Mutex, RwLock};
 use tokio::time::Instant;
 use tracing::{info, warn};
 
@@ -14,6 +14,7 @@ type CancelHandle = (
     Arc<Mutex<tokio::process::ChildStdin>>,
     String,
     Arc<AtomicU64>,
+    PendingMap,
 );
 
 /// Combined state protected by a single lock to prevent deadlocks.
@@ -21,7 +22,8 @@ type CancelHandle = (
 struct PoolState {
     /// Active connections: thread_key → AcpConnection handle.
     active: HashMap<String, Arc<Mutex<AcpConnection>>>,
-    /// Lock-free side-channel handles: thread_key → (stdin, session_id, request_id_allocator).
+    /// Lock-free side-channel handles:
+    /// thread_key -> (stdin, session_id, request_id_allocator, pending_registry).
     /// Stored separately so cancel can work without locking the connection.
     cancel_handles: HashMap<String, CancelHandle>,
     /// Suspended sessions: thread_key → ACP sessionId.
@@ -226,6 +228,7 @@ impl SessionPool {
 
         let cancel_handle = new_conn.cancel_handle();
         let request_id_allocator = new_conn.request_id_allocator();
+        let pending_handle = new_conn.pending_handle();
         let cancel_session_id = new_conn.acp_session_id.clone().unwrap_or_default();
         let new_conn = Arc::new(Mutex::new(new_conn));
 
@@ -285,7 +288,12 @@ impl SessionPool {
         if !cancel_session_id.is_empty() {
             state.cancel_handles.insert(
                 thread_id.to_string(),
-                (cancel_handle, cancel_session_id, request_id_allocator),
+                (
+                    cancel_handle,
+                    cancel_session_id,
+                    request_id_allocator,
+                    pending_handle,
+                ),
             );
         }
         self.save_mapping(&state.persisted);
@@ -352,7 +360,7 @@ impl SessionPool {
     /// Cancel the current in-flight operation for a session.
     /// Uses pre-stored cancel handles to avoid locking the connection (which is held during streaming).
     pub async fn cancel_session(&self, thread_id: &str) -> Result<()> {
-        let (stdin, session_id, _) = {
+        let (stdin, session_id, _, _) = {
             let state = self.state.read().await;
             state
                 .cancel_handles
@@ -383,15 +391,16 @@ impl SessionPool {
     /// concurrently. The patched codex-acp fork injects the prompt into the running
     /// turn instead of starting a new one.
     ///
-    /// The request id is intentionally not added to `pending`: the running turn owns
-    /// the connection's notify subscriber, so the steer's response/notifications are
-    /// surfaced through the in-flight turn's stream rather than a separate receiver.
+    /// The request id is registered as silent pending so the agent's JSON-RPC
+    /// response is consumed without being mistaken for the in-flight prompt's
+    /// completion. The steer's text notifications still flow through the active
+    /// subscriber.
     pub async fn steer_session(
         &self,
         thread_id: &str,
         content_blocks: &[crate::acp::ContentBlock],
     ) -> Result<()> {
-        let (stdin, session_id, next_id) = {
+        let (stdin, session_id, next_id, pending) = {
             let state = self.state.read().await;
             state
                 .cancel_handles
@@ -414,10 +423,44 @@ impl SessionPool {
             "sending mid-turn steer session/prompt"
         );
         use tokio::io::AsyncWriteExt;
-        let mut w = stdin.lock().await;
-        w.write_all(data.as_bytes()).await?;
-        w.write_all(b"\n").await?;
-        w.flush().await?;
+        let (resp_tx, resp_rx) = oneshot::channel();
+        pending
+            .lock()
+            .await
+            .insert(request_id, PendingResponse::silent(resp_tx));
+
+        let write_result: std::io::Result<()> = async {
+            let mut w = stdin.lock().await;
+            w.write_all(data.as_bytes()).await?;
+            w.write_all(b"\n").await?;
+            w.flush().await
+        }
+        .await;
+        if let Err(e) = write_result {
+            pending.lock().await.remove(&request_id);
+            return Err(e.into());
+        }
+
+        tokio::spawn(async move {
+            match resp_rx.await {
+                Ok(resp) if resp.error.is_some() => {
+                    warn!(
+                        request_id,
+                        error = ?resp.error,
+                        "mid-turn steer response resolved with error"
+                    );
+                }
+                Ok(_) => {
+                    tracing::debug!(request_id, "mid-turn steer response consumed");
+                }
+                Err(_) => {
+                    warn!(
+                        request_id,
+                        "mid-turn steer response channel closed before resolution"
+                    );
+                }
+            }
+        });
         Ok(())
     }
 
@@ -429,7 +472,7 @@ impl SessionPool {
         // Send session/cancel via the lock-free stdin handle first.
         // This stops in-flight streaming even while with_connection() holds the
         // connection mutex, so the old process finishes promptly.
-        if let Some((stdin, session_id, _)) = {
+        if let Some((stdin, session_id, _, _)) = {
             let state = self.state.read().await;
             state.cancel_handles.get(thread_id).cloned()
         } {

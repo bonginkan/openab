@@ -113,7 +113,7 @@ pub struct AcpConnection {
     child_pgid: Option<i32>,
     stdin: Arc<Mutex<ChildStdin>>,
     next_id: Arc<AtomicU64>,
-    pending: Arc<Mutex<HashMap<u64, oneshot::Sender<JsonRpcMessage>>>>,
+    pending: PendingMap,
     notify_tx: Arc<Mutex<Option<mpsc::UnboundedSender<JsonRpcMessage>>>>,
     pub acp_session_id: Option<String>,
     pub supports_load_session: bool,
@@ -122,6 +122,29 @@ pub struct AcpConnection {
     pub session_reset: bool,
     _reader_handle: JoinHandle<()>,
     _stderr_handle: Option<JoinHandle<()>>,
+}
+
+pub(crate) type PendingMap = Arc<Mutex<HashMap<u64, PendingResponse>>>;
+
+pub(crate) struct PendingResponse {
+    tx: oneshot::Sender<JsonRpcMessage>,
+    forward_to_subscriber: bool,
+}
+
+impl PendingResponse {
+    pub(crate) fn forwarding(tx: oneshot::Sender<JsonRpcMessage>) -> Self {
+        Self {
+            tx,
+            forward_to_subscriber: true,
+        }
+    }
+
+    pub(crate) fn silent(tx: oneshot::Sender<JsonRpcMessage>) -> Self {
+        Self {
+            tx,
+            forward_to_subscriber: false,
+        }
+    }
 }
 
 /// Build the final set of env vars for the agent subprocess.
@@ -158,7 +181,7 @@ fn build_agent_env(
 pub(crate) async fn run_reader_loop<R, W>(
     reader: R,
     writer: Arc<Mutex<W>>,
-    pending: Arc<Mutex<HashMap<u64, oneshot::Sender<JsonRpcMessage>>>>,
+    pending: PendingMap,
     notify_tx: Arc<Mutex<Option<mpsc::UnboundedSender<JsonRpcMessage>>>>,
 ) where
     R: AsyncRead + Unpin + Send + 'static,
@@ -205,23 +228,27 @@ pub(crate) async fn run_reader_loop<R, W>(
             continue;
         }
 
-        // Response (has id) → resolve pending AND forward to subscriber
+        // Response (has id) -> resolve pending. Prompt responses are forwarded
+        // to the active subscriber; side-channel steering responses are not.
         if let Some(id) = msg.id {
-            let mut map = pending.lock().await;
-            if let Some(tx) = map.remove(&id) {
-                // Forward to subscriber so they see the completion
-                let sub = notify_tx.lock().await;
-                if let Some(ntx) = sub.as_ref() {
-                    // Clone the essential fields for the subscriber
-                    let _ = ntx.send(JsonRpcMessage {
-                        id: Some(id),
-                        method: None,
-                        result: msg.result.clone(),
-                        error: msg.error.clone(),
-                        params: None,
-                    });
+            let pending_response = {
+                let mut map = pending.lock().await;
+                map.remove(&id)
+            };
+            if let Some(pending_response) = pending_response {
+                if pending_response.forward_to_subscriber {
+                    let sub = notify_tx.lock().await;
+                    if let Some(ntx) = sub.as_ref() {
+                        let _ = ntx.send(JsonRpcMessage {
+                            id: Some(id),
+                            method: None,
+                            result: msg.result.clone(),
+                            error: msg.error.clone(),
+                            params: None,
+                        });
+                    }
                 }
-                let _ = tx.send(msg);
+                let _ = pending_response.tx.send(msg);
                 continue;
             }
             // Stale id (#732): pending was already abandoned. Falls through
@@ -239,8 +266,8 @@ pub(crate) async fn run_reader_loop<R, W>(
 
     // Connection closed — resolve all pending with error
     let mut map = pending.lock().await;
-    for (_, tx) in map.drain() {
-        let _ = tx.send(JsonRpcMessage {
+    for (_, pending_response) in map.drain() {
+        let _ = pending_response.tx.send(JsonRpcMessage {
             id: None,
             method: None,
             result: None,
@@ -388,8 +415,7 @@ impl AcpConnection {
             None
         };
 
-        let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<JsonRpcMessage>>>> =
-            Arc::new(Mutex::new(HashMap::new()));
+        let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
         let notify_tx: Arc<Mutex<Option<mpsc::UnboundedSender<JsonRpcMessage>>>> =
             Arc::new(Mutex::new(None));
 
@@ -436,7 +462,10 @@ impl AcpConnection {
         let data = serde_json::to_string(&req)?;
 
         let (tx, rx) = oneshot::channel();
-        self.pending.lock().await.insert(id, tx);
+        self.pending
+            .lock()
+            .await
+            .insert(id, PendingResponse::forwarding(tx));
 
         self.send_raw(&data).await?;
 
@@ -598,7 +627,10 @@ impl AcpConnection {
         let data = serde_json::to_string(&req)?;
 
         let (resp_tx, _resp_rx) = oneshot::channel();
-        self.pending.lock().await.insert(id, resp_tx);
+        self.pending
+            .lock()
+            .await
+            .insert(id, PendingResponse::forwarding(resp_tx));
 
         self.send_raw(&data).await?;
         Ok((rx, id))
@@ -638,6 +670,11 @@ impl AcpConnection {
     /// Return the request id allocator for lock-free side-channel writes.
     pub fn request_id_allocator(&self) -> Arc<AtomicU64> {
         Arc::clone(&self.next_id)
+    }
+
+    /// Return the pending-response registry for lock-free side-channel writes.
+    pub(crate) fn pending_handle(&self) -> PendingMap {
+        Arc::clone(&self.pending)
     }
 
     pub fn alive(&self) -> bool {
@@ -858,8 +895,7 @@ mod reader_loop_tests {
         let (mut agent_stdout_writer, agent_stdout_reader) = duplex(8 * 1024);
         let (agent_stdin_writer, _agent_stdin_reader) = duplex(8 * 1024);
 
-        let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<JsonRpcMessage>>>> =
-            Arc::new(Mutex::new(HashMap::new()));
+        let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
         let notify_tx: Arc<Mutex<Option<mpsc::UnboundedSender<JsonRpcMessage>>>> =
             Arc::new(Mutex::new(None));
 
@@ -889,7 +925,7 @@ mod reader_loop_tests {
         handle.await.unwrap();
     }
 
-    /// Matched-id path: when a response's id is in `pending`, the loop must
+    /// Matched-id path: when a response's id is in forwarding `pending`, the loop must
     /// resolve the oneshot AND forward a copy to the subscriber so the
     /// adapter's recv loop sees the completion. Guards against regressions
     /// that would suppress the forward branch while keeping resolve.
@@ -898,13 +934,15 @@ mod reader_loop_tests {
         let (mut agent_stdout_writer, agent_stdout_reader) = duplex(8 * 1024);
         let (agent_stdin_writer, _agent_stdin_reader) = duplex(8 * 1024);
 
-        let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<JsonRpcMessage>>>> =
-            Arc::new(Mutex::new(HashMap::new()));
+        let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
         let notify_tx: Arc<Mutex<Option<mpsc::UnboundedSender<JsonRpcMessage>>>> =
             Arc::new(Mutex::new(None));
 
         let (resp_tx, resp_rx) = oneshot::channel();
-        pending.lock().await.insert(7, resp_tx);
+        pending
+            .lock()
+            .await
+            .insert(7, PendingResponse::forwarding(resp_tx));
 
         let (sub_tx, mut sub_rx) = mpsc::unbounded_channel();
         *notify_tx.lock().await = Some(sub_tx);
@@ -932,6 +970,53 @@ mod reader_loop_tests {
             .expect("subscriber should receive forwarded copy")
             .expect("subscriber channel should not be closed");
         assert_eq!(forwarded.id, Some(7));
+        assert!(pending.lock().await.is_empty());
+
+        drop(agent_stdout_writer);
+        handle.await.unwrap();
+    }
+
+    /// Side-channel steer responses must resolve their pending receiver without
+    /// being forwarded as a stale id-bearing response to the active prompt turn.
+    #[tokio::test]
+    async fn silent_pending_response_resolves_without_forwarding() {
+        let (mut agent_stdout_writer, agent_stdout_reader) = duplex(8 * 1024);
+        let (agent_stdin_writer, _agent_stdin_reader) = duplex(8 * 1024);
+
+        let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+        let notify_tx: Arc<Mutex<Option<mpsc::UnboundedSender<JsonRpcMessage>>>> =
+            Arc::new(Mutex::new(None));
+
+        let (resp_tx, resp_rx) = oneshot::channel();
+        pending
+            .lock()
+            .await
+            .insert(9, PendingResponse::silent(resp_tx));
+
+        let (sub_tx, mut sub_rx) = mpsc::unbounded_channel();
+        *notify_tx.lock().await = Some(sub_tx);
+
+        let writer = Arc::new(Mutex::new(agent_stdin_writer));
+        let handle = tokio::spawn(run_reader_loop(
+            agent_stdout_reader,
+            writer,
+            pending.clone(),
+            notify_tx.clone(),
+        ));
+
+        let payload = b"{\"jsonrpc\":\"2.0\",\"id\":9,\"result\":{\"stopReason\":\"end_turn\"}}\n";
+        agent_stdout_writer.write_all(payload).await.unwrap();
+        agent_stdout_writer.flush().await.unwrap();
+
+        let resolved = tokio::time::timeout(std::time::Duration::from_secs(2), resp_rx)
+            .await
+            .expect("oneshot should resolve")
+            .expect("oneshot should not be cancelled");
+        assert_eq!(resolved.id, Some(9));
+
+        let forwarded =
+            tokio::time::timeout(std::time::Duration::from_millis(100), sub_rx.recv()).await;
+        assert!(forwarded.is_err());
         assert!(pending.lock().await.is_empty());
 
         drop(agent_stdout_writer);
