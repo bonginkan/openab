@@ -275,6 +275,11 @@ fn default_attachment_max_files() -> usize {
 #[derive(Debug, Deserialize)]
 pub struct DiscordConfig {
     pub bot_token: String,
+    /// Explicit flag: true = allow all guilds, false = check allowed_guilds list.
+    /// When not set, auto-detected: non-empty list → false, empty list → true.
+    pub allow_all_guilds: Option<bool>,
+    #[serde(default)]
+    pub allowed_guilds: Vec<String>,
     /// Explicit flag: true = allow all channels, false = check allowed_channels list.
     /// When not set, auto-detected: non-empty list → false, empty list → true.
     pub allow_all_channels: Option<bool>,
@@ -831,7 +836,14 @@ command = "echo"
     #[test]
     fn parse_minimal_config() {
         let cfg = parse_config(MINIMAL_TOML, "test").unwrap();
-        assert_eq!(cfg.discord.unwrap().bot_token, "test-token");
+        let discord = cfg.discord.unwrap();
+        assert_eq!(discord.bot_token, "test-token");
+        assert!(discord.allowed_guilds.is_empty());
+        assert!(discord.allow_all_guilds.is_none());
+        assert!(resolve_allow_all(
+            discord.allow_all_guilds,
+            &discord.allowed_guilds
+        ));
         assert_eq!(cfg.agent.command, "echo");
         assert_eq!(cfg.pool.max_sessions, 10);
         assert_eq!(cfg.pool.prompt_hard_timeout_secs, 0);
@@ -839,6 +851,47 @@ command = "echo"
         assert!(!cfg.attachments.enabled);
         assert_eq!(cfg.attachments.max_bytes, 10 * 1024 * 1024);
         assert_eq!(cfg.attachments.max_files, 10);
+    }
+
+    #[test]
+    fn parse_discord_config_with_guild_allowlist() {
+        let toml = r#"
+[discord]
+bot_token = "test-token"
+allowed_guilds = ["1284331895190196234", "1500052145108418592"]
+
+[agent]
+command = "echo"
+"#;
+        let cfg = parse_config(toml, "test").unwrap();
+        let discord = cfg.discord.unwrap();
+        assert_eq!(
+            discord.allowed_guilds,
+            vec!["1284331895190196234", "1500052145108418592"]
+        );
+        assert!(!resolve_allow_all(
+            discord.allow_all_guilds,
+            &discord.allowed_guilds
+        ));
+    }
+
+    #[test]
+    fn parse_discord_config_explicit_allow_all_guilds_overrides_list() {
+        let toml = r#"
+[discord]
+bot_token = "test-token"
+allow_all_guilds = true
+allowed_guilds = ["1284331895190196234"]
+
+[agent]
+command = "echo"
+"#;
+        let cfg = parse_config(toml, "test").unwrap();
+        let discord = cfg.discord.unwrap();
+        assert!(resolve_allow_all(
+            discord.allow_all_guilds,
+            &discord.allowed_guilds
+        ));
     }
 
     #[test]

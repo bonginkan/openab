@@ -402,12 +402,18 @@ async fn main() -> anyhow::Result<()> {
 
     // Run Discord adapter (foreground, blocking) or wait for ctrl_c
     if let Some(discord_cfg) = cfg.discord {
+        let allow_all_guilds =
+            config::resolve_allow_all(discord_cfg.allow_all_guilds, &discord_cfg.allowed_guilds);
         let allow_all_channels = config::resolve_allow_all(
             discord_cfg.allow_all_channels,
             &discord_cfg.allowed_channels,
         );
         let allow_all_users =
             config::resolve_allow_all(discord_cfg.allow_all_users, &discord_cfg.allowed_users);
+        let allowed_guilds = parse_id_set(&discord_cfg.allowed_guilds, "discord.allowed_guilds")?;
+        if !allow_all_guilds && allowed_guilds.is_empty() {
+            warn!("allow_all_guilds=false with empty allowed_guilds for Discord — bot will deny all guilds");
+        }
         let allowed_channels =
             parse_id_set(&discord_cfg.allowed_channels, "discord.allowed_channels")?;
         if !allow_all_channels && allowed_channels.is_empty() {
@@ -419,8 +425,10 @@ async fn main() -> anyhow::Result<()> {
         let allowed_role_ids =
             parse_id_set(&discord_cfg.allowed_role_ids, "discord.allowed_role_ids")?;
         info!(
+            allow_all_guilds,
             allow_all_channels,
             allow_all_users,
+            guilds = allowed_guilds.len(),
             channels = allowed_channels.len(),
             users = allowed_users.len(),
             trusted_bots = trusted_bot_ids.len(),
@@ -474,8 +482,10 @@ async fn main() -> anyhow::Result<()> {
 
         let handler = discord::Handler {
             router,
+            allow_all_guilds,
             allow_all_channels,
             allow_all_users,
+            allowed_guilds,
             allowed_channels,
             allowed_users,
             stt_config: cfg.stt.clone(),

@@ -32,6 +32,8 @@ Discord adapter. Requires a Discord bot token.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `bot_token` | string | *required* | Discord bot token. Use `${DISCORD_BOT_TOKEN}` for env var. |
+| `allow_all_guilds` | bool \| omit | auto-detect | `true` = all servers; `false` = only `allowed_guilds`. Omitted = inferred from list (non-empty → false, empty → true). DMs are controlled separately by `allow_dm`. |
+| `allowed_guilds` | string[] | `[]` | Discord server/guild IDs to allow. Only checked when `allow_all_guilds` resolves to false. |
 | `allow_all_channels` | bool \| omit | auto-detect | `true` = all channels; `false` = only `allowed_channels`. Omitted = inferred from list (non-empty → false, empty → true). |
 | `allowed_channels` | string[] | `[]` | Channel IDs to allow. Only checked when `allow_all_channels` resolves to false. |
 | `allow_all_users` | bool \| omit | auto-detect | `true` = any user; `false` = only `allowed_users`. Omitted = inferred from list. |

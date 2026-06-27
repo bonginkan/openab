@@ -50,7 +50,14 @@ Complete guide to setting up, configuring, and running OpenAB with Discord.
 3. Click **Copy Channel ID**
 4. Use this ID in `allowed_channels` in your config
 
-### 7. Get Your User ID (optional)
+### 7. Get the Server ID (optional)
+
+1. Make sure **Developer Mode** is enabled (see step 6)
+2. Right-click the server icon
+3. Click **Copy Server ID**
+4. Use this ID in `allowed_guilds` to restrict which servers can use the bot
+
+### 8. Get Your User ID (optional)
 
 1. Make sure **Developer Mode** is enabled (see step 6)
 2. Right-click your own username (in a message or the member list)
@@ -66,12 +73,19 @@ Complete guide to setting up, configuring, and running OpenAB with Discord.
 ```toml
 [discord]
 bot_token = "${DISCORD_BOT_TOKEN}"
+allowed_guilds = ["1284331895190196234", "1500052145108418592"]  # server/guild allowlist
 allowed_channels = ["123456789"]      # channel ID allowlist (empty = all)
 allowed_users = ["987654321"]         # user ID allowlist (empty = all)
 allow_bot_messages = "off"            # off | mentions | all
 allow_user_messages = "involved"      # involved | mentions
 trusted_bot_ids = []                  # bot user IDs allowed through (empty = any)
 ```
+
+### `allowed_guilds`
+
+Use `allowed_guilds` to restrict the bot to specific Discord servers. Empty
+`allowed_guilds` (default) = no server filtering. DMs are controlled separately
+by `allow_dm`.
 
 ### `allowed_channels` / `allowed_users`
 
