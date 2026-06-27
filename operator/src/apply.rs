@@ -1,4 +1,4 @@
-use crate::manifest::OABServiceManifest;
+use crate::manifest::{OABFleetManifest, OABServiceManifest, RawManifest, Runtime};
 use anyhow::{Context, Result};
 use aws_sdk_ecs::types::{
     AssignPublicIp, AwsVpcConfiguration, CapacityProviderStrategyItem, ContainerDefinition,
@@ -18,10 +18,20 @@ pub async fn run(aws_config: &aws_config::SdkConfig, file_path: &str) -> Result<
     let ecs = aws_sdk_ecs::Client::new(aws_config);
     let s3 = aws_sdk_s3::Client::new(aws_config);
 
+    // Validate ALL manifests before applying any (prevent partial apply)
     for m in &manifests {
         m.validate()?;
-        println!("  Applying {}...", m.metadata.name);
-        apply_one(&ecs, &s3, m).await?;
+        if matches!(&m.spec.runtime, Runtime::Kubernetes(_)) {
+            anyhow::bail!(
+                "Kubernetes runtime not yet implemented (manifest: {})",
+                m.metadata.name
+            );
+        }
+    }
+
+    for m in &manifests {
+        println!("  Applying {} (ECS)...", m.metadata.name);
+        apply_ecs(&ecs, &s3, m).await?;
     }
 
     println!("\n{} service(s) applied.", manifests.len());
@@ -35,33 +45,58 @@ fn load_manifests(path: &Path) -> Result<Vec<OABServiceManifest>> {
             let entry = entry?;
             let p = entry.path();
             if p.extension().is_some_and(|e| e == "yaml" || e == "yml") {
-                manifests.push(parse_manifest(&p)?);
+                manifests.extend(parse_manifest_file(&p)?);
             }
         }
     } else {
-        manifests.push(parse_manifest(path)?);
+        manifests.extend(parse_manifest_file(path)?);
     }
     Ok(manifests)
 }
 
-fn parse_manifest(path: &Path) -> Result<OABServiceManifest> {
+/// Parse a YAML file — returns one or more OABServiceManifests (fleet expands to many)
+fn parse_manifest_file(path: &Path) -> Result<Vec<OABServiceManifest>> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read {}", path.display()))?;
-    serde_yaml::from_str(&content)
-        .with_context(|| format!("failed to parse {}", path.display()))
+
+    // Detect kind first
+    let raw: RawManifest = serde_yaml::from_str(&content)
+        .with_context(|| format!("failed to parse {}", path.display()))?;
+
+    match raw.kind.as_str() {
+        "OABService" => {
+            let m: OABServiceManifest = serde_yaml::from_str(&content)
+                .with_context(|| format!("failed to parse OABService {}", path.display()))?;
+            Ok(vec![m])
+        }
+        "OABFleet" => {
+            let fleet: OABFleetManifest = serde_yaml::from_str(&content)
+                .with_context(|| format!("failed to parse OABFleet {}", path.display()))?;
+            fleet.validate()?;
+            println!("  Fleet '{}': expanding {} agents...", fleet.metadata.name, fleet.spec.agents.len());
+            Ok(fleet.expand())
+        }
+        other => anyhow::bail!("unsupported kind '{}' in {}", other, path.display()),
+    }
 }
 
-async fn apply_one(
+async fn apply_ecs(
     ecs: &aws_sdk_ecs::Client,
     s3: &aws_sdk_s3::Client,
     m: &OABServiceManifest,
 ) -> Result<()> {
+    let ecs_rt = match &m.spec.runtime {
+        Runtime::Ecs(rt) => rt,
+        _ => unreachable!(),
+    };
+
     let service_name = m.ecs_service_name();
-    let bucket = "oab-control-plane";
+    let bucket = std::env::var("OAB_CONTROL_PLANE_BUCKET")
+        .unwrap_or_else(|_| "oab-control-plane".to_string());
 
     // Read current generation from S3 manifest (if exists), increment
     let manifest_key = format!("manifests/{}/{}.yaml", m.metadata.namespace, m.metadata.name);
-    let current_gen = match s3.get_object().bucket(bucket).key(&manifest_key).send().await {
+    let current_gen = match s3.get_object().bucket(&bucket).key(&manifest_key).send().await {
         Ok(resp) => {
             let bytes = resp.body.collect().await?.into_bytes();
             let existing: OABServiceManifest = serde_yaml::from_slice(&bytes)?;
@@ -71,76 +106,44 @@ async fn apply_one(
     };
     let generation = current_gen + 1;
 
-    // 1. Render config.toml and upload to S3 (immutable path)
-    let config_toml = render_config_toml(&m.spec.config);
-    let config_key = format!(
-        "config/{}/{}/{}/config.toml",
-        m.metadata.namespace, m.metadata.name, generation
-    );
-    s3.put_object()
-        .bucket(bucket)
-        .key(&config_key)
-        .body(ByteStream::from(config_toml.into_bytes()))
-        .send()
-        .await
-        .context("failed to upload config to S3")?;
-
-    // 2. Upload manifest to S3 (record of desired state, with updated generation)
+    // 1. Upload manifest to S3 (record of desired state)
     let mut manifest_to_store = serde_yaml::to_value(m)?;
     manifest_to_store["metadata"]["generation"] = serde_yaml::Value::Number(generation.into());
     let manifest_yaml = serde_yaml::to_string(&manifest_to_store)?;
-    let manifest_key = format!("manifests/{}/{}.yaml", m.metadata.namespace, m.metadata.name);
     s3.put_object()
-        .bucket(bucket)
+        .bucket(&bucket)
         .key(&manifest_key)
         .body(ByteStream::from(manifest_yaml.into_bytes()))
         .send()
         .await
         .context("failed to upload manifest to S3")?;
 
-    // 3. Register task definition
-    let config_s3_path = format!("s3://{}/{}", bucket, config_key);
-    let task_def_family = service_name.clone();
-
+    // 2. Build environment variables
     let mut env_vars = vec![
-        KeyValuePair::builder()
-            .name("NAMESPACE")
-            .value(&m.metadata.namespace)
-            .build(),
-        KeyValuePair::builder()
-            .name("NAME")
-            .value(&m.metadata.name)
-            .build(),
-        KeyValuePair::builder()
-            .name("CONFIG_S3_PATH")
-            .value(&config_s3_path)
-            .build(),
+        KeyValuePair::builder().name("NAMESPACE").value(&m.metadata.namespace).build(),
+        KeyValuePair::builder().name("NAME").value(&m.metadata.name).build(),
     ];
+    if !m.spec.config_from.is_empty() {
+        env_vars.push(KeyValuePair::builder().name("CONFIG_S3_PATH").value(&m.spec.config_from).build());
+    }
     if let Some(ref bootstrap) = m.spec.bootstrap_from {
-        env_vars.push(
-            KeyValuePair::builder()
-                .name("BOOTSTRAP_FROM")
-                .value(bootstrap)
-                .build(),
-        );
+        env_vars.push(KeyValuePair::builder().name("BOOTSTRAP_FROM").value(bootstrap).build());
     }
 
+    // 3. Build secrets from map
     let secrets: Vec<Secret> = m
         .spec
         .secrets
         .iter()
-        .map(|s| {
-            Secret::builder()
-                .name(&s.name)
-                .value_from(&s.value_from)
-                .build()
-                .unwrap()
+        .map(|(name, ssm_path)| {
+            Secret::builder().name(name).value_from(ssm_path).build().unwrap()
         })
         .collect();
 
+    // 4. Register task definition
     let container = ContainerDefinition::builder()
         .name("openab")
-        .image(&m.spec.task_definition.image)
+        .image(&m.spec.image)
         .essential(true)
         .set_environment(Some(env_vars))
         .set_secrets(if secrets.is_empty() { None } else { Some(secrets) })
@@ -148,11 +151,11 @@ async fn apply_one(
 
     let task_def = ecs
         .register_task_definition()
-        .family(&task_def_family)
+        .family(&service_name)
         .requires_compatibilities(aws_sdk_ecs::types::Compatibility::Fargate)
         .network_mode(aws_sdk_ecs::types::NetworkMode::Awsvpc)
-        .cpu(m.spec.cpu.to_string())
-        .memory(m.spec.memory.to_string())
+        .cpu(&m.spec.resources.cpu)
+        .memory(&m.spec.resources.memory)
         .container_definitions(container)
         .send()
         .await
@@ -164,16 +167,16 @@ async fn apply_one(
         .unwrap_or_default()
         .to_string();
 
-    // 4. Create or update ECS service
-    let assign_ip = if m.spec.networking.assign_public_ip {
+    // 5. Create or update ECS service
+    let assign_ip = if ecs_rt.networking.assign_public_ip {
         AssignPublicIp::Enabled
     } else {
         AssignPublicIp::Disabled
     };
 
     let vpc_config = AwsVpcConfiguration::builder()
-        .set_subnets(Some(m.spec.networking.subnets.clone()))
-        .set_security_groups(Some(m.spec.networking.security_groups.clone()))
+        .set_subnets(Some(ecs_rt.networking.subnets.clone()))
+        .set_security_groups(Some(ecs_rt.networking.security_groups.clone()))
         .assign_public_ip(assign_ip)
         .build()?;
 
@@ -196,7 +199,6 @@ async fn apply_one(
         .is_some_and(|s| s.status() == Some("ACTIVE"));
 
     if service_active {
-        // Update existing service
         ecs.update_service()
             .cluster("default")
             .service(&service_name)
@@ -207,9 +209,8 @@ async fn apply_one(
             .context("failed to update ECS service")?;
         println!("  ✓ {} updated", m.metadata.name);
     } else {
-        // Create new service
         let cap_strategy = CapacityProviderStrategyItem::builder()
-            .capacity_provider(&m.spec.capacity_provider)
+            .capacity_provider(&ecs_rt.capacity_provider)
             .weight(1)
             .build()?;
 
@@ -225,53 +226,9 @@ async fn apply_one(
             .context("failed to create ECS service")?;
         println!(
             "  ✓ {} created ({}, {}cpu/{}mem)",
-            m.metadata.name, m.spec.capacity_provider, m.spec.cpu, m.spec.memory
+            m.metadata.name, ecs_rt.capacity_provider, m.spec.resources.cpu, m.spec.resources.memory
         );
     }
 
     Ok(())
-}
-
-fn render_config_toml(config: &crate::manifest::AgentConfig) -> String {
-    let mut out = String::new();
-
-    if let Some(ref backend) = config.backend {
-        out.push_str("[backend]\n");
-        out.push_str(&format!("type = \"{}\"\n", backend.backend_type));
-        if let Some(ref model) = backend.model_id {
-            out.push_str(&format!("model_id = \"{}\"\n", model));
-        }
-        if let Some(ref region) = backend.region {
-            out.push_str(&format!("region = \"{}\"\n", region));
-        }
-        out.push('\n');
-    }
-
-    for (i, ch) in config.channels.iter().enumerate() {
-        out.push_str("[[channels]]\n");
-        out.push_str(&format!("type = \"{}\"\n", ch.channel_type));
-        for (k, v) in &ch.extra {
-            if let serde_yaml::Value::String(s) = v {
-                out.push_str(&format!("{} = \"{}\"\n", k, s));
-            }
-        }
-        if i < config.channels.len() - 1 {
-            out.push('\n');
-        }
-    }
-
-    if let Some(ref steering) = config.steering {
-        out.push_str("\n[steering]\n");
-        if let Some(ref prompt) = steering.system_prompt {
-            out.push_str(&format!("system_prompt = \"\"\"\n{}\n\"\"\"\n", prompt));
-        }
-    }
-
-    if let Some(ref features) = config.features {
-        out.push_str("\n[features]\n");
-        out.push_str(&format!("stt = {}\n", features.stt));
-        out.push_str(&format!("cronjob = {}\n", features.cronjob));
-    }
-
-    out
 }

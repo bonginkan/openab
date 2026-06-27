@@ -203,6 +203,15 @@ Agent replies are rendered with Telegram Markdown: **bold**, `code`, and code bl
 
 With **Rich Messages** enabled (default, requires Bot API 10.1+), headings (`##`) and tables render with full formatting via `sendRichMessage`. Code blocks remain on the legacy path for syntax highlighting and copy-button support. Content exceeding 4096 characters is automatically handled via rich messages (up to 32768 chars).
 
+> **Important:** OAB's default table mode wraps markdown tables in code blocks before they reach the gateway. To allow native Telegram table rendering via Rich Messages, disable this conversion in your `config.toml`:
+>
+> ```toml
+> [markdown]
+> tables = "off"
+> ```
+>
+> Rich Messages requires gateway version **v0.6.0-rc.1** or above (`ghcr.io/openabdev/openab-gateway:v0.6.0-rc.1`+).
+
 Set `TELEGRAM_RICH_MESSAGES=false` to disable rich messages and use legacy `sendMessage` for all replies.
 
 ## Environment Variables (Gateway)

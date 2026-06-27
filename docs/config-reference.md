@@ -368,6 +368,26 @@ Fine-tune reaction timing behavior (milliseconds).
 | `done_hold_ms` | `1500` | How long to show the done emoji before removing (if `remove_after_reply`). |
 | `error_hold_ms` | `2500` | How long to show the error emoji before removing. |
 
+### `[reactions.mapping]`
+
+Map emoji reactions to text commands. When a user reacts with a configured emoji on any message in a monitored channel, the bot treats it as if the user sent the corresponding text message.
+
+Keys can be unicode emoji or Discord/GitHub shortcodes (e.g. `:thumbsup:`). Shortcodes are resolved to unicode at config load time.
+
+```toml
+[reactions.mapping]
+"👍" = "OK"
+":thumbsdown:" = "不行"
+":arrows_counterclockwise:" = "重新 review"
+":white_check_mark:" = "approve"
+```
+
+**Requirements:**
+- Enable the `GUILD_MESSAGE_REACTIONS` intent in the Discord Developer Portal.
+- Only unicode emoji are supported (custom server emoji are ignored).
+- The bot's own reactions are always ignored (prevents feedback loops).
+- Channel/thread access control still applies — reactions in non-monitored channels are ignored.
+
 ---
 
 ## `[stt]`

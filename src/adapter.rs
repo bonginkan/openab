@@ -497,9 +497,18 @@ pub trait ChatAdapter: Send + Sync + 'static {
         ))
     }
 
-    /// Rename the thread/channel title. Default: no-op (not all platforms support it).
+    /// Rename the thread/channel title. Default: unsupported error.
     async fn rename_thread(&self, _channel: &ChannelRef, _title: &str) -> Result<()> {
-        Ok(())
+        Err(anyhow::anyhow!(
+            "rename_thread not supported on this platform"
+        ))
+    }
+
+    /// Archive or unarchive a thread. Default: unsupported error.
+    async fn archive_thread(&self, _channel: &ChannelRef, _archived: bool) -> Result<()> {
+        Err(anyhow::anyhow!(
+            "archive_thread not supported on this platform"
+        ))
     }
 
     /// Delete a message. Used to remove streaming placeholders when reply_to is set.
@@ -934,6 +943,7 @@ fn prompt_hard_timeout_from_secs(secs: u64) -> Option<Duration> {
 }
 
 impl AdapterRouter {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         pool: Arc<SessionPool>,
         reactions_config: ReactionsConfig,
@@ -1247,7 +1257,8 @@ impl AdapterRouter {
                     const NATIVE_FLUSH_MS: u128 = 400;
 
                     // Streaming edit: send placeholder, spawn edit loop
-                    let (buf_tx, placeholder_post, _active_post_guard) = if streaming && !native {
+                    let (buf_tx, placeholder_post, _active_post_guard, edit_handle) =
+                        if streaming && !native {
                         let initial = if reset {
                             "⚠️ _Session expired, starting fresh..._\n\n…".to_string()
                         } else {
@@ -1278,7 +1289,7 @@ impl AdapterRouter {
                         .await;
                         let placeholder_post = active_post_guard.controller.clone();
                         let mut buf_rx = rx;
-                        tokio::spawn(async move {
+                        let edit_handle = tokio::spawn(async move {
                             let mut last = String::new();
                             loop {
                                 tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
@@ -1294,9 +1305,14 @@ impl AdapterRouter {
                                 }
                             }
                         });
-                        (Some(tx), Some(placeholder_post), Some(active_post_guard))
+                        (
+                            Some(tx),
+                            Some(placeholder_post),
+                            Some(active_post_guard),
+                            Some(edit_handle),
+                        )
                     } else {
-                        (None, None, None)
+                        (None, None, None, None)
                     };
 
                     // (#732) Liveness-aware recv loop. Filters stale id-bearing
@@ -1493,8 +1509,28 @@ impl AdapterRouter {
                         "prompt turn finished"
                     );
                     conn.prompt_done().await;
-                    // Stop the edit loop
+                    // Stop the cosmetic edit loop before the finalize write path
+                    // issues its authoritative edit. Dropping buf_tx closes the watch
+                    // channel so the loop breaks on its next check, but it may be
+                    // mid-edit (a single edit can now block up to the gateway response
+                    // timeout). Without an explicit abort+join, a cosmetic edit issued
+                    // just before close could land *after* the finalize edit and
+                    // overwrite it with stale, mid-stream content (#1122 review NEW-1).
+                    //
+                    // abort() cancels any cosmetic edit that has not yet been put on
+                    // the wire and interrupts the inter-flush sleep immediately; the
+                    // await confirms the task is gone before we proceed. This narrows
+                    // the race to near zero — it does NOT fully eliminate it: a PUT
+                    // already flushed microseconds before abort cannot be recalled,
+                    // and if finalize's PUT travels a different pooled connection the
+                    // server-side arrival order is not strictly guaranteed. That
+                    // residual window is display-only (stale tail briefly shown) and
+                    // far narrower than before this join existed.
                     drop(buf_tx);
+                    if let Some(handle) = edit_handle {
+                        handle.abort();
+                        let _ = handle.await;
+                    }
 
                     // Parse output directives from raw text_buf BEFORE compose_display.
                     // Directives are agent meta-layer, not content — must be stripped
@@ -1537,9 +1573,22 @@ impl AdapterRouter {
                     };
                     let chunks = if final_content.is_empty() {
                         Vec::new()
+                    } else if adapter.platform() == "discord" {
+                        let mentions = extract_mentions(&final_content);
+                        let mention_reserve = mention_footer_len(&mentions);
+                        let chunks = format::split_message(
+                            &final_content,
+                            message_limit.saturating_sub(mention_reserve),
+                        );
+                        propagate_mentions_to_chunks(chunks, &mentions, message_limit)
                     } else {
                         format::split_message(&final_content, message_limit)
                     };
+                    // Track delivery health across all final write paths. Any failure
+                    // here means the user's view is incomplete; we propagate Err at the
+                    // end of the closure so dispatch surfaces set_error (❌) instead of
+                    // silently calling set_done (🆗) over a half-delivered turn.
+                    let mut delivery_failed = false;
                     // Clear the assistant status line before delivering the final message.
                     if assistant_status {
                         let _ = adapter.set_status(&thread_channel, "").await;
@@ -1547,7 +1596,12 @@ impl AdapterRouter {
                     if native {
                         if let Some(msg) = &native_msg {
                             if !native_pending.is_empty() {
-                                let _ = adapter.stream_append(msg, &native_pending).await;
+                                if let Err(e) =
+                                    adapter.stream_append(msg, &native_pending).await
+                                {
+                                    tracing::warn!(error = ?e, platform = %thread_channel.platform, message_id = %msg.message_id, "native finalize stream_append failed");
+                                    delivery_failed = true;
+                                }
                             }
                             // Finalize the streamed message with the first chunk (full-replace),
                             // then post any overflow chunks as new in-thread messages — mirrors
@@ -1556,13 +1610,26 @@ impl AdapterRouter {
                             // streaming mode — the streamed message is the in-thread reply.
                             match chunks.first() {
                                 Some(first) => {
-                                    let _ = adapter.stream_finish(msg, first).await;
+                                    if let Err(e) = adapter.stream_finish(msg, first).await {
+                                        tracing::warn!(error = ?e, platform = %thread_channel.platform, message_id = %msg.message_id, "native stream_finish failed");
+                                        delivery_failed = true;
+                                    }
                                     for chunk in chunks.iter().skip(1) {
-                                        let _ = adapter.send_message(&thread_channel, chunk).await;
+                                        if let Err(e) =
+                                            adapter.send_message(&thread_channel, chunk).await
+                                        {
+                                            tracing::warn!(error = ?e, platform = %thread_channel.platform, message_id = %msg.message_id, "native overflow chunk send failed");
+                                            delivery_failed = true;
+                                        }
                                     }
                                 }
                                 None => {
-                                    let _ = adapter.stream_finish(msg, &final_content).await;
+                                    if let Err(e) =
+                                        adapter.stream_finish(msg, &final_content).await
+                                    {
+                                        tracing::warn!(error = ?e, platform = %thread_channel.platform, message_id = %msg.message_id, "native stream_finish (no chunks) failed");
+                                        delivery_failed = true;
+                                    }
                                 }
                             }
                         } else {
@@ -1575,29 +1642,35 @@ impl AdapterRouter {
                             // accumulated text_buf) as plain in-thread messages so
                             // the turn is never silently dropped.
                             for chunk in &chunks {
-                                let _ = adapter.send_message(&thread_channel, chunk).await;
+                                if let Err(e) =
+                                    adapter.send_message(&thread_channel, chunk).await
+                                {
+                                    tracing::warn!(error = ?e, platform = %thread_channel.platform, "native fallback chunk send failed");
+                                    delivery_failed = true;
+                                }
                             }
                         }
                     } else if let Some(post) = placeholder_post {
                         if let Some(ref reply_id) = directives.reply_to {
-                            // reply_to directive: send reply first, then delete placeholder.
-                            // Only delete if send succeeds — preserves placeholder on failure.
                             let mut send_ok = false;
                             let mut first = true;
                             for chunk in &chunks {
                                 if first {
-                                    match adapter.send_message_with_reply(
-                                        &thread_channel,
-                                        chunk,
-                                        reply_id,
-                                    ).await {
-                                        Ok(_) => { send_ok = true; }
+                                    match adapter
+                                        .send_message_with_reply(&thread_channel, chunk, reply_id)
+                                        .await
+                                    {
+                                        Ok(_) => send_ok = true,
                                         Err(e) => {
-                                            tracing::warn!(error = ?e, "reply_to send failed; preserving placeholder");
+                                            tracing::warn!(error = ?e, platform = %thread_channel.platform, "reply_to send failed; preserving placeholder");
+                                            delivery_failed = true;
                                         }
                                     }
-                                } else {
-                                    let _ = adapter.send_message(&thread_channel, chunk).await;
+                                } else if let Err(e) =
+                                    adapter.send_message(&thread_channel, chunk).await
+                                {
+                                    tracing::warn!(error = ?e, platform = %thread_channel.platform, "reply_to overflow chunk send failed");
+                                    delivery_failed = true;
                                 }
                                 first = false;
                             }
@@ -1607,7 +1680,11 @@ impl AdapterRouter {
                                     &thread_channel,
                                     attachments,
                                     None,
-                                    if chunks.is_empty() { Some(reply_id.as_str()) } else { None },
+                                    if chunks.is_empty() {
+                                        Some(reply_id.as_str())
+                                    } else {
+                                        None
+                                    },
                                 )
                                 .await
                                 {
@@ -1617,16 +1694,15 @@ impl AdapterRouter {
                                         }
                                     }
                                     Err(e) => {
-                                        tracing::warn!(error = ?e, "outbound attachment send failed");
+                                        tracing::warn!(error = ?e, platform = %thread_channel.platform, "outbound attachment send failed");
+                                        delivery_failed = true;
+                                        let warning = format!("⚠️ Failed to send attachment: {e}");
                                         if chunks.is_empty() {
-                                            post.edit(&format!("⚠️ Failed to send attachment: {e}")).await;
-                                        } else {
-                                            let _ = adapter
-                                                .send_message(
-                                                    &thread_channel,
-                                                    &format!("⚠️ Failed to send attachment: {e}"),
-                                                )
-                                                .await;
+                                            post.edit(&warning).await;
+                                        } else if let Err(send_err) =
+                                            adapter.send_message(&thread_channel, &warning).await
+                                        {
+                                            tracing::warn!(error = ?send_err, platform = %thread_channel.platform, "attachment warning send failed");
                                         }
                                     }
                                 }
@@ -1637,26 +1713,35 @@ impl AdapterRouter {
                         } else if adapter.platform() == "discord"
                             && contains_bot_mention(&final_content)
                         {
-                            // Discord-specific: bot mention detected. Delete placeholder
-                            // and send as new message so Discord emits MESSAGE_CREATE —
-                            // otherwise the mentioned bot won't receive the gateway
-                            // event since MESSAGE_UPDATE skips notifications (#1110).
                             let mut send_ok = false;
                             if let Some(first) = chunks.first() {
-                                if adapter.send_message(&thread_channel, first).await.is_ok() {
-                                    send_ok = true;
+                                match adapter.send_message(&thread_channel, first).await {
+                                    Ok(_) => send_ok = true,
+                                    Err(e) => {
+                                        tracing::warn!(error = ?e, platform = %thread_channel.platform, "discord bot-mention first chunk send failed");
+                                        delivery_failed = true;
+                                    }
                                 }
-                                for chunk in chunks.iter().skip(1) {
-                                    let _ = adapter.send_message(&thread_channel, chunk).await;
+                            }
+                            for chunk in chunks.iter().skip(1) {
+                                if let Err(e) = adapter.send_message(&thread_channel, chunk).await {
+                                    tracing::warn!(error = ?e, platform = %thread_channel.platform, "streaming overflow chunk send failed");
+                                    delivery_failed = true;
+                                }
+                            }
+                            if !attachments.is_empty() {
+                                if let Err(e) =
+                                    send_outbound_attachments(&adapter, &thread_channel, attachments, None, None)
+                                        .await
+                                {
+                                    tracing::warn!(error = ?e, platform = %thread_channel.platform, "outbound attachment send failed");
+                                    delivery_failed = true;
                                 }
                             }
                             if send_ok {
                                 post.delete_current_messages().await;
                             }
                         } else {
-                            // Normal streaming: edit the placeholder post set into
-                            // the final split content. No truncation: long content
-                            // remains visible across multiple Discord messages.
                             if !final_content.is_empty() {
                                 post.edit(&final_content).await;
                             }
@@ -1676,16 +1761,15 @@ impl AdapterRouter {
                                         }
                                     }
                                     Err(e) => {
-                                        tracing::warn!(error = ?e, "outbound attachment send failed");
+                                        tracing::warn!(error = ?e, platform = %thread_channel.platform, "outbound attachment send failed");
+                                        delivery_failed = true;
+                                        let warning = format!("⚠️ Failed to send attachment: {e}");
                                         if chunks.is_empty() {
-                                            post.edit(&format!("⚠️ Failed to send attachment: {e}")).await;
-                                        } else {
-                                            let _ = adapter
-                                                .send_message(
-                                                    &thread_channel,
-                                                    &format!("⚠️ Failed to send attachment: {e}"),
-                                                )
-                                                .await;
+                                            post.edit(&warning).await;
+                                        } else if let Err(send_err) =
+                                            adapter.send_message(&thread_channel, &warning).await
+                                        {
+                                            tracing::warn!(error = ?send_err, platform = %thread_channel.platform, "attachment warning send failed");
                                         }
                                     }
                                 }
@@ -1705,68 +1789,85 @@ impl AdapterRouter {
                             {
                                 Ok(()) => {
                                     for chunk in chunks.iter().skip(1) {
-                                        let _ = adapter.send_message(&thread_channel, chunk).await;
+                                        if let Err(e) =
+                                            adapter.send_message(&thread_channel, chunk).await
+                                        {
+                                            tracing::warn!(error = ?e, platform = %thread_channel.platform, "send-once subsequent chunk failed");
+                                            delivery_failed = true;
+                                        }
                                     }
                                 }
                                 Err(e) => {
-                                    tracing::warn!(error = ?e, "outbound attachment send failed");
-                                    // Preserve the textual response even if attachment upload fails.
-                                    let mut first = true;
-                                    for chunk in &chunks {
-                                        if first {
-                                            if let Some(ref reply_id) = directives.reply_to {
-                                                let _ = adapter
-                                                    .send_message_with_reply(
-                                                        &thread_channel,
-                                                        chunk,
-                                                        reply_id,
-                                                    )
-                                                    .await;
-                                            } else {
-                                                let _ = adapter
-                                                    .send_message(&thread_channel, chunk)
-                                                    .await;
-                                            }
-                                        } else {
-                                            let _ = adapter.send_message(&thread_channel, chunk).await;
-                                        }
-                                        first = false;
+                                    tracing::warn!(error = ?e, platform = %thread_channel.platform, "outbound attachment send failed");
+                                    delivery_failed = true;
+                                    send_chunks_once(
+                                        &adapter,
+                                        &thread_channel,
+                                        &chunks,
+                                        directives.reply_to.as_deref(),
+                                        &mut delivery_failed,
+                                    )
+                                    .await;
+                                    let warning = format!("⚠️ Failed to send attachment: {e}");
+                                    if let Err(send_err) =
+                                        adapter.send_message(&thread_channel, &warning).await
+                                    {
+                                        tracing::warn!(error = ?send_err, platform = %thread_channel.platform, "attachment warning send failed");
                                     }
-                                    let _ = adapter
-                                        .send_message(
-                                            &thread_channel,
-                                            &format!("⚠️ Failed to send attachment: {e}"),
-                                        )
-                                        .await;
                                 }
                             }
                         } else {
-                            // Send-once: all chunks as new messages
-                            // First chunk uses reply_to directive if present
-                            let mut first = true;
-                            for chunk in &chunks {
-                                if first {
-                                    if let Some(ref reply_id) = directives.reply_to {
-                                        let _ = adapter.send_message_with_reply(
-                                            &thread_channel,
-                                            chunk,
-                                            reply_id,
-                                        ).await;
-                                    } else {
-                                        let _ = adapter.send_message(&thread_channel, chunk).await;
-                                    }
-                                } else {
-                                    let _ = adapter.send_message(&thread_channel, chunk).await;
-                                }
-                                first = false;
-                            }
+                            send_chunks_once(
+                                &adapter,
+                                &thread_channel,
+                                &chunks,
+                                directives.reply_to.as_deref(),
+                                &mut delivery_failed,
+                            )
+                            .await;
                         }
                     }
 
-                    Ok(())
+                    if delivery_failed {
+                        Err(anyhow::anyhow!(
+                            "streaming finalization had delivery failures; user view is incomplete"
+                        ))
+                    } else {
+                        Ok(())
+                    }
                 })
             })
             .await
+    }
+}
+
+async fn send_chunks_once(
+    adapter: &Arc<dyn ChatAdapter>,
+    thread_channel: &ChannelRef,
+    chunks: &[String],
+    reply_to_message_id: Option<&str>,
+    delivery_failed: &mut bool,
+) {
+    let mut first = true;
+    for chunk in chunks {
+        if first {
+            if let Some(reply_id) = reply_to_message_id {
+                if let Err(e) = adapter
+                    .send_message_with_reply(thread_channel, chunk, reply_id)
+                    .await
+                {
+                    tracing::warn!(error = ?e, platform = %thread_channel.platform, "send-once reply_to first chunk failed");
+                    *delivery_failed = true;
+                }
+            } else if let Err(e) = adapter.send_message(thread_channel, chunk).await {
+                tracing::warn!(error = ?e, platform = %thread_channel.platform, "send-once first chunk failed");
+                *delivery_failed = true;
+            }
+        } else if let Err(e) = adapter.send_message(thread_channel, chunk).await {
+            tracing::warn!(error = ?e, platform = %thread_channel.platform, "send-once subsequent chunk failed");
+            *delivery_failed = true;
+        }
+        first = false;
     }
 }
 
@@ -1902,6 +2003,126 @@ fn ensure_response_separator(text_buf: &mut String, next_chunk: &str) {
     } else {
         text_buf.push_str("\n\n");
     }
+}
+
+/// Extract all Discord mentions (`<@123>`, `<@!123>`, `<@&123>`) from content,
+/// skipping mentions inside fenced code blocks (``` ... ```).
+/// Normalizes `<@!UID>` to `<@UID>` for deduplication (same user).
+/// Returns deduplicated list in appearance order.
+fn extract_mentions(content: &str) -> Vec<String> {
+    let mut mentions = Vec::new();
+    let mut in_fence = false;
+
+    for line in content.split('\n') {
+        if line.starts_with("```") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+
+        let bytes = line.as_bytes();
+        let mut i = 0;
+        while i + 2 < bytes.len() {
+            if bytes[i] == b'<' && bytes[i + 1] == b'@' {
+                let (prefix_end, is_role) = if i + 2 < bytes.len() && bytes[i + 2] == b'&' {
+                    (i + 3, true)
+                } else if i + 2 < bytes.len() && bytes[i + 2] == b'!' {
+                    (i + 3, false)
+                } else {
+                    (i + 2, false)
+                };
+                if prefix_end < bytes.len() && bytes[prefix_end].is_ascii_digit() {
+                    if let Some(end) = line[prefix_end..].find('>') {
+                        if line[prefix_end..prefix_end + end]
+                            .chars()
+                            .all(|c| c.is_ascii_digit())
+                        {
+                            // Normalize: <@!UID> → <@UID>, keep <@&RoleID> as-is
+                            let uid = &line[prefix_end..prefix_end + end];
+                            let normalized = if is_role {
+                                format!("<@&{uid}>")
+                            } else {
+                                format!("<@{uid}>")
+                            };
+                            if !mentions.contains(&normalized) {
+                                mentions.push(normalized);
+                            }
+                            i = prefix_end + end + 1;
+                            continue;
+                        }
+                    }
+                }
+                i = prefix_end;
+            } else {
+                i += 1;
+            }
+        }
+    }
+    mentions
+}
+
+/// Compute the char length of the mention footer that will be appended.
+/// Returns 0 if no mentions or only 1 chunk would be produced.
+fn mention_footer_len(mentions: &[String]) -> usize {
+    if mentions.is_empty() {
+        return 0;
+    }
+    // "\n" + mentions joined by " "
+    1 + mentions.iter().map(|m| m.len()).sum::<usize>() + mentions.len().saturating_sub(1)
+}
+
+/// Append mentions to split chunks that don't already contain them.
+/// Ensures every chunk carries all mentions from the original content so
+/// receiving bots under `allow_bot_messages = "mentions"` gate accept all pieces.
+/// `limit` is the hard message limit (e.g. 2000) — chunks that would exceed it
+/// after appending are left unchanged (they already fit within split_message's
+/// reduced limit, so the mention_reserve guarantees space in normal cases).
+fn propagate_mentions_to_chunks(
+    chunks: Vec<String>,
+    mentions: &[String],
+    limit: usize,
+) -> Vec<String> {
+    if mentions.is_empty() || chunks.len() <= 1 {
+        return chunks;
+    }
+    chunks
+        .into_iter()
+        .map(|chunk| {
+            let missing: Vec<&String> = mentions
+                .iter()
+                .filter(|m| !chunk_contains_mention(&chunk, m))
+                .collect();
+            if missing.is_empty() {
+                chunk
+            } else {
+                let footer = format!(
+                    "\n{}",
+                    missing
+                        .iter()
+                        .map(|m| m.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                );
+                if chunk.chars().count() + footer.chars().count() <= limit {
+                    format!("{chunk}{footer}")
+                } else {
+                    // Safety: don't exceed limit; chunk already passes gate
+                    // if it contained the mention from the original content.
+                    chunk
+                }
+            }
+        })
+        .collect()
+}
+
+/// Check if a chunk contains an exact mention.
+/// Since mentions are formatted as `<@DIGITS>` (terminated by `>`), a simple
+/// substring search is sufficient — `<@123>` cannot match inside `<@1234>`
+/// because the `>` acts as an exact boundary delimiter.
+fn chunk_contains_mention(chunk: &str, mention: &str) -> bool {
+    chunk.contains(mention)
 }
 
 /// Returns true if `content` contains a Discord user/bot mention (`<@123>`, `<@!123>`)
@@ -2511,6 +2732,180 @@ mod tests {
     #[test]
     fn contains_bot_mention_embedded() {
         assert!(contains_bot_mention("請問 <@1501788608439386172> 1+1=?"));
+    }
+
+    #[test]
+    fn extract_mentions_basic() {
+        let mentions = extract_mentions("hello <@123> and <@&456> world");
+        assert_eq!(mentions, vec!["<@123>", "<@&456>"]);
+    }
+
+    #[test]
+    fn extract_mentions_dedup() {
+        let mentions = extract_mentions("<@123> foo <@123> bar");
+        assert_eq!(mentions, vec!["<@123>"]);
+    }
+
+    #[test]
+    fn extract_mentions_normalizes_nickname() {
+        // <@!789> should be normalized to <@789>
+        let mentions = extract_mentions("hey <@!789>");
+        assert_eq!(mentions, vec!["<@789>"]);
+    }
+
+    #[test]
+    fn extract_mentions_dedup_after_normalize() {
+        // <@123> and <@!123> are the same user
+        let mentions = extract_mentions("<@123> and <@!123>");
+        assert_eq!(mentions, vec!["<@123>"]);
+    }
+
+    #[test]
+    fn extract_mentions_skips_code_blocks() {
+        let content = "hello <@111>\n```\n<@222>\n```\nworld <@333>";
+        let mentions = extract_mentions(content);
+        assert_eq!(mentions, vec!["<@111>", "<@333>"]);
+    }
+
+    #[test]
+    fn extract_mentions_none() {
+        let mentions = extract_mentions("no mentions here");
+        assert!(mentions.is_empty());
+    }
+
+    #[test]
+    fn mention_footer_len_empty() {
+        assert_eq!(mention_footer_len(&[]), 0);
+    }
+
+    #[test]
+    fn mention_footer_len_single() {
+        // "\n<@123>" = 1 + 6 = 7
+        assert_eq!(mention_footer_len(&["<@123>".to_string()]), 7);
+    }
+
+    #[test]
+    fn mention_footer_len_multiple() {
+        // "\n<@123> <@456>" = 1 + 6 + 1 + 6 = 14
+        let mentions = vec!["<@123>".to_string(), "<@456>".to_string()];
+        assert_eq!(mention_footer_len(&mentions), 14);
+    }
+
+    #[test]
+    fn propagate_mentions_single_chunk() {
+        let chunks = vec!["hello <@123>".to_string()];
+        let result = propagate_mentions_to_chunks(chunks.clone(), &["<@123>".to_string()], 2000);
+        assert_eq!(result, chunks);
+    }
+
+    #[test]
+    fn propagate_mentions_appends_to_all_chunks() {
+        let chunks = vec![
+            "first chunk no mention".to_string(),
+            "second chunk".to_string(),
+            "third chunk".to_string(),
+        ];
+        let result = propagate_mentions_to_chunks(chunks, &["<@123>".to_string()], 2000);
+        assert!(result[0].ends_with("\n<@123>"));
+        assert!(result[1].ends_with("\n<@123>"));
+        assert!(result[2].ends_with("\n<@123>"));
+    }
+
+    #[test]
+    fn propagate_mentions_skips_already_present() {
+        let chunks = vec!["hello <@123>".to_string(), "world <@123>".to_string()];
+        let result = propagate_mentions_to_chunks(chunks.clone(), &["<@123>".to_string()], 2000);
+        assert_eq!(result, chunks);
+    }
+
+    #[test]
+    fn propagate_mentions_respects_limit() {
+        // Chunk at exactly limit - no room to append
+        let chunk = "x".repeat(2000);
+        let chunks = vec!["short <@123>".to_string(), chunk.clone()];
+        let result = propagate_mentions_to_chunks(chunks, &["<@123>".to_string()], 2000);
+        // Second chunk unchanged (would exceed limit)
+        assert_eq!(result[1], chunk);
+    }
+
+    #[test]
+    fn propagate_mentions_multiple() {
+        let chunks = vec!["<@111> and <@222> start".to_string(), "middle".to_string()];
+        let mentions = vec!["<@111>".to_string(), "<@222>".to_string()];
+        let result = propagate_mentions_to_chunks(chunks, &mentions, 2000);
+        assert_eq!(result[1], "middle\n<@111> <@222>");
+    }
+
+    #[test]
+    fn propagate_mentions_empty() {
+        let chunks = vec!["hello".to_string(), "world".to_string()];
+        let result = propagate_mentions_to_chunks(chunks.clone(), &[], 2000);
+        assert_eq!(result, chunks);
+    }
+
+    #[test]
+    fn chunk_contains_mention_exact() {
+        assert!(chunk_contains_mention("hello <@123> world", "<@123>"));
+        assert!(chunk_contains_mention("<@123>", "<@123>"));
+    }
+
+    #[test]
+    fn chunk_contains_mention_not_substring() {
+        // <@123> ends with > so it won't match inside <@1234>
+        // because <@1234> is "<@1234>" not "<@123>4"
+        assert!(!chunk_contains_mention("hello <@1234> world", "<@123>"));
+    }
+
+    #[test]
+    fn pipeline_split_then_propagate() {
+        // End-to-end: split a message that exceeds limit, then propagate mentions.
+        use crate::format::split_message;
+        let mention = "<@99999>";
+        let body = "x".repeat(80);
+        let content = format!("{mention} {body}");
+        let limit: usize = 50;
+        let mentions = extract_mentions(&content);
+        let reserve = mention_footer_len(&mentions);
+        let chunks = split_message(&content, limit.saturating_sub(reserve));
+        let result = propagate_mentions_to_chunks(chunks, &mentions, limit);
+        // Every chunk must carry the mention and fit within limit.
+        for chunk in &result {
+            assert!(chunk.contains(mention), "chunk missing mention: {chunk}");
+            assert!(chunk.chars().count() <= limit, "chunk exceeds limit");
+        }
+    }
+
+    #[test]
+    fn extract_mentions_unclosed_fence() {
+        // Unclosed code fence — everything after it is "inside" fence, so no mentions extracted.
+        let content = "hello <@111>\n```\n<@222>\n<@333>";
+        let mentions = extract_mentions(content);
+        assert_eq!(mentions, vec!["<@111>"]);
+    }
+
+    #[test]
+    fn saturating_sub_large_reserve() {
+        // When mention_reserve exceeds the limit, saturating_sub yields 0.
+        // split_message with limit=0 puts nothing in first chunk but must not panic.
+        use crate::format::split_message;
+        let mentions = vec!["<@111111111111111111>".to_string(); 200];
+        let reserve = mention_footer_len(&mentions);
+        let limit: usize = 100;
+        // saturating_sub → 0
+        let effective = limit.saturating_sub(reserve);
+        assert_eq!(effective, 0);
+        let chunks = split_message("short", effective);
+        // Should not panic; propagation returns chunks unchanged when they'd exceed limit.
+        let result = propagate_mentions_to_chunks(chunks, &mentions, limit);
+        assert!(!result.is_empty());
+    }
+
+    #[test]
+    fn role_vs_user_mention_distinction() {
+        // <@&123> (role) and <@123> (user) are distinct mentions.
+        let content = "<@123> hello <@&123>";
+        let mentions = extract_mentions(content);
+        assert_eq!(mentions, vec!["<@123>", "<@&123>"]);
     }
 }
 

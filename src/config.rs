@@ -739,6 +739,10 @@ pub struct ReactionsConfig {
     pub emojis: ReactionEmojis,
     #[serde(default)]
     pub timing: ReactionTiming,
+    /// Emoji-to-text mapping. When a user reacts with a mapped emoji,
+    /// it is treated as if they sent the corresponding text message.
+    #[serde(default)]
+    pub mapping: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -868,6 +872,7 @@ impl Default for ReactionsConfig {
             tool_display: ToolDisplay::default(),
             emojis: ReactionEmojis::default(),
             timing: ReactionTiming::default(),
+            mapping: HashMap::new(),
         }
     }
 }
@@ -1003,6 +1008,25 @@ async fn load_config_from_url(url: &str) -> anyhow::Result<Config> {
 fn parse_config_inner(expanded: &str, source: &str) -> anyhow::Result<Config> {
     let mut config: Config = toml::from_str(expanded)
         .map_err(|e| anyhow::anyhow!("failed to parse config from {source}: {e}"))?;
+
+    // Resolve Discord shortcodes in reactions.mapping keys.
+    // Allows operators to write `:thumbsup: = "OK"` instead of `"👍" = "OK"`.
+    config.reactions.mapping = config
+        .reactions
+        .mapping
+        .into_iter()
+        .map(|(key, val)| {
+            let resolved = if key.starts_with(':') && key.ends_with(':') && key.len() > 2 {
+                let shortcode = &key[1..key.len() - 1];
+                emojis::get_by_shortcode(shortcode)
+                    .map(|e| e.as_str().to_string())
+                    .unwrap_or(key)
+            } else {
+                key
+            };
+            (resolved, val)
+        })
+        .collect();
 
     // If [agentcore] is set and [agent] command was not explicitly provided,
     // synthesize agent config to spawn the bundled agentcore-acp adapter.
@@ -1705,5 +1729,94 @@ cancel_strategy = "noop"
         let cfg = parse_config(toml, "test").unwrap();
         let ac = cfg.agentcore.unwrap();
         assert_eq!(ac.cancel_strategy, AgentCoreCancelStrategy::Noop);
+    }
+
+    #[test]
+    fn reactions_mapping_unicode_keys() {
+        let toml = r#"
+[discord]
+bot_token = "t"
+
+[agent]
+command = "echo"
+
+[reactions.mapping]
+"👍" = "OK"
+"✅" = "approve"
+"#;
+        let cfg = parse_config(toml, "test").unwrap();
+        assert_eq!(cfg.reactions.mapping.get("👍").unwrap(), "OK");
+        assert_eq!(cfg.reactions.mapping.get("✅").unwrap(), "approve");
+    }
+
+    #[test]
+    fn reactions_mapping_shortcode_resolution() {
+        let toml = r#"
+[discord]
+bot_token = "t"
+
+[agent]
+command = "echo"
+
+[reactions.mapping]
+":thumbsup:" = "OK"
+":white_check_mark:" = "approve"
+":rocket:" = "deploy"
+"#;
+        let cfg = parse_config(toml, "test").unwrap();
+        // Shortcodes should be resolved to unicode
+        assert_eq!(cfg.reactions.mapping.get("👍").unwrap(), "OK");
+        assert_eq!(cfg.reactions.mapping.get("✅").unwrap(), "approve");
+        assert_eq!(cfg.reactions.mapping.get("🚀").unwrap(), "deploy");
+        // Original shortcode keys should not remain
+        assert!(cfg.reactions.mapping.get(":thumbsup:").is_none());
+    }
+
+    #[test]
+    fn reactions_mapping_unknown_shortcode_kept_as_is() {
+        let toml = r#"
+[discord]
+bot_token = "t"
+
+[agent]
+command = "echo"
+
+[reactions.mapping]
+":nonexistent_emoji_xyz:" = "nope"
+"#;
+        let cfg = parse_config(toml, "test").unwrap();
+        // Unknown shortcode kept as-is (won't match any reaction)
+        assert_eq!(
+            cfg.reactions
+                .mapping
+                .get(":nonexistent_emoji_xyz:")
+                .unwrap(),
+            "nope"
+        );
+    }
+
+    #[test]
+    fn reactions_mapping_mixed_unicode_and_shortcodes() {
+        let toml = r#"
+[discord]
+bot_token = "t"
+
+[agent]
+command = "echo"
+
+[reactions.mapping]
+"👎" = "reject"
+":rocket:" = "deploy"
+"#;
+        let cfg = parse_config(toml, "test").unwrap();
+        assert_eq!(cfg.reactions.mapping.get("👎").unwrap(), "reject");
+        assert_eq!(cfg.reactions.mapping.get("🚀").unwrap(), "deploy");
+        assert_eq!(cfg.reactions.mapping.len(), 2);
+    }
+
+    #[test]
+    fn reactions_mapping_empty_by_default() {
+        let cfg = parse_config(MINIMAL_TOML, "test").unwrap();
+        assert!(cfg.reactions.mapping.is_empty());
     }
 }

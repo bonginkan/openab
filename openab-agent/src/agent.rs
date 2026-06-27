@@ -107,6 +107,12 @@ impl Agent {
         self.provider = provider;
     }
 
+    /// Update working directory and rebuild system prompt.
+    pub fn set_working_dir(&mut self, cwd: String) {
+        self.system_prompt = Self::build_system_prompt(&cwd, self.mcp_manager.as_ref());
+        self.working_dir = PathBuf::from(cwd);
+    }
+
     /// Number of messages in the conversation (test helper).
     #[cfg(test)]
     pub fn message_count(&self) -> usize {
