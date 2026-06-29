@@ -1,0 +1,265 @@
+name: Sync Remotes and Notify
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_branch:
+        description: Branch in this repo to sync into
+        required: false
+        default: main
+      upstream_branch:
+        description: Branch in upstream repo to merge
+        required: false
+        default: main
+      validate:
+        description: Run cargo fmt/check/clippy/test after merge
+        required: false
+        default: "true"
+  schedule:
+    - cron: "17 */6 * * *"
+
+concurrency:
+  group: sync-remotes-${{ inputs.base_branch || 'main' }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+env:
+  UPSTREAM_URL: https://github.com/openabdev/openab.git
+  SYNC_BRANCH: automation/sync-remotes-main
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    outputs:
+      status: ${{ steps.sync.outputs.status }}
+      pr_url: ${{ steps.sync.outputs.pr_url }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Sync origin and upstream
+        id: sync
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BASE_BRANCH_INPUT: ${{ inputs.base_branch }}
+          UPSTREAM_BRANCH_INPUT: ${{ inputs.upstream_branch }}
+          VALIDATE_INPUT: ${{ inputs.validate }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -uo pipefail
+
+          BASE_BRANCH="${BASE_BRANCH_INPUT:-main}"
+          UPSTREAM_BRANCH="${UPSTREAM_BRANCH_INPUT:-main}"
+          VALIDATE="${VALIDATE_INPUT:-true}"
+          REPORT="$RUNNER_TEMP/sync-report.md"
+          MERGE_LOG="$RUNNER_TEMP/sync-merge.log"
+          VALIDATION_LOG="$RUNNER_TEMP/sync-validation.log"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if git remote get-url upstream >/dev/null 2>&1; then
+            git remote set-url upstream "$UPSTREAM_URL"
+          else
+            git remote add upstream "$UPSTREAM_URL"
+          fi
+
+          git fetch --prune origin \
+            "+refs/heads/${BASE_BRANCH}:refs/remotes/origin/${BASE_BRANCH}" \
+            "+refs/heads/${SYNC_BRANCH}:refs/remotes/origin/${SYNC_BRANCH}" || true
+          git fetch --prune upstream \
+            "+refs/heads/${UPSTREAM_BRANCH}:refs/remotes/upstream/${UPSTREAM_BRANCH}"
+
+          OLD_SYNC=""
+          if git rev-parse --verify "origin/${SYNC_BRANCH}" >/dev/null 2>&1; then
+            OLD_SYNC="$(git rev-parse "origin/${SYNC_BRANCH}")"
+          fi
+
+          ORIGIN_HEAD="$(git rev-parse "origin/${BASE_BRANCH}")"
+          UPSTREAM_HEAD="$(git rev-parse "upstream/${UPSTREAM_BRANCH}")"
+
+          {
+            echo "## OpenAB remote sync"
+            echo
+            echo "- repository: ${GITHUB_REPOSITORY}"
+            echo "- base: origin/${BASE_BRANCH} @ ${ORIGIN_HEAD:0:7}"
+            echo "- upstream: openabdev/openab ${UPSTREAM_BRANCH} @ ${UPSTREAM_HEAD:0:7}"
+            echo "- run: ${RUN_URL}"
+            echo
+            echo "### origin/${BASE_BRANCH} updates"
+            if [ -n "$OLD_SYNC" ]; then
+              git log --oneline --no-merges "${OLD_SYNC}..origin/${BASE_BRANCH}" | sed -n '1,20p' || true
+            else
+              git log --oneline --no-merges -5 "origin/${BASE_BRANCH}" || true
+            fi
+            echo
+            echo "### upstream/${UPSTREAM_BRANCH} updates"
+            if [ -n "$OLD_SYNC" ]; then
+              git log --oneline --no-merges "${OLD_SYNC}..upstream/${UPSTREAM_BRANCH}" | sed -n '1,40p' || true
+            else
+              git log --oneline --no-merges -10 "upstream/${UPSTREAM_BRANCH}" || true
+            fi
+            echo
+          } > "$REPORT"
+
+          git checkout -B "$SYNC_BRANCH" "origin/${BASE_BRANCH}"
+
+          if git merge --no-ff --no-edit "upstream/${UPSTREAM_BRANCH}" >"$MERGE_LOG" 2>&1; then
+            echo "### merge" >> "$REPORT"
+            echo "status: clean merge" >> "$REPORT"
+            echo >> "$REPORT"
+          else
+            {
+              echo "### merge"
+              echo "status: conflict"
+              echo
+              echo "conflicted files:"
+              git diff --name-only --diff-filter=U | sed 's/^/- /'
+              echo
+              echo "merge log:"
+              echo '```text'
+              tail -80 "$MERGE_LOG"
+              echo '```'
+            } >> "$REPORT"
+            echo "status=conflict" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ "$VALIDATE" = "true" ]; then
+            if {
+              cargo fmt --check
+              cargo check
+              cargo clippy -- -D warnings
+              cargo test
+            } >"$VALIDATION_LOG" 2>&1; then
+              {
+                echo "### validation"
+                echo "validation: passed"
+                echo '```text'
+                tail -80 "$VALIDATION_LOG"
+                echo '```'
+              } >> "$REPORT"
+            else
+              {
+                echo "### validation"
+                echo "validation: failed"
+                echo '```text'
+                tail -120 "$VALIDATION_LOG"
+                echo '```'
+              } >> "$REPORT"
+              echo "status=validation_failed" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          else
+            echo "### validation" >> "$REPORT"
+            echo "validation: skipped" >> "$REPORT"
+          fi
+
+          if [ "$(git rev-parse HEAD)" = "$ORIGIN_HEAD" ]; then
+            echo "### result" >> "$REPORT"
+            echo "No sync branch update was needed; origin already contains upstream." >> "$REPORT"
+            echo "status=noop" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git push --force-with-lease origin "HEAD:${SYNC_BRANCH}"
+
+          PR_URL="$(gh pr view "$SYNC_BRANCH" --json url --jq .url 2>/dev/null || true)"
+          if [ -z "$PR_URL" ]; then
+            PR_URL="$(gh pr create \
+              --base "$BASE_BRANCH" \
+              --head "$SYNC_BRANCH" \
+              --title "chore: sync upstream/${UPSTREAM_BRANCH} into ${BASE_BRANCH}" \
+              --body-file "$REPORT")"
+          else
+            gh pr edit "$SYNC_BRANCH" --body-file "$REPORT"
+          fi
+
+          {
+            echo
+            echo "### result"
+            echo "sync branch: ${SYNC_BRANCH}"
+            echo "pull request: ${PR_URL}"
+          } >> "$REPORT"
+
+          echo "pr_url=${PR_URL}" >> "$GITHUB_OUTPUT"
+          echo "status=success" >> "$GITHUB_OUTPUT"
+
+      - name: Notify Discord
+        if: always()
+        env:
+          WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          STATUS: ${{ steps.sync.outputs.status }}
+          PR_URL: ${{ steps.sync.outputs.pr_url }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          REPORT="$RUNNER_TEMP/sync-report.md"
+          if [ ! -s "$REPORT" ]; then
+            cat > "$REPORT" <<EOF
+          ## OpenAB remote sync
+
+          status: workflow failed before report creation
+          run: ${RUN_URL}
+          EOF
+          fi
+
+          if [ -z "${WEBHOOK_URL}" ]; then
+            echo "::warning::DISCORD_WEBHOOK_URL secret is not configured; skipping Discord notification"
+            exit 0
+          fi
+
+          case "${STATUS:-unknown}" in
+            success) PREFIX="✅ remote sync succeeded" ;;
+            noop) PREFIX="ℹ️ remote sync had no changes" ;;
+            conflict) PREFIX="⚠️ remote sync has conflicts" ;;
+            validation_failed) PREFIX="❌ remote sync validation failed" ;;
+            *) PREFIX="❌ remote sync workflow failed" ;;
+          esac
+
+          {
+            echo "$PREFIX"
+            echo
+            sed -n '1,120p' "$REPORT"
+            if [ -n "${PR_URL:-}" ]; then
+              echo
+              echo "PR: ${PR_URL}"
+            fi
+          } > "$RUNNER_TEMP/discord-message.txt"
+
+          python3 - "$WEBHOOK_URL" "$RUNNER_TEMP/discord-message.txt" <<'PY'
+          import json
+          import sys
+          import urllib.request
+
+          webhook_url, path = sys.argv[1], sys.argv[2]
+          content = open(path, encoding="utf-8").read()
+          if len(content) > 1900:
+              content = content[:1800] + "\n\n... truncated; see GitHub Actions run for full report"
+          data = json.dumps({"content": content}).encode("utf-8")
+          req = urllib.request.Request(
+              webhook_url,
+              data=data,
+              headers={"Content-Type": "application/json"},
+              method="POST",
+          )
+          with urllib.request.urlopen(req, timeout=10) as res:
+              res.read()
+          PY
+
+      - name: Fail on unresolved sync
+        if: steps.sync.outputs.status == 'conflict' || steps.sync.outputs.status == 'validation_failed' || steps.sync.outputs.status == ''
+        run: |
+          echo "Remote sync did not complete cleanly: ${{ steps.sync.outputs.status }}"
+          exit 1
