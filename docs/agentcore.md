@@ -84,10 +84,10 @@ args = ["agentcore-bridge", "--runtime-arn", "arn:aws:...", "--region", "us-east
 
 ## Docker Image
 
-Use `ghcr.io/openabdev/openab-agentcore` — a minimal image (~20MB) with only the OAB binary. No Python, no coding CLI bundled.
+Use `ghcr.io/openabdev/openab:beta-agentcore` — a minimal image (~20MB) with only the OAB binary. No Python, no coding CLI bundled.
 
 ```bash
-docker pull ghcr.io/openabdev/openab-agentcore:latest
+docker pull ghcr.io/openabdev/openab:beta-agentcore
 ```
 
 ## Deploying a Kiro Runtime

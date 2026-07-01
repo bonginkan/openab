@@ -11,12 +11,21 @@ path = "src/main.rs"
 [dependencies]
 aws-config = "1.5"
 aws-sdk-ecs = "1.53"
+aws-sdk-ec2 = "1"
+aws-sdk-iam = "1"
 aws-sdk-s3 = "1.65"
 aws-sdk-ssm = "1.52"
+aws-sdk-sts = "1"
+aws-sdk-cloudwatchlogs = "1"
+aws-sdk-secretsmanager = "1"
 ecsctl = { git = "https://github.com/oablab/ecsctl.git", rev = "90a6cd1" }
 clap = { version = "4.5", features = ["derive"] }
+chrono = "0.4"
 serde = { version = "1.0", features = ["derive"] }
+serde_json = "1"
 serde_yaml = "0.9"
 tokio = { version = "1.40", features = ["full"] }
 toml = "0.8"
 anyhow = "1.0"
+dirs = "6"
+rpassword = "7"

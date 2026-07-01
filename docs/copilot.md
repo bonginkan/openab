@@ -59,7 +59,6 @@ helm install openab-copilot openab/openab \
   --set agents.copilot.discord.botToken="$DISCORD_BOT_TOKEN" \
   --set-string 'agents.copilot.discord.allowedChannels[0]=YOUR_CHANNEL_ID' \
   --set agents.copilot.discord.enabled=true \
-  --set agents.copilot.image=ghcr.io/openabdev/openab-copilot \
   --set agents.copilot.command=copilot \
   --set 'agents.copilot.args={--acp,--stdio}' \
   --set agents.copilot.persistence.enabled=true \
@@ -129,13 +128,34 @@ helm install openab-copilot openab/openab \
   --set agents.copilot.discord.enabled=true \
   --set agents.copilot.discord.botToken="$DISCORD_BOT_TOKEN" \
   --set-string 'agents.copilot.discord.allowedChannels[0]=YOUR_CHANNEL_ID' \
-  --set agents.copilot.image=ghcr.io/openabdev/openab-copilot \
   --set agents.copilot.command=copilot \
   --set 'agents.copilot.args={--acp,--stdio}' \
   --set agents.copilot.persistence.enabled=true \
   --set agents.copilot.workingDir=/home/node \
-  --set 'agents.copilot.env.COPILOT_GITHUB_TOKEN=github_pat_YOUR_TOKEN_HERE'  # optional, see Authentication
+  --set 'agents.copilot.env.COPILOT_GITHUB_TOKEN=github_pat_YOUR_TOKEN_HERE' \
+  --set image.tag=beta
 ```
+
+> `COPILOT_GITHUB_TOKEN` is optional — see Authentication section below.
+
+### Image Tag
+
+Use `--set image.tag=<version>` to set the image version globally.
+The chart auto-appends `-<agent>` to produce the final tag (see [image-tags.md](image-tags.md) for full details).
+
+| Tag | Resolves to | Description |
+|-----|-------------|-------------|
+| `beta` | `beta-copilot` | Floating beta channel (latest pre-release) |
+| `0.9.0-beta.2` | `0.9.0-beta.2-copilot` | Pinned to exact version |
+| `0.9` | `0.9-copilot` | Latest patch in minor (floating) |
+| `stable` | `stable-copilot` | Floating stable channel |
+
+To override a single agent's image instead of the global tag:
+```bash
+--set agents.copilot.image=ghcr.io/openabdev/openab:beta-copilot
+```
+
+> ⚠️ There is no `latest` tag. Use `beta` or `stable`, or pin to an exact version.
 
 ## Model Selection
 

@@ -1,0 +1,56 @@
+name: Build oabctl
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'Build target (linux-x86_64, linux-aarch64, macos-arm64)'
+        required: false
+        default: 'linux-x86_64'
+        type: choice
+        options:
+          - linux-x86_64
+          - linux-aarch64
+          - macos-arm64
+
+jobs:
+  build:
+    runs-on: ${{ inputs.target == 'macos-arm64' && 'macos-latest' || 'ubuntu-latest' }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ inputs.target == 'linux-aarch64' && 'aarch64-unknown-linux-gnu' || '' }}
+
+      - name: Install cross-compilation tools
+        if: inputs.target == 'linux-aarch64'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Build oabctl
+        working-directory: operator
+        run: |
+          if [ "${{ inputs.target }}" = "linux-aarch64" ]; then
+            export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+            cargo build --release --target aarch64-unknown-linux-gnu
+            cp target/aarch64-unknown-linux-gnu/release/oabctl .
+          else
+            cargo build --release
+            cp target/release/oabctl .
+          fi
+
+      - name: Package
+        working-directory: operator
+        run: tar czf oabctl-${{ inputs.target }}.tar.gz oabctl
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: oabctl-${{ inputs.target }}
+          path: operator/oabctl-${{ inputs.target }}.tar.gz
+          retention-days: 7

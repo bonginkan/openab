@@ -2,9 +2,17 @@
 FROM rust:1-bookworm AS builder
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
-RUN mkdir src && echo 'fn main() {}' > src/main.rs && cargo build --release && rm -rf src
+COPY crates/openab-core/Cargo.toml crates/openab-core/Cargo.toml
+COPY crates/openab-gateway/Cargo.toml crates/openab-gateway/Cargo.toml
+RUN mkdir -p src crates/openab-core/src crates/openab-gateway/src \
+    && echo 'fn main() {}' > src/main.rs \
+    && echo '' > crates/openab-core/src/lib.rs \
+    && echo '' > crates/openab-gateway/src/lib.rs \
+    && cargo build --release \
+    && rm -rf src crates/openab-core/src crates/openab-gateway/src
+COPY crates/ crates/
 COPY src/ src/
-RUN touch src/main.rs && cargo build --release
+RUN touch src/main.rs crates/openab-core/src/lib.rs crates/openab-gateway/src/lib.rs && cargo build --release
 
 # --- Runtime stage ---
 # MiMo-Code (https://github.com/XiaomiMiMo/MiMo-Code) is a fork of OpenCode
@@ -15,7 +23,7 @@ RUN touch src/main.rs && cargo build --release
 # ACP is supported via `mimo acp` (same JSON-RPC/stdio protocol as OpenCode).
 #
 # Version is pinned for reproducible builds.
-FROM node:22-bookworm-slim
+FROM node:22-trixie-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl procps ripgrep tini unzip && rm -rf /var/lib/apt/lists/*
 
 # Install MiMo-Code

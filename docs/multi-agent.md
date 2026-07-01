@@ -10,7 +10,6 @@ helm install openab openab/openab \
   --set-string 'agents.kiro.discord.allowedChannels[0]=KIRO_CHANNEL_ID' \
   --set agents.claude.discord.botToken="$CLAUDE_BOT_TOKEN" \
   --set-string 'agents.claude.discord.allowedChannels[0]=CLAUDE_CHANNEL_ID' \
-  --set agents.claude.image=ghcr.io/openabdev/openab-claude:latest \
   --set agents.claude.command=claude-agent-acp \
   --set agents.claude.workingDir=/home/node
 ```
@@ -30,17 +29,14 @@ helm install openab openab/openab \
   --set-string 'agents.kiro.discord.allowedChannels[0]=KIRO_CHANNEL_ID' \
   --set agents.claude.discord.botToken="$CLAUDE_BOT_TOKEN" \
   --set-string 'agents.claude.discord.allowedChannels[0]=CLAUDE_CHANNEL_ID' \
-  --set agents.claude.image=ghcr.io/openabdev/openab-claude:latest \
   --set agents.claude.command=claude-agent-acp \
   --set agents.claude.workingDir=/home/node \
   --set agents.codex.discord.botToken="$CODEX_BOT_TOKEN" \
   --set-string 'agents.codex.discord.allowedChannels[0]=CODEX_CHANNEL_ID' \
-  --set agents.codex.image=ghcr.io/openabdev/openab-codex:latest \
   --set agents.codex.command=codex-acp \
   --set agents.codex.workingDir=/home/node \
   --set agents.gemini.discord.botToken="$GEMINI_BOT_TOKEN" \
   --set-string 'agents.gemini.discord.allowedChannels[0]=GEMINI_CHANNEL_ID' \
-  --set agents.gemini.image=ghcr.io/openabdev/openab-gemini:latest \
   --set agents.gemini.command=gemini \
   --set agents.gemini.args='{--acp}' \
   --set agents.gemini.workingDir=/home/node

@@ -2,9 +2,17 @@
 FROM rust:1-bookworm AS builder
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
-RUN mkdir src && echo 'fn main() {}' > src/main.rs && cargo build --release && rm -rf src
+COPY crates/openab-core/Cargo.toml crates/openab-core/Cargo.toml
+COPY crates/openab-gateway/Cargo.toml crates/openab-gateway/Cargo.toml
+RUN mkdir -p src crates/openab-core/src crates/openab-gateway/src \
+    && echo 'fn main() {}' > src/main.rs \
+    && echo '' > crates/openab-core/src/lib.rs \
+    && echo '' > crates/openab-gateway/src/lib.rs \
+    && cargo build --release \
+    && rm -rf src crates/openab-core/src crates/openab-gateway/src
+COPY crates/ crates/
 COPY src/ src/
-RUN touch src/main.rs && cargo build --release
+RUN touch src/main.rs crates/openab-core/src/lib.rs crates/openab-gateway/src/lib.rs && cargo build --release
 
 # --- Build agy-acp adapter ---
 FROM rust:1-bookworm AS adapter-builder
@@ -15,11 +23,11 @@ COPY agy-acp/src/ src/
 RUN touch src/main.rs && cargo build --release
 
 # --- Runtime stage ---
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl procps tini unzip && rm -rf /var/lib/apt/lists/*
 
-# Install agy (Google Antigravity CLI) — pinned to v1.0.4
-ENV AGY_VERSION=1.0.6
+# Install agy (Google Antigravity CLI) — pinned version
+ENV AGY_VERSION=1.0.10
 RUN ARCH=$(dpkg --print-architecture) && \
     case "$ARCH" in \
       amd64) ASSET="agy_cli_linux_x64.tar.gz" ;; \

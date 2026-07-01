@@ -18,8 +18,28 @@ helm repo update
 
 helm install openab openab/openab \
   --set agents.kiro.discord.botToken="$DISCORD_BOT_TOKEN" \
-  --set-string 'agents.kiro.discord.allowedChannels[0]=YOUR_CHANNEL_ID'
+  --set-string 'agents.kiro.discord.allowedChannels[0]=YOUR_CHANNEL_ID' \
+  --set image.tag=beta
 ```
+
+### Image Tag
+
+Use `--set image.tag=<version>` to set the image version globally.
+The chart auto-appends `-<agent>` to produce the final tag (see [image-tags.md](image-tags.md) for full details).
+
+| Tag | Resolves to | Description |
+|-----|-------------|-------------|
+| `beta` | `beta-kiro` | Floating beta channel (latest pre-release) |
+| `0.9.0-beta.2` | `0.9.0-beta.2-kiro` | Pinned to exact version |
+| `0.9` | `0.9-kiro` | Latest patch in minor (floating) |
+| `stable` | `stable-kiro` | Floating stable channel |
+
+To override a single agent's image instead of the global tag:
+```bash
+--set agents.kiro.image=ghcr.io/openabdev/openab:beta-kiro
+```
+
+> ⚠️ There is no `latest` tag. Use `beta` or `stable`, or pin to an exact version.
 
 ## Manual config.toml
 
@@ -31,7 +51,99 @@ helm install openab openab/openab \
 
 ## Authentication
 
-Kiro CLI requires a one-time OAuth login. The PVC persists tokens across pod restarts.
+### Recommended: API Key (No Login Required)
+
+Kiro CLI supports API key authentication via the `KIRO_API_KEY` environment variable. This is the **recommended** approach — it requires no manual OAuth login and is fully managed by AWS Secrets Manager.
+
+#### Setup Steps
+
+1. **Enable API Keys in AWS Console** — Go to your AWS Console and search for "Kiro". Enable the API Keys feature. This option is only available through the AWS Console.
+2. **Generate your API Key** — Go to [kiro.dev](https://kiro.dev), log in, and generate your API key.
+3. **Store the key in AWS Secrets Manager** — Create a generic secret (e.g. secret name `kiro`) and store your API key as a key/value pair (e.g. key: `API_KEY`, value: your generated key).
+4. **Configure AWS credentials** — Make sure your runtime environment has AWS CLI or AWS credentials configured so OpenAB can retrieve the secret.
+5. **Configure `config.toml`** — Add the secret reference and environment variable:
+
+```toml
+[secrets.refs]
+kiro_api_key = "aws-sm://kiro#API_KEY"
+
+[agent]
+env = { KIRO_API_KEY = "${secrets.kiro_api_key}" }
+```
+
+That's it — you're all set. No OAuth login required.
+
+#### Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        One-time Setup                           │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  ┌───────────────┐      ┌───────────┐      ┌────────────────┐   │
+│  │  AWS Console  │      │ kiro.dev  │      │ AWS Secrets Mgr│   │
+│  │               │      │           │      │                │   │
+│  │ Enable Kiro   │      │ Generate  │      │ Secret: "kiro" │   │
+│  │ API Keys      │      │ API Key   │─────▶│ Key: API_KEY   │   │
+│  └───────────────┘      └───────────┘      │ Val: sk-xxxxx  │   │
+│        ①                      ②            └───────┬────────┘   │
+│                                                    │ ③          │
+└────────────────────────────────────────────────────┼────────────┘
+                                                     │
+┌────────────────────────────────────────────────────┼────────────┐
+│                     Runtime (automatic)            │            │
+├────────────────────────────────────────────────────┼────────────┤
+│                                                    │            │
+│  ┌──────────────────────┐         ④ resolve        │            │
+│  │       OpenAB         │◀──────────────────-──────┘            │
+│  │                      │  aws-sm://kiro#API_KEY                │
+│  │  config.toml:        │                                       │
+│  │  env = { KIRO_API_KEY│                                       │
+│  │    = "${secrets...}"}│                                       │
+│  └──────────┬───────────┘                                       │
+│             │ ⑤ inject env                                      │
+│             ▼                                                   │
+│  ┌──────────────────────┐         ⑥ authenticate                │
+│  │     Kiro CLI         │────────────────────────▶ Kiro API     │
+│  │                      │      KIRO_API_KEY ✅                  │
+│  │  No login needed!    │                                       │
+│  └──────────────────────┘                                       │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+```mermaid
+sequenceDiagram
+    participant User as User (one-time setup)
+    participant Console as AWS Console
+    participant Kiro as kiro.dev
+    participant SM as AWS Secrets Manager
+    participant OAB as OpenAB
+    participant CLI as Kiro CLI
+
+    Note over User,SM: One-time setup
+    User->>Console: 1. Enable Kiro API Keys
+    User->>Kiro: 2. Generate API Key
+    User->>SM: 3. Store key in secret "kiro" (key: API_KEY)
+
+    Note over OAB,CLI: Runtime (automatic)
+    OAB->>SM: 4. Resolve aws-sm://kiro#API_KEY
+    SM-->>OAB: Return API key value
+    OAB->>CLI: 5. Inject as KIRO_API_KEY env var
+    CLI->>Kiro: 6. Authenticate with API key ✅
+```
+
+#### How It Works
+
+1. OpenAB starts and resolves `aws-sm://kiro#API_KEY` — fetches the `API_KEY` field from the AWS Secrets Manager secret named `kiro`.
+2. The resolved value is injected into the agent container as the `KIRO_API_KEY` environment variable.
+3. Kiro CLI detects `KIRO_API_KEY` and uses it directly — **no OAuth flow, no device code, no manual intervention**.
+
+This makes the entire Kiro deployment **zero-touch** — fully automated with no login step required.
+
+### Alternative: OAuth Device Flow (Legacy)
+
+If you cannot use an API key, Kiro CLI falls back to the OAuth device code flow. The PVC persists tokens across pod restarts.
 
 ```bash
 kubectl exec -it deployment/openab-kiro -- sh -c "$OPENAB_AGENT_AUTH_COMMAND"

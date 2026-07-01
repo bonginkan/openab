@@ -18,14 +18,33 @@ helm install openab openab/openab \
   --set agents.grok.discord.enabled=true \
   --set agents.grok.discord.botToken="$DISCORD_BOT_TOKEN" \
   --set-string 'agents.grok.discord.allowedChannels[0]=YOUR_CHANNEL_ID' \
-  --set agents.grok.image=ghcr.io/openabdev/openab-grok:latest \
   --set agents.grok.command=grok \
   --set-string 'agents.grok.args[0]=agent' \
   --set-string 'agents.grok.args[1]=stdio' \
-  --set agents.grok.workingDir=/home/agent
+  --set agents.grok.workingDir=/home/agent \
+  --set image.tag=beta
 ```
 
 > Set `agents.kiro.enabled=false` to disable the default Kiro agent.
+
+### Image Tag
+
+Use `--set image.tag=<version>` to set the image version globally.
+The chart auto-appends `-<agent>` to produce the final tag (see [image-tags.md](image-tags.md) for full details).
+
+| Tag | Resolves to | Description |
+|-----|-------------|-------------|
+| `beta` | `beta-grok` | Floating beta channel (latest pre-release) |
+| `0.9.0-beta.2` | `0.9.0-beta.2-grok` | Pinned to exact version |
+| `0.9` | `0.9-grok` | Latest patch in minor (floating) |
+| `stable` | `stable-grok` | Floating stable channel |
+
+To override a single agent's image instead of the global tag:
+```bash
+--set agents.grok.image=ghcr.io/openabdev/openab:beta-grok
+```
+
+> ⚠️ There is no `latest` tag. Use `beta` or `stable`, or pin to an exact version.
 
 ## Manual config.toml
 

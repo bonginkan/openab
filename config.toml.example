@@ -42,6 +42,11 @@ allowed_channels = ["1234567890"]       # ↑ omitted + non-empty list → auto-
 #                                       # post+edit + emoji reactions. Requires the Slack app to be
 #                                       # an AI app with the `assistant:write` scope (plus chat:write).
 #                                       # Set false for non-AI Slack apps to keep emoji reactions.
+# streaming = true                     # default true: stream the reply live (native or post+edit).
+#                                       # Set false to always post a single final message (send-once),
+#                                       # regardless of assistant_mode — useful in multi-agent threads
+#                                       # to avoid streamed-edit states re-firing app_mention.
+#                                       # What a send-once message *contains* is controlled by [reactions] narration_display.
 
 # [gateway]
 # url = "ws://openab-gateway:8080/ws"  # WebSocket URL of the custom gateway
@@ -56,6 +61,17 @@ allowed_channels = ["1234567890"]       # ↑ omitted + non-empty list → auto-
 # allowed_users = ["U5678"]             # only checked when allow_all_users = false
 # streaming = true                      # enable streaming (typewriter) mode
 # streaming_placeholder = false         # set false for draft-based platforms (e.g. Telegram Rich Messages)
+
+# --- Telegram (first-class section; alternative to TELEGRAM_* env vars) ---
+# Config-authoritative with ${} expansion; each field falls back to its
+# TELEGRAM_* env var when unset, then to a default. Symmetric with [discord].
+# [telegram]
+# bot_token           = "${TELEGRAM_BOT_TOKEN}"     # env fallback: TELEGRAM_BOT_TOKEN
+# secret_token        = "${TELEGRAM_SECRET_TOKEN}"  # env fallback: TELEGRAM_SECRET_TOKEN
+# trusted_source_only = true            # reject IPs outside Telegram subnets (default false)
+# rich_messages       = true            # sendRichMessage rendering (default true)
+# streaming           = true            # override; defaults to follow rich_messages
+# webhook_path        = "/webhook/telegram"   # default /webhook/telegram
 
 # --- AgentCore Runtime (alternative to [agent]) ---
 # When [agentcore] is set and [agent].command is not explicitly provided,
@@ -130,6 +146,14 @@ working_dir = "/home/agent"
 # # Run `opencode auth login` once before starting openab.
 
 # [agent]
+# command = "devin"
+# args = ["acp"]
+# working_dir = "/home/agent"
+# # Devin CLI (Cognition AI) with native ACP support.
+# # Requires a Devin subscription (Enterprise or individual).
+# # Auth: kubectl exec -it <pod> -- devin auth login --force-manual-token-flow
+
+# [agent]
 # command = "mimo"
 # args = ["acp"]
 # working_dir = "/home/node"
@@ -198,6 +222,12 @@ remove_after_reply = false
 #                                       # Controls how tool calls appear in the final message.
 #                                       # Applies to both assistant_mode and post+edit mode.
 #                                       # Set "none" to hide the tool summary entirely.
+# narration_display = false             # default false: in send-once mode, deliver ONLY the final
+#                                       # answer block (text after the last tool call); inter-tool
+#                                       # narration ("let me check… / now reading X") is dropped.
+#                                       # Set true to keep the full text. Platform-agnostic (Slack
+#                                       # streaming=false, multi-bot threads, gateway). No effect
+#                                       # while streaming — streamed text is shown live as produced.
 
 [reactions.emojis]
 queued = "👀"
@@ -256,3 +286,37 @@ error_hold_ms = 2500
 # openab = "~/projects/openab"
 # infra  = "~/projects/infra-cdk"
 # web    = "~/projects/frontend"
+
+# --- Pre-seed: download & extract S3 zip archives before pre_boot ---
+# Seeds the agent environment (configs, tools, memory) before any hook runs.
+# Archives are extracted in order — later layers overwrite earlier ones (like container layers).
+# Max 5 sources. Only s3:// URIs with .zip format are supported.
+# Requires the `pre-seed` feature flag (opt-in).
+#
+# [hooks.pre_seed]
+# sources = [
+#   "s3://my-bucket/base-env.zip",            # Layer 1: base tools & configs
+#   "s3://my-bucket/shared-memory.zip",       # Layer 2: shared team memory
+#   "s3://my-bucket/agent-specific.zip",      # Layer 3: agent-specific overrides
+# ]
+# target = "/home/agent"                      # extraction target (default: $HOME)
+# max_bytes = 104857600                       # max compressed zip size (default: 100 MiB)
+# timeout_seconds = 300                       # per-source timeout (default: 300)
+# on_failure = "abort"                        # "abort" or "warn" (default: "abort")
+# region = "us-west-2"                        # optional: override AWS region
+# endpoint_url = "http://localhost:4566"      # optional: LocalStack / VPC endpoint
+
+# --- Ambient Mode ---
+# Passive channel observation: bot listens without @mention and decides when to reply.
+# [ambient]
+# enabled = true
+# flush_interval_seconds = 60               # ±20% jitter applied
+# flush_max_messages = 10                   # flush when N messages buffered
+# flush_hard_cap = 50                       # safety cap on buffer
+# max_concurrent_flushes = 3               # global LLM concurrency
+# flush_timeout_seconds = 120              # safety timeout per flush
+# instructions_file = "~/.openab/config/ambient.md"  # custom system prompt (first 2000 chars)
+#
+# [ambient.discord]
+# channels = ["1234567890"]                # channel IDs to observe
+# allow_bot_messages = false               # include other bots in buffer

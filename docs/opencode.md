@@ -38,14 +38,33 @@ helm install openab openab/openab \
   --set agents.opencode.enabled=true \
   --set agents.opencode.command=opencode \
   --set 'agents.opencode.args={acp}' \
-  --set agents.opencode.image=ghcr.io/openabdev/openab-opencode:latest \
   --set agents.opencode.discord.botToken="$DISCORD_BOT_TOKEN" \
   --set-string 'agents.opencode.discord.allowedChannels[0]=YOUR_CHANNEL_ID' \
   --set agents.opencode.workingDir=/home/node \
-  --set agents.opencode.pool.maxSessions=3
+  --set agents.opencode.pool.maxSessions=3 \
+  --set image.tag=beta
 ```
 
 > Set `agents.kiro.enabled=false` to disable the default Kiro agent.
+
+### Image Tag
+
+Use `--set image.tag=<version>` to set the image version globally.
+The chart auto-appends `-<agent>` to produce the final tag (see [image-tags.md](image-tags.md) for full details).
+
+| Tag | Resolves to | Description |
+|-----|-------------|-------------|
+| `beta` | `beta-opencode` | Floating beta channel (latest pre-release) |
+| `0.9.0-beta.2` | `0.9.0-beta.2-opencode` | Pinned to exact version |
+| `0.9` | `0.9-opencode` | Latest patch in minor (floating) |
+| `stable` | `stable-opencode` | Floating stable channel |
+
+To override a single agent's image instead of the global tag:
+```bash
+--set agents.opencode.image=ghcr.io/openabdev/openab:beta-opencode
+```
+
+> ⚠️ There is no `latest` tag. Use `beta` or `stable`, or pin to an exact version.
 
 ## Manual config.toml
 

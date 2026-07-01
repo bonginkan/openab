@@ -1,3 +1,4 @@
+use crate::bootstrap::BootstrapState;
 use crate::manifest::{OABFleetManifest, OABServiceManifest, RawManifest, Runtime};
 use anyhow::{Context, Result};
 use aws_sdk_ecs::types::{
@@ -7,12 +8,42 @@ use aws_sdk_ecs::types::{
 use aws_sdk_s3::primitives::ByteStream;
 use std::path::Path;
 
-pub async fn run(aws_config: &aws_config::SdkConfig, file_path: &str) -> Result<()> {
+/// Try to load bootstrap state for networking defaults (used in future for auto-fill)
+#[allow(dead_code)]
+async fn load_bootstrap_state(config: &aws_config::SdkConfig) -> Option<BootstrapState> {
+    let sts = aws_sdk_sts::Client::new(config);
+    let account = sts.get_caller_identity().send().await.ok()?
+        .account()?.to_string();
+    let bucket = format!("oab-control-plane-{account}");
+    let s3 = aws_sdk_s3::Client::new(config);
+    crate::bootstrap::load_state_pub(&s3, &bucket).await.ok().flatten()
+}
+
+pub async fn run(aws_config: &aws_config::SdkConfig, file_path: &str, sync_config: bool, wait: bool) -> Result<()> {
     let path = Path::new(file_path);
     let manifests = load_manifests(path)?;
 
     if manifests.is_empty() {
         anyhow::bail!("no manifests found at {}", file_path);
+    }
+
+    // --sync: upload local config.toml to S3 configFrom path
+    if sync_config {
+        let s3 = aws_sdk_s3::Client::new(aws_config);
+        for m in &manifests {
+            let config_path = path.parent().unwrap_or(Path::new(".")).join("config.toml");
+            if config_path.exists() && !m.spec.config_from.is_empty() {
+                let body = aws_sdk_s3::primitives::ByteStream::from_path(&config_path).await
+                    .context("failed to read local config.toml")?;
+                // Parse s3://bucket/key from configFrom
+                if let Some(s3_path) = m.spec.config_from.strip_prefix("s3://") {
+                    let (bucket, key) = s3_path.split_once('/').context("invalid configFrom S3 URI")?;
+                    s3.put_object().bucket(bucket).key(key).body(body).send().await
+                        .context("failed to sync config.toml to S3")?;
+                    eprintln!("  ⬆ Synced config.toml → {}", m.spec.config_from);
+                }
+            }
+        }
     }
 
     let ecs = aws_sdk_ecs::Client::new(aws_config);
@@ -31,7 +62,7 @@ pub async fn run(aws_config: &aws_config::SdkConfig, file_path: &str) -> Result<
 
     for m in &manifests {
         println!("  Applying {} (ECS)...", m.metadata.name);
-        apply_ecs(&ecs, &s3, m).await?;
+        apply_ecs(&ecs, &s3, aws_config, m, wait).await?;
     }
 
     println!("\n{} service(s) applied.", manifests.len());
@@ -83,7 +114,9 @@ fn parse_manifest_file(path: &Path) -> Result<Vec<OABServiceManifest>> {
 async fn apply_ecs(
     ecs: &aws_sdk_ecs::Client,
     s3: &aws_sdk_s3::Client,
+    config: &aws_config::SdkConfig,
     m: &OABServiceManifest,
+    wait: bool,
 ) -> Result<()> {
     let ecs_rt = match &m.spec.runtime {
         Runtime::Ecs(rt) => rt,
@@ -91,8 +124,16 @@ async fn apply_ecs(
     };
 
     let service_name = m.ecs_service_name();
-    let bucket = std::env::var("OAB_CONTROL_PLANE_BUCKET")
-        .unwrap_or_else(|_| "oab-control-plane".to_string());
+    let bucket = if let Some(b) = crate::config::OabConfig::load().ok().and_then(|c| c.bucket()) {
+        b
+    } else {
+        // Fallback: derive from account ID
+        let sts = aws_sdk_sts::Client::new(config);
+        let account = sts.get_caller_identity().send().await
+            .ok().and_then(|r| r.account().map(|a| a.to_string()))
+            .unwrap_or_else(|| "unknown".to_string());
+        format!("oab-control-plane-{account}")
+    };
 
     // Read current generation from S3 manifest (if exists), increment
     let manifest_key = format!("manifests/{}/{}.yaml", m.metadata.namespace, m.metadata.name);
@@ -187,7 +228,7 @@ async fn apply_ecs(
     // Check if service exists
     let existing = ecs
         .describe_services()
-        .cluster("default")
+        .cluster("oab")
         .services(&service_name)
         .send()
         .await;
@@ -200,7 +241,7 @@ async fn apply_ecs(
 
     if service_active {
         ecs.update_service()
-            .cluster("default")
+            .cluster("oab")
             .service(&service_name)
             .task_definition(&task_def_arn)
             .network_configuration(network_config)
@@ -215,7 +256,7 @@ async fn apply_ecs(
             .build()?;
 
         ecs.create_service()
-            .cluster("default")
+            .cluster("oab")
             .service_name(&service_name)
             .task_definition(&task_def_arn)
             .desired_count(1)
@@ -230,5 +271,32 @@ async fn apply_ecs(
         );
     }
 
+    if wait {
+        eprintln!("  ⏳ Waiting for {} to stabilize...", m.metadata.name);
+        wait_for_stable(ecs, "oab", &service_name).await?;
+        eprintln!("  ✓ {} is stable", m.metadata.name);
+    }
+
     Ok(())
+}
+
+async fn wait_for_stable(ecs: &aws_sdk_ecs::Client, cluster: &str, service: &str) -> Result<()> {
+    for _ in 0..60 {
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        let resp = ecs.describe_services()
+            .cluster(cluster)
+            .services(service)
+            .send().await?;
+        if let Some(svc) = resp.services().first() {
+            let deployments = svc.deployments();
+            if deployments.len() == 1 {
+                if let Some(d) = deployments.first() {
+                    if d.running_count() == d.desired_count() && d.rollout_state() == Some(&aws_sdk_ecs::types::DeploymentRolloutState::Completed) {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+    }
+    anyhow::bail!("timed out waiting for service to stabilize (5 min)")
 }

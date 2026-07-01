@@ -4,7 +4,7 @@ on:
   pull_request:
     paths:
       - "src/**"
-      - "gateway/**"
+      - "crates/**"
       - "operator/**"
       - "Cargo.toml"
       - "Cargo.lock"
@@ -18,7 +18,6 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       core: ${{ steps.filter.outputs.core }}
-      gateway: ${{ steps.filter.outputs.gateway }}
       operator: ${{ steps.filter.outputs.operator }}
     steps:
       - uses: actions/checkout@v6
@@ -29,8 +28,7 @@ jobs:
           BASE=${{ github.event.pull_request.base.sha }}
           HEAD=${{ github.event.pull_request.head.sha }}
           CHANGED=$(git diff --name-only "$BASE" "$HEAD")
-          echo "core=$(echo "$CHANGED" | grep -qE '^(src/|Cargo\.(toml|lock))' && echo true || echo false)" >> "$GITHUB_OUTPUT"
-          echo "gateway=$(echo "$CHANGED" | grep -q '^gateway/' && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          echo "core=$(echo "$CHANGED" | grep -qE '^(src/|crates/|Cargo\.(toml|lock))' && echo true || echo false)" >> "$GITHUB_OUTPUT"
           echo "operator=$(echo "$CHANGED" | grep -q '^operator/' && echo true || echo false)" >> "$GITHUB_OUTPUT"
 
   check:
@@ -44,33 +42,16 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - name: cargo check
-        run: cargo check
+        run: cargo check --workspace
       - name: cargo clippy
-        run: cargo clippy -- -D warnings
+        run: cargo clippy --workspace -- -D warnings
+      - name: cargo clippy (unified)
+        run: cargo clippy --workspace --features unified -- -D warnings
       - name: cargo test
-        run: cargo test
+        run: cargo test --workspace
 
-  gateway:
-    needs: changes
-    if: needs.changes.outputs.gateway == 'true'
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: gateway
-    steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: gateway
-      - name: cargo check
-        run: cargo check
-      - name: cargo clippy
-        run: cargo clippy -- -D warnings
-      - name: cargo test
-        run: cargo test
+  # gateway tests are now covered by `cargo test --workspace` in the check job above
+  # (openab-gateway is a workspace member in crates/openab-gateway/)
 
   operator:
     needs: changes

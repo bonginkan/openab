@@ -58,7 +58,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: gateway/Dockerfile
+          file: Dockerfile.gateway
           platforms: ${{ matrix.platform.os }}
           outputs: type=image,name=${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=${{ inputs.dry_run != true }}
           cache-from: type=gha,scope=gateway-${{ matrix.platform.os }}
@@ -146,9 +146,11 @@ jobs:
           TAG="${{ steps.tag.outputs.tag }}"
           VERSION="${{ steps.tag.outputs.version }}"
           cat > /tmp/release-notes.md << EOF
-          ## OpenAB Custom Gateway v${VERSION}
+          ## OpenAB Gateway v${VERSION}
 
-          Standalone gateway service — bridges webhook-based platforms to OAB via WebSocket.
+          Unified binary with all gateway adapters (Telegram, LINE, Feishu, Google Chat, WeCom, Teams) compiled in via \`BUILD_MODE=unified\`.
+
+          > **Note**: This image contains the full openab binary with all adapters enabled, not a standalone gateway process. It replaces the previous standalone gateway binary.
 
           ### Docker
 
@@ -160,7 +162,7 @@ jobs:
 
           ### Links
 
-          - [Gateway README](https://github.com/openabdev/openab/blob/main/gateway/README.md)
+          - [Gateway Crate README](https://github.com/openabdev/openab/blob/main/crates/openab-gateway/README.md)
           - [ADR: Custom Gateway](https://github.com/openabdev/openab/blob/main/docs/adr/custom-gateway.md)
           EOF
           sed -i 's/^          //' /tmp/release-notes.md

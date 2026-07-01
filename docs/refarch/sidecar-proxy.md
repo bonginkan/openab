@@ -64,7 +64,6 @@ kubectl create secret generic auth-proxy-tokens \
 helm install openab openab/openab \
   --set agents.mybot.command=opencode \
   --set-json 'agents.mybot.args=["acp"]' \
-  --set agents.mybot.image=ghcr.io/openabdev/openab-opencode \
   --set-json 'agents.mybot.extraContainers=[{"name":"auth-proxy","image":"ghcr.io/openabdev/openab-auth-proxy:latest","args":["serve","--bind","0.0.0.0"],"ports":[{"containerPort":9090}],"volumeMounts":[{"name":"data","mountPath":"/home/agent"}]}]' \
   --set-json 'agents.mybot.extraInitContainers=[{"name":"copy-tokens","image":"busybox","command":["sh","-c","mkdir -p /dest/.openab-auth-proxy/xai && cp /src/tokens.json /dest/.openab-auth-proxy/xai/tokens.json"],"volumeMounts":[{"name":"tokens-src","mountPath":"/src","readOnly":true},{"name":"data","mountPath":"/dest"}]}]' \
   --set-json 'agents.mybot.extraVolumes=[{"name":"tokens-src","secret":{"secretName":"auth-proxy-tokens"}}]'

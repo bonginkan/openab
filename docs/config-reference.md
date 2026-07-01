@@ -17,11 +17,52 @@ openab run -c https://example.com/config.toml
 
 # Remote URL via HTTP (warns — avoid in production; config contains secrets)
 openab run -c http://internal.example.com/config.toml
+
+# Amazon S3 (or S3-compatible) object
+openab run -c s3://my-bucket/path/to/config.toml
 ```
 
 Remote config is fetched via HTTP GET with a 10-second timeout and a 1 MiB response size limit. Environment variable expansion (`${VAR}`) works identically on both local and remote config content.
 
 > **Security best practice:** Never hardcode secrets in remote config files. Use environment variable references like `bot_token = "${DISCORD_BOT_TOKEN}"` and inject the actual values via local environment variables or Kubernetes Secrets. For centralized secret management with rotation and audit, use `[secrets.refs]` with AWS Secrets Manager or an exec provider — see [secrets-management.md](secrets-management.md). OpenAB expands `${VAR}` identically for both local and remote config.
+
+### `s3://` config source
+
+`openab run -c s3://<bucket>/<key>` fetches the config object directly from Amazon S3
+(requires a build with the `config-s3` feature, which is on by default). The same
+1 MiB size cap, UTF-8 validation, and `${VAR}` expansion apply as for HTTP(S) sources.
+
+**Credential & region resolution** uses the standard AWS provider chain — the same
+mechanism as `aws-sm://` secret references:
+
+- environment variables (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`),
+- shared config/credentials files (`~/.aws/...`),
+- container/instance roles: **IRSA / EKS Pod Identity** (Kubernetes) or the **ECS task role** / EC2 instance role.
+
+There is no `[s3]` config section for this: the credentials needed to *fetch* the
+config cannot live *inside* the config you are fetching. Configure the bootstrap S3
+access via the environment/role above.
+
+**Minimum IAM policy** — scope the role to only the config prefix, never `Resource: "*"`:
+
+```json
+{
+  "Effect": "Allow",
+  "Action": ["s3:GetObject"],
+  "Resource": "arn:aws:s3:::my-bucket/path/to/*"
+}
+```
+
+> **Secrets still never belong in the config object.** The `s3://` loader does not
+> resolve secrets — it only fetches text and expands `${VAR}`. Keep secrets out of the
+> S3 object and inject them via env vars / `[secrets.refs]` as above.
+
+> **S3-compatible stores (Cloudflare R2, MinIO):** R2 generally works by setting
+> `AWS_ENDPOINT_URL_S3` (plus R2 keys and `AWS_REGION=auto`). MinIO and some others
+> additionally require path-style addressing, which the standard AWS env vars do not
+> cover yet — explicit endpoint / path-style support is tracked as a follow-up. Only
+> point the endpoint at trusted hosts; a poisoned endpoint env var could redirect the
+> fetch to a malicious server.
 
 ---
 
@@ -86,6 +127,8 @@ Custom Gateway adapter for platforms like Telegram, LINE, Feishu/Lark, and Googl
 | `allowed_channels` | string[] | `[]` | Chat/group IDs to allow. Only checked when `allow_all_channels` resolves to false. |
 | `allow_all_users` | bool \| omit | auto-detect | `true` = any user; `false` = only `allowed_users`. Omitted = inferred from list. |
 | `allowed_users` | string[] | `[]` | User IDs to allow. Only checked when `allow_all_users` resolves to false. |
+| `allow_bot_messages` | bool | `false` | Allow messages from bots. Unlike Discord/Slack (which use an enum with `"off"`/`"mentions"`/`"all"`), the gateway adapter uses a simple boolean: `true` = allow all bots, `false` = block (unless in `trusted_bot_ids`). |
+| `trusted_bot_ids` | string[] | `[]` | Bot IDs that bypass the bot filter even when `allow_bot_messages = false`. |
 | `streaming` | bool | `false` | Enable streaming (typewriter) mode — requires the gateway platform to support message editing. |
 | `streaming_placeholder` | bool | `true` | Show "…" placeholder at streaming start. Set `false` for platforms using drafts (e.g. Telegram Rich Messages). |
 | `message_processing_mode` | string | `"per-message"` | Same as Discord. See [Message Dispatch Modes](message-dispatch-modes.md). |
@@ -242,7 +285,39 @@ Session pool settings for managing concurrent agent sessions.
 
 ## `[hooks]`
 
-Lifecycle hooks that run custom scripts at specific points during the container lifecycle. See [hooks.md](hooks.md) for full documentation and examples.
+Lifecycle hooks that run at specific points during the container lifecycle. See [hooks.md](hooks.md) for full documentation and examples.
+
+### `[hooks.pre_seed]`
+
+Downloads and extracts archives from S3 before `pre_boot`. Seeds the agent environment with configs, tools, and shared memory without requiring AWS CLI in the image.
+
+> `pre-seed` is enabled by default. No feature flag needed.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `sources` | string[] | `[]` | S3 URIs of archives (`.zip`, `.tar.gz`, `.tgz`). Max 5. Extracted in order; later layers overwrite earlier ones. |
+| `target` | string | `$HOME` | Extraction target directory. |
+| `max_bytes` | u64 | `104857600` | Max compressed archive size in bytes (100 MiB). Rejects downloads exceeding this. |
+| `timeout_seconds` | u64 | `300` | Per-source download+extract timeout in seconds. |
+| `on_failure` | string | `"abort"` | `"abort"` exits openab; `"warn"` logs and continues. |
+| `region` | string | — | Override AWS region for S3 access. |
+| `endpoint_url` | string | — | Override S3 endpoint URL (for LocalStack, VPC endpoints). |
+
+**Credential resolution** uses the standard AWS provider chain (same as `config-s3` and `secrets-aws`):
+environment variables, shared credentials, IRSA / EKS Pod Identity, ECS task role.
+
+**Integrity verification:** If S3 objects are uploaded with `--checksum-algorithm SHA256`, OpenAB automatically verifies the checksum on download. No config needed — see [hooks.md](hooks.md) for details.
+
+```toml
+[hooks.pre_seed]
+sources = [
+  "s3://my-bucket/base-env.tar.gz",
+  "s3://my-bucket/shared-memory.zip",
+  "s3://my-bucket/agent-overrides.tgz",
+]
+timeout_seconds = 300
+on_failure = "abort"
+```
 
 ### `[hooks.pre_boot]`
 
@@ -434,6 +509,32 @@ web    = "~/projects/frontend"
 
 ---
 
+## `[ambient]`
+
+Passive channel listening with batch flush. See [ambient.md](ambient.md) for full guide.
+
+```toml
+[ambient]
+enabled = false                   # Master switch
+flush_interval_seconds = 60       # Time trigger (±20% jitter)
+flush_max_messages = 10           # Count trigger
+flush_hard_cap = 50               # Max buffer size
+max_concurrent_flushes = 3        # Global LLM concurrency limit
+flush_timeout_seconds = 120       # Safety timeout per flush
+context_window = 20               # (v2, not yet implemented)
+
+[ambient.pool]                    # (v2, not yet enforced)
+max_sessions = 5
+session_ttl_minutes = 60
+context_flushes = 3
+
+[ambient.discord]
+channels = []                     # Channel ID allowlist — and their threads (required)
+allow_bot_messages = true
+```
+
+---
+
 ## `[cron]`
 
 Everything cron-related lives under `[cron]`.
@@ -600,3 +701,44 @@ bot_token = "${DISCORD_BOT_TOKEN}"
 ```
 
 Undefined variables resolve to an empty string.
+
+---
+
+## Unified Mode Environment Variables
+
+When running with `BUILD_MODE=unified`, the binary embeds a webhook server for gateway platforms. These env vars control its behavior:
+
+### Server
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `GATEWAY_LISTEN` | `0.0.0.0:8080` | Bind address for the embedded webhook server |
+
+### Security Gating
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `GATEWAY_ALLOW_ALL_CHANNELS` | `true` | Accept events from any channel. **Set to `false` in production** and use `GATEWAY_ALLOWED_CHANNELS`. |
+| `GATEWAY_ALLOWED_CHANNELS` | _(empty)_ | Comma-separated channel IDs to allow (when `GATEWAY_ALLOW_ALL_CHANNELS=false`) |
+| `GATEWAY_ALLOW_ALL_USERS` | `true` | Accept events from any user. **Set to `false` in production** and use `GATEWAY_ALLOWED_USERS`. |
+| `GATEWAY_ALLOWED_USERS` | _(empty)_ | Comma-separated user IDs to allow (when `GATEWAY_ALLOW_ALL_USERS=false`) |
+| `GATEWAY_ALLOW_BOT_MESSAGES` | `false` | Allow messages from all bots (for multi-agent scenarios) |
+| `GATEWAY_TRUSTED_BOT_IDS` | _(empty)_ | Comma-separated bot IDs to allow even when `GATEWAY_ALLOW_BOT_MESSAGES=false` |
+| `GATEWAY_BOT_USERNAME` | _(empty)_ | Bot's username for @mention detection in groups |
+
+### Platform Adapters
+
+Each platform is auto-enabled when its env vars are present:
+
+| Platform | Required Env Var | Optional |
+|----------|-----------------|----------|
+| Telegram | `TELEGRAM_BOT_TOKEN` | `TELEGRAM_SECRET_TOKEN`, `TELEGRAM_WEBHOOK_PATH`, `TELEGRAM_RICH_MESSAGES` |
+| LINE | `LINE_CHANNEL_SECRET` | `LINE_CHANNEL_ACCESS_TOKEN` |
+| Feishu | `FEISHU_APP_ID` | `FEISHU_WEBHOOK_PATH` |
+| Google Chat | `GOOGLE_CHAT_ENABLED=true` | `GOOGLE_CHAT_SA_KEY_JSON`, `GOOGLE_CHAT_SA_KEY_FILE`, `GOOGLE_CHAT_ACCESS_TOKEN`, `GOOGLE_CHAT_AUDIENCE`, `GOOGLE_CHAT_WEBHOOK_PATH` |
+| WeCom | `WECOM_CORP_ID` | _(see wecom config)_ |
+| Teams | `TEAMS_APP_ID` | `TEAMS_WEBHOOK_PATH` |
+
+> ⚠️ **Production checklist**: Set `GATEWAY_ALLOW_ALL_CHANNELS=false` and `GATEWAY_ALLOW_ALL_USERS=false` with explicit allowlists. The defaults are permissive for development convenience.
+>
+> ⚠️ **Google Chat JWT**: When `GOOGLE_CHAT_AUDIENCE` is unset, webhook requests are **not** verified via JWT. Set this to your Google Chat app's project number or service account email in production to enable request authentication. If `GOOGLE_CHAT_SA_KEY_FILE` is set but the file cannot be read, the adapter starts without token authentication (warn logged).

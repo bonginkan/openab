@@ -22,17 +22,26 @@ on:
         type: boolean
         default: false
 
+concurrency:
+  group: build-operator-${{ github.ref_name }}
+  cancel-in-progress: false
+
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
+  # All agent variants built from Dockerfile.unified targets.
+  AGENTS: "kiro,claude,codex,copilot,cursor,devin,gemini,grok,hermes,mimocode,opencode,antigravity,pi,native,agentcore"
 
 jobs:
   resolve-tag:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     outputs:
       tag: ${{ steps.resolve.outputs.tag }}
       chart_version: ${{ steps.resolve.outputs.chart_version }}
       is_prerelease: ${{ steps.resolve.outputs.is_prerelease }}
+      agents: ${{ steps.resolve.outputs.agents }}
     steps:
       - name: Resolve and validate tag
         id: resolve
@@ -58,36 +67,26 @@ jobs:
             IS_PRERELEASE="false"
           fi
 
+          # Build agent matrix as JSON array + validate against allowlist
+          ALLOWED="${{ env.AGENTS }}"
+          AGENTS_JSON=$(echo "$ALLOWED" | tr ',' '\n' | sed 's/^ *//;s/ *$//' | jq -R . | jq -sc .)
+
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
           echo "chart_version=${CHART_VERSION}" >> "$GITHUB_OUTPUT"
           echo "is_prerelease=${IS_PRERELEASE}" >> "$GITHUB_OUTPUT"
+          echo "agents=${AGENTS_JSON}" >> "$GITHUB_OUTPUT"
 
-  # ── Pre-release path: full build ──────────────────────────────
+  # ── Pre-release path: unified build ──────────────────────────────
 
-  build-image:
+  build-core:
     needs: resolve-tag
     if: ${{ needs.resolve-tag.outputs.is_prerelease == 'true' }}
     strategy:
+      fail-fast: true
       matrix:
-        variant:
-          - { suffix: "", dockerfile: "Dockerfile", artifact: "default" }
-          - { suffix: "-codex", dockerfile: "Dockerfile.codex", artifact: "codex" }
-          - { suffix: "-claude", dockerfile: "Dockerfile.claude", artifact: "claude" }
-          - { suffix: "-gemini", dockerfile: "Dockerfile.gemini", artifact: "gemini" }
-          - { suffix: "-copilot", dockerfile: "Dockerfile.copilot", artifact: "copilot" }
-          - { suffix: "-opencode", dockerfile: "Dockerfile.opencode", artifact: "opencode" }
-          - { suffix: "-cursor", dockerfile: "Dockerfile.cursor", artifact: "cursor" }
-          - { suffix: "-hermes", dockerfile: "Dockerfile.hermes", artifact: "hermes" }
-          - { suffix: "-agentcore", dockerfile: "Dockerfile.agentcore", artifact: "agentcore" }
-          - { suffix: "-grok", dockerfile: "Dockerfile.grok", artifact: "grok" }
-          - { suffix: "-antigravity", dockerfile: "Dockerfile.antigravity", artifact: "antigravity" }
-          - { suffix: "-pi", dockerfile: "Dockerfile.pi", artifact: "pi" }
-          - { suffix: "-mimocode", dockerfile: "Dockerfile.mimocode", artifact: "mimocode" }
-          - { suffix: "-native", dockerfile: "Dockerfile.native", artifact: "native" }
-          - { suffix: "-native-sandbox", dockerfile: "openshell/Dockerfile", artifact: "nativesandbox" }
         platform:
-          - { os: linux/amd64, runner: ubuntu-latest }
-          - { os: linux/arm64, runner: ubuntu-24.04-arm }
+          - { os: linux/amd64, runner: ubuntu-latest, arch: amd64 }
+          - { os: linux/arm64, runner: ubuntu-24.04-arm, arch: arm64 }
     runs-on: ${{ matrix.platform.runner }}
     permissions:
       contents: read
@@ -103,22 +102,60 @@ jobs:
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Docker metadata
-        id: meta
-        uses: docker/metadata-action@v6
+      - name: Build shared builder stage
+        uses: docker/build-push-action@v6
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}${{ matrix.variant.suffix }}
+          context: .
+          file: Dockerfile.unified
+          target: local_builder
+          platforms: ${{ matrix.platform.os }}
+          # Always push builder — it's an internal image needed by build-agents.
+          # dry_run only gates the final agent image push + manifest creation.
+          push: true
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/builder:${{ needs.resolve-tag.outputs.chart_version }}-${{ matrix.platform.arch }}
+          no-cache: ${{ inputs.no_cache == true }}
+          cache-from: ${{ inputs.no_cache != true && format('type=gha,scope=unified-builder-{0}', matrix.platform.arch) || '' }}
+          cache-to: ${{ inputs.no_cache != true && format('type=gha,scope=unified-builder-{0},mode=max', matrix.platform.arch) || '' }}
 
-      - name: Build and push by digest
+  build-agents:
+    needs: [resolve-tag, build-core]
+    if: ${{ needs.resolve-tag.outputs.is_prerelease == 'true' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        agent: ${{ fromJson(needs.resolve-tag.outputs.agents) }}
+        platform:
+          - { os: linux/amd64, runner: ubuntu-latest, arch: amd64 }
+          - { os: linux/arm64, runner: ubuntu-24.04-arm, arch: arm64 }
+    runs-on: ${{ matrix.platform.runner }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build agent variant
         id: build
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: ${{ matrix.variant.dockerfile }}
+          file: Dockerfile.unified
+          target: ${{ matrix.agent }}
           platforms: ${{ matrix.platform.os }}
-          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}${{ matrix.variant.suffix }},push-by-digest=true,name-canonical=true,push=${{ inputs.dry_run != true }}
-          cache-from: ${{ inputs.no_cache != true && format('type=gha,scope={0}-{1}', matrix.variant.suffix, matrix.platform.os) || '' }}
-          cache-to: ${{ inputs.no_cache != true && format('type=gha,scope={0}-{1},mode=max', matrix.variant.suffix, matrix.platform.os) || '' }}
+          build-args: |
+            BUILDER_IMAGE=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/builder:${{ needs.resolve-tag.outputs.chart_version }}-${{ matrix.platform.arch }}
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=${{ inputs.dry_run != true }}
+          no-cache: ${{ inputs.no_cache == true }}
+          cache-from: ${{ inputs.no_cache != true && format('type=gha,scope=unified-agent-{0}-{1}', matrix.agent, matrix.platform.arch) || '' }}
+          cache-to: ${{ inputs.no_cache != true && format('type=gha,scope=unified-agent-{0}-{1},mode=max', matrix.agent, matrix.platform.arch) || '' }}
 
       - name: Export digest
         if: inputs.dry_run != true
@@ -131,31 +168,16 @@ jobs:
         if: inputs.dry_run != true
         uses: actions/upload-artifact@v4
         with:
-          name: digests-${{ matrix.variant.artifact }}-${{ matrix.platform.runner }}
+          name: digests-${{ matrix.agent }}-${{ matrix.platform.arch }}
           path: /tmp/digests/*
           retention-days: 1
 
   merge-manifests:
-    needs: [resolve-tag, build-image]
+    needs: [resolve-tag, build-agents]
     if: ${{ inputs.dry_run != true && needs.resolve-tag.outputs.is_prerelease == 'true' }}
     strategy:
       matrix:
-        variant:
-          - { suffix: "", artifact: "default" }
-          - { suffix: "-codex", artifact: "codex" }
-          - { suffix: "-claude", artifact: "claude" }
-          - { suffix: "-gemini", artifact: "gemini" }
-          - { suffix: "-copilot", artifact: "copilot" }
-          - { suffix: "-opencode", artifact: "opencode" }
-          - { suffix: "-cursor", artifact: "cursor" }
-          - { suffix: "-hermes", artifact: "hermes" }
-          - { suffix: "-agentcore", artifact: "agentcore" }
-          - { suffix: "-grok", artifact: "grok" }
-          - { suffix: "-antigravity", artifact: "antigravity" }
-          - { suffix: "-pi", artifact: "pi" }
-          - { suffix: "-mimocode", artifact: "mimocode" }
-          - { suffix: "-native", artifact: "native" }
-          - { suffix: "-native-sandbox", artifact: "nativesandbox" }
+        agent: ${{ fromJson(needs.resolve-tag.outputs.agents) }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -165,8 +187,23 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: /tmp/digests
-          pattern: digests-${{ matrix.variant.artifact }}-*
+          pattern: digests-${{ matrix.agent }}-*
           merge-multiple: true
+
+      - name: Validate digests
+        run: |
+          COUNT=$(ls -1 /tmp/digests/ | wc -l)
+          if [ "$COUNT" -ne 2 ]; then
+            echo "::error::Expected 2 digests (amd64 + arm64), got $COUNT"
+            exit 1
+          fi
+          for f in /tmp/digests/*; do
+            name=$(basename "$f")
+            if ! echo "$name" | grep -qE '^[a-f0-9]{64}$'; then
+              echo "::error::Invalid digest format: $name"
+              exit 1
+            fi
+          done
 
       - uses: docker/setup-buildx-action@v3
 
@@ -176,21 +213,31 @@ jobs:
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Docker metadata
-        id: meta
-        uses: docker/metadata-action@v6
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}${{ matrix.variant.suffix }}
-          tags: |
-            type=sha,prefix=
-            type=semver,pattern={{version}},value=${{ needs.resolve-tag.outputs.tag }}
-            type=raw,value=beta
-
       - name: Create manifest list
-        working-directory: /tmp/digests
         run: |
-          docker buildx imagetools create $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
-            $(printf '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}${{ matrix.variant.suffix }}@sha256:%s ' *)
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+          VERSION="${{ needs.resolve-tag.outputs.chart_version }}"
+          AGENT="${{ matrix.agent }}"
+          SHA="${{ github.sha }}"
+          SHORT_SHA="${SHA:0:7}"
+
+          DIGESTS=$(printf "${IMAGE}@sha256:%s " $(ls /tmp/digests/))
+
+          # All agents use the same tag format: <version>-<agent>, beta-<agent>
+          # No bare tags, no "latest", no default agent.
+          docker buildx imagetools create \
+            -t "${IMAGE}:${VERSION}-${AGENT}" \
+            -t "${IMAGE}:beta-${AGENT}" \
+            -t "${IMAGE}:${SHORT_SHA}-${AGENT}" \
+            ${DIGESTS}
+
+      - name: Summary
+        run: |
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+          VERSION="${{ needs.resolve-tag.outputs.chart_version }}"
+          AGENT="${{ matrix.agent }}"
+          echo "### 📦 \`${IMAGE}:${VERSION}-${AGENT}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "### 📦 \`${IMAGE}:beta-${AGENT}\`" >> "$GITHUB_STEP_SUMMARY"
 
   # ── Stable path: promote pre-release image (no rebuild) ──────
 
@@ -199,22 +246,7 @@ jobs:
     if: ${{ inputs.dry_run != true && needs.resolve-tag.outputs.is_prerelease == 'false' }}
     strategy:
       matrix:
-        variant:
-          - { suffix: "" }
-          - { suffix: "-codex" }
-          - { suffix: "-claude" }
-          - { suffix: "-gemini" }
-          - { suffix: "-copilot" }
-          - { suffix: "-opencode" }
-          - { suffix: "-cursor" }
-          - { suffix: "-hermes" }
-          - { suffix: "-agentcore" }
-          - { suffix: "-grok" }
-          - { suffix: "-antigravity" }
-          - { suffix: "-pi" }
-          - { suffix: "-mimocode" }
-          - { suffix: "-native" }
-          - { suffix: "-native-sandbox" }
+        agent: ${{ fromJson(needs.resolve-tag.outputs.agents) }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -236,7 +268,6 @@ jobs:
         id: find-prerelease
         run: |
           CHART_VERSION="${{ needs.resolve-tag.outputs.chart_version }}"
-          # Find latest pre-release tag matching this version (e.g. v0.7.0-beta.1)
           PRERELEASE_TAG=$(git tag -l "v${CHART_VERSION}-*" --sort=-v:refname | head -1)
           if [ -z "$PRERELEASE_TAG" ]; then
             echo "::error::No pre-release tag found for v${CHART_VERSION}-*. Run a pre-release build first."
@@ -246,28 +277,33 @@ jobs:
           echo "Found pre-release: ${PRERELEASE_TAG} (${PRERELEASE_VERSION})"
           echo "prerelease_version=${PRERELEASE_VERSION}" >> "$GITHUB_OUTPUT"
 
-      - name: Verify pre-release image exists
+      - name: Verify and promote to stable tags
         run: |
-          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}${{ matrix.variant.suffix }}"
-          PRERELEASE_VERSION="${{ steps.find-prerelease.outputs.prerelease_version }}"
-          echo "Checking ${IMAGE}:${PRERELEASE_VERSION} ..."
-          docker buildx imagetools inspect "${IMAGE}:${PRERELEASE_VERSION}" || \
-            { echo "::error::Image ${IMAGE}:${PRERELEASE_VERSION} not found — build the pre-release first"; exit 1; }
-
-      - name: Promote to stable tags
-        run: |
-          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}${{ matrix.variant.suffix }}"
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
           PRERELEASE_VERSION="${{ steps.find-prerelease.outputs.prerelease_version }}"
           CHART_VERSION="${{ needs.resolve-tag.outputs.chart_version }}"
           MAJOR_MINOR="${CHART_VERSION%.*}"
+          AGENT="${{ matrix.agent }}"
 
-          echo "Promoting ${IMAGE}:${PRERELEASE_VERSION} → ${CHART_VERSION}, ${MAJOR_MINOR}, latest, stable"
+          # All agents use the same format — no default, no latest
+          echo "Checking ${IMAGE}:${PRERELEASE_VERSION}-${AGENT} ..."
+          docker buildx imagetools inspect "${IMAGE}:${PRERELEASE_VERSION}-${AGENT}" || \
+            { echo "::error::Image ${IMAGE}:${PRERELEASE_VERSION}-${AGENT} not found"; exit 1; }
+
+          # Promote: openab:<version>-<agent>, openab:<major.minor>-<agent>, openab:stable-<agent>
           docker buildx imagetools create \
-            -t "${IMAGE}:${CHART_VERSION}" \
-            -t "${IMAGE}:${MAJOR_MINOR}" \
-            -t "${IMAGE}:latest" \
-            -t "${IMAGE}:stable" \
-            "${IMAGE}:${PRERELEASE_VERSION}"
+            -t "${IMAGE}:${CHART_VERSION}-${AGENT}" \
+            -t "${IMAGE}:${MAJOR_MINOR}-${AGENT}" \
+            -t "${IMAGE}:stable-${AGENT}" \
+            "${IMAGE}:${PRERELEASE_VERSION}-${AGENT}"
+
+      - name: Summary
+        run: |
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+          CHART_VERSION="${{ needs.resolve-tag.outputs.chart_version }}"
+          AGENT="${{ matrix.agent }}"
+          echo "### 📦 Promoted \`${IMAGE}:${CHART_VERSION}-${AGENT}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "### 📦 Promoted \`${IMAGE}:stable-${AGENT}\`" >> "$GITHUB_STEP_SUMMARY"
 
   # ── Chart release (runs after either path) ───────────────────
 

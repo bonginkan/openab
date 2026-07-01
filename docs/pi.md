@@ -68,7 +68,7 @@ agents:
         - "YOUR_CHANNEL_ID"
     command: pi-acp
     workingDir: /home/node
-    image: "ghcr.io/openabdev/openab-pi:latest"
+    image: "ghcr.io/openabdev/openab:beta-pi"
 ```
 
 ## Authentication

@@ -1,17 +1,38 @@
 # --- Build stage ---
+ARG BUILD_MODE=default
+ARG FEATURES=""
+
 FROM rust:1-bookworm AS builder
+ARG BUILD_MODE
+ARG FEATURES
+
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
-RUN mkdir src && echo 'fn main() {}' > src/main.rs && cargo build --release && rm -rf src
+COPY crates/openab-core/Cargo.toml crates/openab-core/Cargo.toml
+COPY crates/openab-gateway/Cargo.toml crates/openab-gateway/Cargo.toml
+RUN mkdir -p src crates/openab-core/src crates/openab-gateway/src \
+    && echo 'fn main() {}' > src/main.rs \
+    && echo '' > crates/openab-core/src/lib.rs \
+    && echo '' > crates/openab-gateway/src/lib.rs \
+    && cargo build --release \
+    && rm -rf src crates/openab-core/src crates/openab-gateway/src
+COPY crates/ crates/
 COPY src/ src/
-RUN touch src/main.rs && cargo build --release
+RUN touch src/main.rs crates/openab-core/src/lib.rs crates/openab-gateway/src/lib.rs && \
+    if [ "$BUILD_MODE" = "unified" ]; then \
+      cargo build --release --features unified; \
+    elif [ -n "$FEATURES" ]; then \
+      cargo build --release --no-default-features --features "$FEATURES"; \
+    else \
+      cargo build --release; \
+    fi
 
 # --- Runtime stage ---
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl procps ripgrep tini unzip && rm -rf /var/lib/apt/lists/*
 
 # Install kiro-cli (auto-detect arch, copy binary directly)
-ARG KIRO_CLI_VERSION=2.5.0
+ARG KIRO_CLI_VERSION=2.8.1
 RUN ARCH=$(dpkg --print-architecture) && \
     if [ "$ARCH" = "arm64" ]; then URL="https://prod.download.cli.kiro.dev/stable/${KIRO_CLI_VERSION}/kirocli-aarch64-linux.zip"; \
     else URL="https://prod.download.cli.kiro.dev/stable/${KIRO_CLI_VERSION}/kirocli-x86_64-linux.zip"; fi && \

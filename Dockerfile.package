@@ -1,0 +1,383 @@
+# Dockerfile.package — Lightweight agent packaging (no Rust compilation).
+# Expects pre-built binaries at build context paths:
+#   ./bin/openab          (required for all targets)
+#   ./bin/openab-agent    (required for native target)
+#   ./bin/agy-acp         (required for antigravity target)
+#
+# Usage: docker build --target <agent> -f Dockerfile.package --build-context bins=./bin .
+
+# =============================================================================
+# Stage: bins — pre-built binaries passed in via build context
+# =============================================================================
+FROM scratch AS bins
+COPY openab openab-agent* agy-acp* /
+
+# =============================================================================
+# Stage: base-debian — shared runtime base for debian-based agents
+# =============================================================================
+FROM debian:trixie-slim AS base-debian
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates curl procps ripgrep tini git unzip \
+    && rm -rf /var/lib/apt/lists/*
+RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+      -o /usr/share/keyrings/githubcli-archive-keyring.gpg && \
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+      > /etc/apt/sources.list.d/github-cli.list && \
+    apt-get update && apt-get install -y --no-install-recommends gh && \
+    rm -rf /var/lib/apt/lists/*
+RUN useradd -m -s /bin/bash -u 1000 agent
+
+# =============================================================================
+# Stage: base-node — shared runtime base for node-based agents
+# =============================================================================
+FROM node:22-trixie-slim AS base-node
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates curl procps ripgrep tini bubblewrap socat unzip git \
+    && rm -rf /var/lib/apt/lists/*
+RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+      -o /usr/share/keyrings/githubcli-archive-keyring.gpg && \
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+      > /etc/apt/sources.list.d/github-cli.list && \
+    apt-get update && apt-get install -y --no-install-recommends gh && \
+    rm -rf /var/lib/apt/lists/*
+
+# =============================================================================
+# Target: kiro (default)
+# =============================================================================
+FROM base-debian AS kiro
+ARG KIRO_CLI_VERSION=2.8.1
+RUN ARCH=$(dpkg --print-architecture) && \
+    if [ "$ARCH" = "arm64" ]; then URL="https://prod.download.cli.kiro.dev/stable/${KIRO_CLI_VERSION}/kirocli-aarch64-linux.zip"; \
+    else URL="https://prod.download.cli.kiro.dev/stable/${KIRO_CLI_VERSION}/kirocli-x86_64-linux.zip"; fi && \
+    curl --proto '=https' --tlsv1.2 -sSf --retry 3 --retry-delay 5 "$URL" -o /tmp/kirocli.zip && \
+    unzip /tmp/kirocli.zip -d /tmp && \
+    cp /tmp/kirocli/bin/* /usr/local/bin/ && \
+    chmod +x /usr/local/bin/kiro-cli* && \
+    rm -rf /tmp/kirocli /tmp/kirocli.zip
+RUN mkdir -p /home/agent/.local/share/kiro-cli /home/agent/.kiro && \
+    chown -R agent:agent /home/agent
+ENV HOME=/home/agent
+WORKDIR /home/agent
+COPY --from=bins --chown=agent:agent /openab /usr/local/bin/openab
+USER agent
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+  CMD pgrep -x openab || exit 1
+ENV OPENAB_AGENT_COMMAND="kiro-cli acp --trust-all-tools"
+ENV OPENAB_AGENT_AUTH_COMMAND="kiro-cli login --use-device-flow"
+ENTRYPOINT ["tini", "--"]
+CMD ["openab", "run", "-c", "/etc/openab/config.toml"]
+
+# =============================================================================
+# Target: claude
+# =============================================================================
+FROM base-node AS claude
+ARG CLAUDE_AGENT_ACP_VERSION=0.45.0
+ARG CLAUDE_CODE_VERSION=2.1.179
+RUN npm install -g @agentclientprotocol/claude-agent-acp@${CLAUDE_AGENT_ACP_VERSION} @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION} --retry 3
+ENV CLAUDE_CODE_EXECUTABLE=/usr/local/bin/claude
+ENV HOME=/home/node
+WORKDIR /home/node
+COPY --from=bins --chown=node:node /openab /usr/local/bin/openab
+RUN mkdir -p /home/node/.claude && chown -R node:node /home/node
+USER node
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+  CMD pgrep -x openab || exit 1
+ENV OPENAB_AGENT_COMMAND="claude"
+ENV OPENAB_AGENT_AUTH_COMMAND="claude auth login"
+ENTRYPOINT ["tini", "--"]
+CMD ["openab", "run", "-c", "/etc/openab/config.toml"]
+
+# =============================================================================
+# Target: codex
+# =============================================================================
+FROM base-node AS codex
+ARG CODEX_ACP_VERSION=0.16.0
+ARG CODEX_VERSION=0.141.0
+RUN npm install -g @zed-industries/codex-acp@${CODEX_ACP_VERSION} @openai/codex@${CODEX_VERSION} --retry 3
+ENV HOME=/home/node
+WORKDIR /home/node
+COPY --from=bins --chown=node:node /openab /usr/local/bin/openab
+RUN mkdir -p /home/node/.codex && chown -R node:node /home/node
+USER node
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+  CMD pgrep -x openab || exit 1
+ENV OPENAB_AGENT_COMMAND="codex-acp"
+ENV OPENAB_AGENT_AUTH_COMMAND="codex login --device-auth"
+ENTRYPOINT ["tini", "--"]
+CMD ["openab", "run", "-c", "/etc/openab/config.toml"]
+
+# =============================================================================
+# Target: copilot
+# =============================================================================
+FROM base-node AS copilot
+ARG COPILOT_VERSION=1.0.63
+RUN npm install -g @github/copilot@${COPILOT_VERSION} --retry 3
+ENV HOME=/home/node
+WORKDIR /home/node
+COPY --from=bins --chown=node:node /openab /usr/local/bin/openab
+RUN mkdir -p /home/node/.copilot && chown -R node:node /home/node
+USER node
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+  CMD pgrep -x openab || exit 1
+ENV OPENAB_AGENT_COMMAND="copilot --acp --stdio"
+ENV OPENAB_AGENT_AUTH_COMMAND="copilot login"
+ENTRYPOINT ["tini", "--"]
+CMD ["openab", "run", "-c", "/etc/openab/config.toml"]
+
+# =============================================================================
+# Target: cursor
+# =============================================================================
+FROM base-debian AS cursor
+ARG CURSOR_VERSION=2026.06.19-20-24-33-653a7fb
+RUN ARCH=$(dpkg --print-architecture) && \
+    if [ "$ARCH" = "arm64" ]; then ARCH=arm64; else ARCH=x64; fi && \
+    curl -fSL "https://downloads.cursor.com/lab/${CURSOR_VERSION}/linux/${ARCH}/agent-cli-package.tar.gz" \
+      -o /tmp/cursor.tar.gz && \
+    tar xzf /tmp/cursor.tar.gz -C /opt && \
+    mv /opt/dist-package /opt/cursor-agent && \
+    ln -s /opt/cursor-agent/cursor-agent /usr/local/bin/cursor-agent && \
+    rm /tmp/cursor.tar.gz
+ENV HOME=/home/agent
+WORKDIR /home/agent
+COPY --from=bins --chown=agent:agent /openab /usr/local/bin/openab
+RUN mkdir -p /home/agent/.cursor && chown -R agent:agent /home/agent
+USER agent
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+  CMD pgrep -x openab || exit 1
+ENV OPENAB_AGENT_COMMAND="cursor-agent acp"
+ENV OPENAB_AGENT_AUTH_COMMAND="cursor-agent login"
+ENTRYPOINT ["tini", "--"]
+CMD ["openab", "run", "-c", "/etc/openab/config.toml"]
+
+# =============================================================================
+# Target: gemini
+# =============================================================================
+FROM base-node AS gemini
+ARG GEMINI_CLI_VERSION=0.47.0
+RUN npm install -g @google/gemini-cli@${GEMINI_CLI_VERSION} --retry 3
+ENV HOME=/home/node
+WORKDIR /home/node
+COPY --from=bins --chown=node:node /openab /usr/local/bin/openab
+RUN mkdir -p /home/node/.gemini && chown -R node:node /home/node
+USER node
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+  CMD pgrep -x openab || exit 1
+ENV OPENAB_AGENT_COMMAND="gemini --acp"
+ENV OPENAB_AGENT_AUTH_COMMAND="gemini auth"
+ENTRYPOINT ["tini", "--"]
+CMD ["openab", "run", "-c", "/etc/openab/config.toml"]
+
+# =============================================================================
+# Target: grok
+# =============================================================================
+FROM base-debian AS grok
+ARG GROK_VERSION=0.1.220
+ARG GROK_SHA256_AMD64=98d331d64dfc4fb1dae862475218cccdd195f76839b8361a0678af2fd388364b
+ARG GROK_SHA256_ARM64=3b15efc258f4219d01736acee70c575a8167f970cb4d497a3b0c218440db58ff
+ARG TARGETPLATFORM
+RUN set -eux; \
+    case "${TARGETPLATFORM:-linux/amd64}" in \
+      "linux/amd64") arch=x86_64; sha="${GROK_SHA256_AMD64}" ;; \
+      "linux/arm64") arch=aarch64; sha="${GROK_SHA256_ARM64}" ;; \
+      *) echo "Unsupported platform: ${TARGETPLATFORM}" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL "https://storage.googleapis.com/grok-build-public-artifacts/cli/grok-${GROK_VERSION}-linux-${arch}" \
+      -o /tmp/grok && \
+    echo "${sha}  /tmp/grok" | sha256sum -c - && \
+    install -m 0755 /tmp/grok /usr/local/bin/grok && \
+    rm /tmp/grok
+ENV HOME=/home/agent
+WORKDIR /home/agent
+COPY --from=bins --chown=agent:agent /openab /usr/local/bin/openab
+RUN mkdir -p /home/agent/.grok && chown -R agent:agent /home/agent
+USER agent
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+  CMD pgrep -x openab || exit 1
+ENV OPENAB_AGENT_COMMAND="grok agent stdio"
+ENV OPENAB_AGENT_AUTH_COMMAND="grok login --device-auth"
+ENTRYPOINT ["tini", "--"]
+CMD ["openab", "run", "-c", "/etc/openab/config.toml"]
+
+# =============================================================================
+# Target: hermes
+# =============================================================================
+FROM python:3.12-slim-trixie AS hermes
+RUN useradd -m -u 1000 agent
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates curl procps ripgrep tini git ffmpeg unzip xz-utils \
+    && rm -rf /var/lib/apt/lists/*
+ARG HERMES_INSTALL_COMMIT=2bd1977d8fad185c9b4be47884f7e87f1add0ce3
+ARG HERMES_INSTALL_SHA256=dbd9d555ed4ac67bd1fc71ba6a39b410cf2af0ebcfd8f4889e086af78c9ddcaa
+RUN curl -fsSL "https://raw.githubusercontent.com/NousResearch/hermes-agent/${HERMES_INSTALL_COMMIT}/scripts/install.sh" \
+      -o /tmp/install-hermes.sh && \
+    echo "${HERMES_INSTALL_SHA256}  /tmp/install-hermes.sh" | sha256sum -c - && \
+    HERMES_HOME=/home/agent/.hermes bash /tmp/install-hermes.sh && \
+    rm /tmp/install-hermes.sh && \
+    (test -d /root/.local/share/uv && chmod -R a+rX /root/.local/share/uv && chmod a+rx /root /root/.local /root/.local/share || true) && \
+    ln -sf /usr/local/lib/hermes-agent/venv/bin/hermes-acp /usr/local/bin/hermes-acp
+RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+      -o /usr/share/keyrings/githubcli-archive-keyring.gpg && \
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+      > /etc/apt/sources.list.d/github-cli.list && \
+    apt-get update && apt-get install -y --no-install-recommends gh && \
+    rm -rf /var/lib/apt/lists/*
+ENV HOME=/home/agent
+WORKDIR /home/agent
+COPY --from=bins --chown=agent:agent /openab /usr/local/bin/openab
+RUN chown -R agent:agent /home/agent
+USER agent
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+  CMD pgrep -x openab || exit 1
+ENV OPENAB_AGENT_COMMAND="hermes-acp"
+ENV OPENAB_AGENT_AUTH_COMMAND="hermes auth add"
+ENTRYPOINT ["tini", "--"]
+CMD ["openab", "run", "-c", "/etc/openab/config.toml"]
+
+# =============================================================================
+# Target: mimocode
+# =============================================================================
+FROM base-node AS mimocode
+ARG MIMOCODE_VERSION=0.1.1
+RUN npm install -g @mimo-ai/cli@${MIMOCODE_VERSION} --retry 3
+ENV HOME=/home/node
+WORKDIR /home/node
+COPY --from=bins --chown=node:node /openab /usr/local/bin/openab
+RUN mkdir -p /home/node/.mimo && chown -R node:node /home/node
+USER node
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+  CMD pgrep -x openab || exit 1
+ENV OPENAB_AGENT_COMMAND="mimo acp"
+ENV OPENAB_AGENT_AUTH_COMMAND="mimo auth login --provider mimo --method \"MiMo Auto (free)\""
+ENTRYPOINT ["tini", "--"]
+CMD ["openab", "run", "-c", "/etc/openab/config.toml"]
+
+# =============================================================================
+# Target: opencode
+# =============================================================================
+FROM base-node AS opencode
+ARG OPENCODE_VERSION=1.17.9
+RUN npm install -g opencode-ai@${OPENCODE_VERSION} --retry 3
+ENV HOME=/home/node
+WORKDIR /home/node
+COPY --from=bins --chown=node:node /openab /usr/local/bin/openab
+RUN mkdir -p /home/node/.opencode && chown -R node:node /home/node
+USER node
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+  CMD pgrep -x openab || exit 1
+ENV OPENAB_AGENT_COMMAND="opencode acp"
+ENV OPENAB_AGENT_AUTH_COMMAND="opencode auth login"
+ENTRYPOINT ["tini", "--"]
+CMD ["openab", "run", "-c", "/etc/openab/config.toml"]
+
+# =============================================================================
+# Target: devin
+# =============================================================================
+FROM base-debian AS devin
+ARG DEVIN_VERSION=2026.8.18
+ARG DEVIN_SHA256_AMD64=dd4bba20593086bf708474792c11ab0c9428be5b2419ff5c182ec5f1099a0661
+ARG DEVIN_SHA256_ARM64=127e7a8baf2e09cb0fd23871af989dc9e32e3bfa7f497b1f6560cc52f5bf19c6
+ARG TARGETPLATFORM
+RUN set -eux; \
+    case "${TARGETPLATFORM:-linux/amd64}" in \
+      "linux/amd64") arch=x86_64-unknown-linux; sha="${DEVIN_SHA256_AMD64}" ;; \
+      "linux/arm64") arch=aarch64-unknown-linux; sha="${DEVIN_SHA256_ARM64}" ;; \
+      *) echo "Unsupported platform: ${TARGETPLATFORM}" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL "https://static.devin.ai/cli/${DEVIN_VERSION}/devin-${DEVIN_VERSION}-${arch}.tar.gz" \
+      -o /tmp/devin.tar.gz && \
+    echo "${sha}  /tmp/devin.tar.gz" | sha256sum -c - && \
+    tar xzf /tmp/devin.tar.gz -C /tmp && \
+    install -m 0755 /tmp/bin/devin /usr/local/bin/devin && \
+    rm -rf /tmp/devin* /tmp/bin /tmp/share
+ENV HOME=/home/agent
+WORKDIR /home/agent
+COPY --from=bins --chown=agent:agent /openab /usr/local/bin/openab
+RUN chown -R agent:agent /home/agent
+USER agent
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+  CMD pgrep -x openab || exit 1
+ENV OPENAB_AGENT_COMMAND="devin acp"
+ENV OPENAB_AGENT_AUTH_COMMAND="devin auth login --force-manual-token-flow"
+ENTRYPOINT ["tini", "--"]
+CMD ["openab", "run", "-c", "/etc/openab/config.toml"]
+
+# =============================================================================
+# Target: antigravity
+# =============================================================================
+FROM base-debian AS antigravity
+ENV AGY_VERSION=1.0.10
+RUN ARCH=$(dpkg --print-architecture) && \
+    case "$ARCH" in \
+      amd64) ASSET="agy_cli_linux_x64.tar.gz" ;; \
+      arm64) ASSET="agy_cli_linux_arm64.tar.gz" ;; \
+      *) echo "unsupported arch: $ARCH" && exit 1 ;; \
+    esac && \
+    curl -fsSL "https://github.com/google-antigravity/antigravity-cli/releases/download/${AGY_VERSION}/${ASSET}" \
+      | tar -xz -C /usr/local/bin && \
+    mv /usr/local/bin/antigravity /usr/local/bin/agy && \
+    chmod +x /usr/local/bin/agy
+ENV HOME=/home/agent
+WORKDIR /home/agent
+COPY --from=bins --chown=agent:agent /openab /usr/local/bin/openab
+COPY --from=bins --chown=agent:agent /agy-acp /usr/local/bin/agy-acp
+RUN mkdir -p /home/agent/.agy && chown -R agent:agent /home/agent
+USER agent
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+  CMD pgrep -x openab || exit 1
+ENV OPENAB_AGENT_COMMAND="agy-acp"
+ENV OPENAB_AGENT_AUTH_COMMAND="agy auth"
+ENTRYPOINT ["tini", "--"]
+CMD ["openab", "run", "-c", "/etc/openab/config.toml"]
+
+# =============================================================================
+# Target: pi
+# =============================================================================
+FROM base-node AS pi
+ARG PI_ACP_VERSION=0.0.31
+ARG PI_CODING_AGENT_VERSION=0.79.9
+RUN npm install -g pi-acp@${PI_ACP_VERSION} @earendil-works/pi-coding-agent@${PI_CODING_AGENT_VERSION} --retry 3
+ENV HOME=/home/node
+WORKDIR /home/node
+COPY --from=bins --chown=node:node /openab /usr/local/bin/openab
+RUN mkdir -p /home/node/.pi && chown -R node:node /home/node
+USER node
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+  CMD pgrep -x openab || exit 1
+ENV OPENAB_AGENT_COMMAND="openab-agent"
+ENV OPENAB_AGENT_AUTH_COMMAND="pi /login"
+ENTRYPOINT ["tini", "--"]
+CMD ["openab", "run", "-c", "/etc/openab/config.toml"]
+
+# =============================================================================
+# Target: native
+# =============================================================================
+FROM base-debian AS native
+ENV HOME=/home/agent
+WORKDIR /home/agent
+COPY --from=bins --chown=agent:agent /openab /usr/local/bin/openab
+COPY --from=bins --chown=agent:agent /openab-agent /usr/local/bin/openab-agent
+RUN mkdir -p /home/agent/.openab && chown -R agent:agent /home/agent
+USER agent
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+  CMD pgrep -x openab || exit 1
+ENV OPENAB_AGENT_COMMAND="openab-agent"
+ENV OPENAB_AGENT_AUTH_COMMAND="openab-agent auth codex-oauth --no-browser"
+ENTRYPOINT ["tini", "--"]
+CMD ["openab", "run", "-c", "/etc/openab/config.toml"]
+
+# =============================================================================
+# Target: agentcore (minimal — no agent CLI bundled)
+# =============================================================================
+FROM debian:trixie-slim AS agentcore
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates tini \
+    && rm -rf /var/lib/apt/lists/*
+RUN useradd -m -s /bin/bash -u 1000 agent
+ENV HOME=/home/agent
+WORKDIR /home/agent
+COPY --from=bins --chown=agent:agent /openab /usr/local/bin/openab
+USER agent
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+  CMD pgrep -x openab || exit 1
+ENTRYPOINT ["tini", "--"]
+CMD ["openab", "run", "-c", "/etc/openab/config.toml"]

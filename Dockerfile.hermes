@@ -2,12 +2,20 @@
 FROM rust:1-bookworm AS builder
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
-RUN mkdir src && echo 'fn main() {}' > src/main.rs && cargo build --release && rm -rf src
+COPY crates/openab-core/Cargo.toml crates/openab-core/Cargo.toml
+COPY crates/openab-gateway/Cargo.toml crates/openab-gateway/Cargo.toml
+RUN mkdir -p src crates/openab-core/src crates/openab-gateway/src \
+    && echo 'fn main() {}' > src/main.rs \
+    && echo '' > crates/openab-core/src/lib.rs \
+    && echo '' > crates/openab-gateway/src/lib.rs \
+    && cargo build --release \
+    && rm -rf src crates/openab-core/src crates/openab-gateway/src
+COPY crates/ crates/
 COPY src/ src/
-RUN touch src/main.rs && cargo build --release
+RUN touch src/main.rs crates/openab-core/src/lib.rs crates/openab-gateway/src/lib.rs && cargo build --release
 
 # --- Runtime stage ---
-FROM python:3.12-slim-bookworm
+FROM python:3.12-slim-trixie
 
 # Create agent user first so WORKDIR gets correct ownership
 RUN useradd -m -u 1000 agent
@@ -19,8 +27,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Install Hermes Agent — pinned to known commit with checksum verification
 # Root install uses FHS layout: binary at /usr/local/bin/hermes, code at /usr/local/lib/hermes-agent
 # HERMES_HOME points to agent user's data dir for OAuth tokens and config
-ARG HERMES_INSTALL_COMMIT=a5c12f5f593b0d5c11bf0adb15074cc50fbffaee
-ARG HERMES_INSTALL_SHA256=19a04f56496727de6492683bb89fa7e716ed29a22966f022e48679f0e1853652
+ARG HERMES_INSTALL_COMMIT=2bd1977d8fad185c9b4be47884f7e87f1add0ce3
+ARG HERMES_INSTALL_SHA256=dbd9d555ed4ac67bd1fc71ba6a39b410cf2af0ebcfd8f4889e086af78c9ddcaa
 RUN curl -fsSL "https://raw.githubusercontent.com/NousResearch/hermes-agent/${HERMES_INSTALL_COMMIT}/scripts/install.sh" \
       -o /tmp/install-hermes.sh && \
     echo "${HERMES_INSTALL_SHA256}  /tmp/install-hermes.sh" | sha256sum -c - && \

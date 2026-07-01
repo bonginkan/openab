@@ -17,7 +17,7 @@ Kubernetes CronJob
      |
      v
 Ephemeral Job Pod
-  image: ghcr.io/openabdev/openab-codex:latest
+  image: ghcr.io/openabdev/openab:beta-codex
   command: bash /opt/openab-project-screening/screen_once.sh
      |
      +--> read GitHub Project state via gh
@@ -91,7 +91,7 @@ spec:
             - name: project-screening
               # Pin to a specific tag in production (e.g. :0.8.0) to ensure
               # reproducible runs. :latest is used here for illustration only.
-              image: ghcr.io/openabdev/openab-codex:latest
+              image: ghcr.io/openabdev/openab:beta-codex
               command:
                 - bash
                 - /opt/openab-project-screening/screen_once.sh
@@ -308,7 +308,7 @@ projectScreening:
   enabled: true
   schedule: "*/30 * * * *"
   # Pin to a specific tag in production (e.g. :0.8.0)
-  image: ghcr.io/openabdev/openab-codex:latest
+  image: ghcr.io/openabdev/openab:beta-codex
   githubToken: "<token with project scope>"
   codexAuthJson: |
     <contents of ~/.codex/auth.json>

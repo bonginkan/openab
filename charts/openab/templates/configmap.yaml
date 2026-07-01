@@ -138,6 +138,10 @@ data:
     {{- if and (hasKey ($cfg.slack | default dict) "assistantMode") (not ($cfg.slack).assistantMode) }}
     assistant_mode = false
     {{- end }}
+    {{- /* streaming: master switch; false → send-once (no native, no post+edit) */ -}}
+    {{- if and (hasKey ($cfg.slack | default dict) "streaming") (not ($cfg.slack).streaming) }}
+    streaming = false
+    {{- end }}
     {{- end }}
 
     [agent]
@@ -187,6 +191,10 @@ data:
     {{- fail (printf "agents.%s.reactions.toolDisplay must be one of: full, compact, none — got: %s" $name ($cfg.reactions).toolDisplay) }}
     {{- end }}
     tool_display = {{ ($cfg.reactions).toolDisplay | toJson }}
+    {{- end }}
+    {{- /* narrationDisplay: true → keep inter-tool narration in send-once (default false → final answer block only) */ -}}
+    {{- if ($cfg.reactions).narrationDisplay }}
+    narration_display = true
     {{- end }}
     {{- if ($cfg.stt).enabled }}
     {{- if not ($cfg.stt).apiKey }}

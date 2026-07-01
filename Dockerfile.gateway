@@ -1,0 +1,50 @@
+# Dockerfile.gateway — Standalone gateway binary (backward-compatible)
+#
+# Builds the openab-gateway binary that bridges webhook platforms to OAB via WebSocket.
+# This is the same functionality as the old standalone gateway/ directory.
+#
+# Usage:
+#   docker build -f Dockerfile.gateway -t openab-gateway .
+#   docker build -f Dockerfile.gateway --build-arg FEATURES=telegram,line -t openab-gateway:slim .
+
+ARG FEATURES=""
+
+FROM rust:1-bookworm AS builder
+ARG FEATURES
+
+WORKDIR /build
+COPY Cargo.toml Cargo.lock ./
+COPY crates/openab-core/Cargo.toml crates/openab-core/Cargo.toml
+COPY crates/openab-gateway/Cargo.toml crates/openab-gateway/Cargo.toml
+RUN mkdir -p src crates/openab-core/src crates/openab-gateway/src \
+    && echo 'fn main() {}' > src/main.rs \
+    && echo 'fn main() {}' > crates/openab-gateway/src/main.rs \
+    && echo '' > crates/openab-core/src/lib.rs \
+    && echo '' > crates/openab-gateway/src/lib.rs \
+    && cargo build --release -p openab-gateway \
+    && rm -rf src crates/openab-core/src crates/openab-gateway/src
+COPY crates/ crates/
+COPY src/ src/
+RUN touch crates/openab-gateway/src/main.rs crates/openab-gateway/src/lib.rs && \
+    if [ -n "$FEATURES" ]; then \
+      cargo build --release -p openab-gateway --no-default-features --features "$FEATURES"; \
+    else \
+      cargo build --release -p openab-gateway; \
+    fi
+
+# --- Runtime stage ---
+FROM debian:trixie-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates tini && rm -rf /var/lib/apt/lists/*
+
+RUN useradd -m -s /bin/bash -u 1000 gateway
+WORKDIR /home/gateway
+
+COPY --from=builder --chown=gateway:gateway /build/target/release/openab-gateway /usr/local/bin/openab-gateway
+
+USER gateway
+EXPOSE 8080
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+  CMD curl -sf http://localhost:8080/health || exit 1
+
+ENTRYPOINT ["tini", "--"]
+CMD ["openab-gateway"]

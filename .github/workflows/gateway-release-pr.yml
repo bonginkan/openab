@@ -29,7 +29,7 @@ jobs:
       - name: Update gateway version
         run: |
           VERSION="${{ inputs.version }}"
-          sed -i "s/^version = .*/version = \"${VERSION}\"/" gateway/Cargo.toml
+          sed -i "s/^version = .*/version = \"${VERSION}\"/" crates/openab-gateway/Cargo.toml
           echo "::notice::Gateway release version: ${VERSION}"
 
       - name: Create release PR

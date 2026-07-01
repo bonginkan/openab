@@ -68,9 +68,7 @@ agents:
       command: "agy-acp"
       args: []
       workingDir: "/home/agent"
-    image:
-      repository: ghcr.io/openabdev/openab-antigravity
-      tag: "latest"
+    # image: leave empty — chart auto-resolves to openab:<tag>-antigravity
 ```
 
 ## Limitations

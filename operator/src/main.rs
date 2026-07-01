@@ -1,5 +1,8 @@
 mod manifest;
 mod apply;
+mod bootstrap;
+mod config;
+mod create;
 mod get;
 mod delete;
 
@@ -19,6 +22,23 @@ enum Commands {
         /// Path to manifest file or directory
         #[arg(short, long)]
         file: String,
+        /// Skip syncing local config.toml to S3 before applying
+        #[arg(long)]
+        no_sync: bool,
+        /// Wait for deployment to stabilize
+        #[arg(long)]
+        wait: bool,
+    },
+    /// Interactive wizard to create a new agent
+    Create {
+        /// Agent name
+        name: String,
+        /// Namespace
+        #[arg(long, default_value = "prod")]
+        namespace: String,
+        /// Automatically apply after generating (default: just create files)
+        #[arg(long)]
+        auto_apply: bool,
     },
     /// List OAB services and their status
     Get {
@@ -65,6 +85,36 @@ enum Commands {
         /// Destination: agent:/path or local dir
         dst: String,
     },
+    /// Bootstrap OAB infrastructure (cluster, IAM roles, S3, security group)
+    Bootstrap {
+        /// Delete all bootstrap resources
+        #[arg(long)]
+        delete: bool,
+        /// Show current bootstrap status
+        #[arg(long)]
+        status: bool,
+        /// AWS region (defaults to AWS_DEFAULT_REGION or us-east-1)
+        #[arg(long)]
+        region: Option<String>,
+        /// Use existing ECS cluster (skip creation)
+        #[arg(long)]
+        cluster: Option<String>,
+        /// Use existing VPC
+        #[arg(long)]
+        vpc: Option<String>,
+        /// Use existing subnets (comma-separated)
+        #[arg(long, value_delimiter = ',')]
+        subnets: Option<Vec<String>>,
+        /// Use existing security group
+        #[arg(long, alias = "sg")]
+        security_group: Option<String>,
+        /// Use existing task execution role ARN
+        #[arg(long)]
+        execution_role: Option<String>,
+        /// Use existing task role ARN
+        #[arg(long)]
+        task_role: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -73,7 +123,8 @@ async fn main() -> anyhow::Result<()> {
     let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
 
     match cli.command {
-        Commands::Apply { file } => apply::run(&config, &file).await,
+        Commands::Apply { file, no_sync, wait } => apply::run(&config, &file, !no_sync, wait).await,
+        Commands::Create { name, namespace, auto_apply } => create::run(&config, &name, &namespace, auto_apply).await,
         Commands::Get { resource, name, cluster } => get::run(&config, &resource, name.as_deref(), &cluster).await,
         Commands::Delete { resource, name, cluster, namespace } => {
             delete::run(&config, &resource, &name, &cluster, &namespace).await
@@ -116,6 +167,25 @@ async fn main() -> anyhow::Result<()> {
             }
             eprintln!("✓ Done");
             Ok(())
+        }
+        Commands::Bootstrap { delete, status, region, cluster, vpc, subnets, security_group, execution_role, task_role } => {
+            let cfg = if let Some(ref r) = region {
+                aws_config::defaults(aws_config::BehaviorVersion::latest())
+                    .region(aws_config::Region::new(r.clone()))
+                    .load()
+                    .await
+            } else {
+                config.clone()
+            };
+            let imports = bootstrap::ImportOptions {
+                cluster,
+                vpc,
+                subnets,
+                security_group,
+                execution_role,
+                task_role,
+            };
+            bootstrap::run(&cfg, delete, status, imports).await
         }
     }
 }

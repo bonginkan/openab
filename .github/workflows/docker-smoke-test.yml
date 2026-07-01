@@ -2,36 +2,45 @@ name: Docker Smoke Test
 
 on:
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
     paths:
       - 'Dockerfile*'
       - 'src/**'
+      - 'crates/**'
       - 'Cargo.*'
+
+concurrency:
+  group: smoke-test-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
 
 jobs:
   smoke-test:
+    if: github.event.pull_request.draft == false
     strategy:
       fail-fast: false
       matrix:
         variant:
-          - { dockerfile: Dockerfile, suffix: "", agent: "kiro-cli", agent_args: "acp --trust-all-tools" }
-          - { dockerfile: Dockerfile.claude, suffix: "-claude", agent: "claude-agent-acp", agent_args: "" }
-          - { dockerfile: Dockerfile.codex, suffix: "-codex", agent: "codex-acp", agent_args: "" }
-          - { dockerfile: Dockerfile.gemini, suffix: "-gemini", agent: "gemini", agent_args: "--acp" }
-          - { dockerfile: Dockerfile.copilot, suffix: "-copilot", agent: "copilot", agent_args: "--acp" }
-          - { dockerfile: Dockerfile.opencode, suffix: "-opencode", agent: "opencode", agent_args: "acp" }
-          - { dockerfile: Dockerfile.cursor, suffix: "-cursor", agent: "cursor-agent", agent_args: "acp" }
-          - { dockerfile: Dockerfile.mimocode, suffix: "-mimocode", agent: "mimo", agent_args: "acp" }
-          - { dockerfile: Dockerfile.hermes, suffix: "-hermes", agent: "hermes-acp", agent_args: "" }
-          - { dockerfile: Dockerfile.grok, suffix: "-grok", agent: "grok", agent_args: "agent stdio" }
-          - { dockerfile: Dockerfile.antigravity, suffix: "-antigravity", agent: "agy-acp", agent_args: "" }
-          - { dockerfile: Dockerfile.pi, suffix: "-pi", agent: "pi-acp", agent_args: "" }
-          - { dockerfile: openshell/Dockerfile, suffix: "-native-sandbox", agent: "openab-agent", agent_args: "" }
+          - { dockerfile: Dockerfile, suffix: "", agent: "kiro-cli", agent_args: "acp --trust-all-tools", build_args: "" }
+          - { dockerfile: Dockerfile, suffix: "-unified", agent: "kiro-cli", agent_args: "acp --trust-all-tools", build_args: "--build-arg BUILD_MODE=unified" }
+          - { dockerfile: Dockerfile.claude, suffix: "-claude", agent: "claude-agent-acp", agent_args: "", build_args: "" }
+          - { dockerfile: Dockerfile.codex, suffix: "-codex", agent: "codex-acp", agent_args: "", build_args: "" }
+          - { dockerfile: Dockerfile.gemini, suffix: "-gemini", agent: "gemini", agent_args: "--acp", build_args: "" }
+          - { dockerfile: Dockerfile.copilot, suffix: "-copilot", agent: "copilot", agent_args: "--acp", build_args: "" }
+          - { dockerfile: Dockerfile.opencode, suffix: "-opencode", agent: "opencode", agent_args: "acp", build_args: "" }
+          - { dockerfile: Dockerfile.cursor, suffix: "-cursor", agent: "cursor-agent", agent_args: "acp", build_args: "" }
+          - { dockerfile: Dockerfile.mimocode, suffix: "-mimocode", agent: "mimo", agent_args: "acp", build_args: "" }
+          - { dockerfile: Dockerfile.hermes, suffix: "-hermes", agent: "hermes-acp", agent_args: "", build_args: "" }
+          - { dockerfile: Dockerfile.grok, suffix: "-grok", agent: "grok", agent_args: "agent stdio", build_args: "" }
+          - { dockerfile: Dockerfile.devin, suffix: "-devin", agent: "devin", agent_args: "acp", build_args: "" }
+          - { dockerfile: Dockerfile.antigravity, suffix: "-antigravity", agent: "agy-acp", agent_args: "", build_args: "" }
+          - { dockerfile: Dockerfile.pi, suffix: "-pi", agent: "pi-acp", agent_args: "", build_args: "" }
+          - { dockerfile: openshell/Dockerfile, suffix: "-native-sandbox", agent: "openab-agent", agent_args: "", build_args: "" }
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
 
       - name: Build image
-        run: docker build -t openab-test${{ matrix.variant.suffix }} -f ${{ matrix.variant.dockerfile }} .
+        run: docker build ${{ matrix.variant.build_args }} -t openab-test${{ matrix.variant.suffix }} -f ${{ matrix.variant.dockerfile }} .
 
       - name: Verify openab CMD does not crash
         run: |

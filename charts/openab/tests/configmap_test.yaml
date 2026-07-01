@@ -180,3 +180,49 @@ tests:
       - notMatchRegex:
           path: data["config.toml"]
           pattern: 'assistant_mode'
+
+  - it: renders slack streaming = false when explicitly disabled
+    set:
+      agents.kiro.slack.enabled: true
+      agents.kiro.slack.botToken: xoxb-x
+      agents.kiro.slack.appToken: xapp-y
+      agents.kiro.slack.streaming: false
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'streaming = false'
+
+  - it: does not render slack streaming when enabled (Rust default true)
+    set:
+      agents.kiro.slack.enabled: true
+      agents.kiro.slack.botToken: xoxb-x
+      agents.kiro.slack.appToken: xapp-y
+      agents.kiro.slack.streaming: true
+    asserts:
+      - notMatchRegex:
+          path: data["config.toml"]
+          pattern: 'streaming = '
+
+  - it: renders reactions narration_display = true when explicitly enabled
+    set:
+      agents.kiro.reactions.narrationDisplay: true
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'narration_display = true'
+
+  - it: does not render reactions narration_display when off (Rust default false)
+    set:
+      agents.kiro.reactions.narrationDisplay: false
+    asserts:
+      - notMatchRegex:
+          path: data["config.toml"]
+          pattern: 'narration_display = '
+
+  - it: does not render reactions narration_display when key absent (Rust default false)
+    set:
+      agents.kiro.reactions.enabled: true
+    asserts:
+      - notMatchRegex:
+          path: data["config.toml"]
+          pattern: 'narration_display = '
