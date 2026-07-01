@@ -273,8 +273,10 @@ impl ChatAdapter for DiscordAdapter {
 
 pub struct Handler {
     pub router: Arc<AdapterRouter>,
+    pub allow_all_guilds: bool,
     pub allow_all_channels: bool,
     pub allow_all_users: bool,
+    pub allowed_guilds: HashSet<u64>,
     pub allowed_channels: HashSet<u64>,
     pub allowed_users: HashSet<u64>,
     pub stt_config: SttConfig,
@@ -312,6 +314,45 @@ pub struct Handler {
 }
 
 impl Handler {
+    fn guild_allowed(&self, guild_id: Option<u64>) -> bool {
+        is_allowed_guild(self.allow_all_guilds, &self.allowed_guilds, guild_id)
+    }
+
+    async fn reject_disallowed_guild_interaction(
+        &self,
+        ctx: &Context,
+        interaction: &Interaction,
+        guild_id: u64,
+    ) {
+        let response = CreateInteractionResponse::Message(
+            CreateInteractionResponseMessage::new()
+                .content("⚠️ This bot is not enabled in this server.")
+                .ephemeral(true),
+        );
+
+        match interaction {
+            Interaction::Command(cmd) => {
+                if let Err(e) = cmd.create_response(&ctx.http, response).await {
+                    tracing::debug!(
+                        guild_id,
+                        error = %e,
+                        "failed to reject command in disallowed guild"
+                    );
+                }
+            }
+            Interaction::Component(comp) => {
+                if let Err(e) = comp.create_response(&ctx.http, response).await {
+                    tracing::debug!(
+                        guild_id,
+                        error = %e,
+                        "failed to reject component interaction in disallowed guild"
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+
     async fn mark_thread_participated(&self, channel_id: &str) {
         let mut cache = self.participated_threads.lock().await;
         cache_participation_entry(&mut cache, channel_id.to_string(), self.session_ttl);
@@ -385,6 +426,15 @@ impl Handler {
 impl EventHandler for Handler {
     async fn message(&self, ctx: Context, msg: Message) {
         let bot_id = ctx.cache.current_user().id;
+
+        if !self.guild_allowed(msg.guild_id.map(|id| id.get())) {
+            tracing::debug!(
+                guild_id = ?msg.guild_id.map(|id| id.get()),
+                channel_id = %msg.channel_id,
+                "message ignored from disallowed guild"
+            );
+            return;
+        }
 
         // Early multibot detection: cache that another bot is present.
         // Runs before self-check and bot gating so we always detect other bots. (#481)
@@ -1362,6 +1412,19 @@ impl EventHandler for Handler {
     }
 
     async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
+        let guild_id = match &interaction {
+            Interaction::Command(cmd) => cmd.guild_id.map(|id| id.get()),
+            Interaction::Component(comp) => comp.guild_id.map(|id| id.get()),
+            _ => None,
+        };
+        if !self.guild_allowed(guild_id) {
+            if let Some(guild_id) = guild_id {
+                self.reject_disallowed_guild_interaction(&ctx, &interaction, guild_id)
+                    .await;
+            }
+            return;
+        }
+
         match interaction {
             Interaction::Command(cmd) if cmd.data.name == "models" => {
                 self.handle_config_command(&ctx, &cmd, "model", "model")
@@ -2628,6 +2691,19 @@ fn is_trusted_bot_mention(
     is_mentioned && !trusted_bot_ids.is_empty() && trusted_bot_ids.contains(&author_id)
 }
 
+/// Returns true when the message/interaction is allowed by the Discord guild gate.
+/// DMs have no guild ID and are handled by the separate `allow_dm` gate.
+fn is_allowed_guild(
+    allow_all_guilds: bool,
+    allowed_guilds: &HashSet<u64>,
+    guild_id: Option<u64>,
+) -> bool {
+    match guild_id {
+        None => true,
+        Some(id) => allow_all_guilds || allowed_guilds.contains(&id),
+    }
+}
+
 /// Pure decision function: should a DM be processed?
 /// Returns `true` if the DM should be processed (bot responds).
 /// Mirrors the DM gating logic in EventHandler::message:
@@ -3632,6 +3708,32 @@ mod tests {
             false, // involved
             false, // other_bot_present
         ));
+    }
+
+    // --- Guild gating tests ---
+
+    #[test]
+    fn guild_gate_allows_dm_without_guild_id() {
+        let allowed = HashSet::from([1284331895190196234]);
+        assert!(is_allowed_guild(false, &allowed, None));
+    }
+
+    #[test]
+    fn guild_gate_allows_any_guild_when_allow_all_true() {
+        let allowed = HashSet::new();
+        assert!(is_allowed_guild(true, &allowed, Some(42)));
+    }
+
+    #[test]
+    fn guild_gate_allows_configured_guild() {
+        let allowed = HashSet::from([1284331895190196234, 1500052145108418592]);
+        assert!(is_allowed_guild(false, &allowed, Some(1500052145108418592)));
+    }
+
+    #[test]
+    fn guild_gate_rejects_unconfigured_guild() {
+        let allowed = HashSet::from([1284331895190196234, 1500052145108418592]);
+        assert!(!is_allowed_guild(false, &allowed, Some(42)));
     }
 
     // --- Thread creation skip tests (regression for #656 DM bug) ---

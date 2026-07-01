@@ -2,6 +2,9 @@
 
 [discord]
 bot_token = "${DISCORD_BOT_TOKEN}"
+# allow_all_guilds = true              # true = all servers; false = only allowed_guilds
+#                                      # omitted = auto-detect from list (non-empty → false, empty → true)
+# allowed_guilds = ["1234567890"]      # server/guild IDs; DMs are controlled separately by allow_dm
 # allow_all_channels = true            # true = allow all channels; false = only allowed_channels
 #                                      # omitted = auto-detect from list (non-empty → false, empty → true)
 allowed_channels = ["1234567890"]       # ↑ omitted + non-empty list → auto-detected as false

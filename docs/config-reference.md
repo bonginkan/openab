@@ -32,6 +32,8 @@ Discord adapter. Requires a Discord bot token.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `bot_token` | string | *required* | Discord bot token. Use `${DISCORD_BOT_TOKEN}` for env var. |
+| `allow_all_guilds` | bool \| omit | auto-detect | `true` = all servers; `false` = only `allowed_guilds`. Omitted = inferred from list (non-empty → false, empty → true). DMs are controlled separately by `allow_dm`. |
+| `allowed_guilds` | string[] | `[]` | Discord server/guild IDs to allow. Only checked when `allow_all_guilds` resolves to false. |
 | `allow_all_channels` | bool \| omit | auto-detect | `true` = all channels; `false` = only `allowed_channels`. Omitted = inferred from list (non-empty → false, empty → true). |
 | `allowed_channels` | string[] | `[]` | Channel IDs to allow. Only checked when `allow_all_channels` resolves to false. |
 | `allow_all_users` | bool \| omit | auto-detect | `true` = any user; `false` = only `allowed_users`. Omitted = inferred from list. |
@@ -122,6 +124,8 @@ Outbound file/image attachments from the agent back to the user.
 |-----|------|---------|-------------|
 | `enabled` | bool | `false` | Enable `[[attach_image:path]]` and `[[attach_file:path]]` output directives. Disabled by default to preserve text-only behavior. |
 | `allowed_dirs` | string[] | `[]` | Directories OpenAB may read outbound files from. Empty means only `[agent].working_dir`. |
+| `auto_stage_generated_images` | bool | `false` | Move generated images from known Codex/OpenAB staging locations into an allowed directory before upload. Only applies to `attach_image`. |
+| `auto_stage_dir` | string? | unset | Destination directory for auto-staged generated images. Must resolve inside `allowed_dirs`; when unset, the first allowed directory is used. |
 | `max_bytes` | u64 | `10485760` | Maximum bytes per outbound file. Default is 10 MiB. |
 | `max_files` | usize | `10` | Maximum outbound files per ACP response. |
 
@@ -136,6 +140,8 @@ working_dir = "/home/node"
 [attachments]
 enabled = true
 allowed_dirs = ["/home/node", "/home/node/.codex/generated_images"]
+auto_stage_generated_images = true
+auto_stage_dir = "/home/node/out"
 max_bytes = 10485760
 max_files = 10
 ```

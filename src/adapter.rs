@@ -1,7 +1,7 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::Serialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -602,6 +602,8 @@ pub struct OutboundAttachment {
 struct OutboundAttachments {
     enabled: bool,
     allowed_dirs: Vec<PathBuf>,
+    auto_stage_generated_images: bool,
+    auto_stage_dir: Option<PathBuf>,
     agent_working_dir: PathBuf,
     max_bytes: u64,
     max_files: usize,
@@ -633,6 +635,8 @@ impl OutboundAttachments {
         Self {
             enabled: config.enabled,
             allowed_dirs,
+            auto_stage_generated_images: config.auto_stage_generated_images,
+            auto_stage_dir: config.auto_stage_dir.map(PathBuf::from),
             agent_working_dir,
             max_bytes: config.max_bytes,
             max_files: config.max_files,
@@ -694,7 +698,21 @@ impl OutboundAttachments {
         let canonical = tokio::fs::canonicalize(&candidate)
             .await
             .map_err(|e| anyhow::anyhow!("cannot resolve path {}: {e}", candidate.display()))?;
-        self.ensure_allowed_path(&canonical).await?;
+        let canonical = match self.ensure_allowed_path(&canonical).await {
+            Ok(()) => canonical,
+            Err(e)
+                if matches!(kind, OutboundAttachmentKind::Image)
+                    && self.auto_stage_generated_images =>
+            {
+                match self.stage_generated_image(&canonical).await {
+                    Ok(staged) => staged,
+                    Err(stage_error) => {
+                        return Err(anyhow::anyhow!("{e}; auto-stage failed: {stage_error}"));
+                    }
+                }
+            }
+            Err(e) => return Err(e),
+        };
 
         let metadata = tokio::fs::metadata(&canonical).await?;
         anyhow::ensure!(metadata.is_file(), "path is not a regular file");
@@ -745,6 +763,95 @@ impl OutboundAttachments {
             "path is outside attachments.allowed_dirs (default: agent.working_dir)"
         ))
     }
+
+    async fn stage_generated_image(&self, canonical_file: &Path) -> Result<PathBuf> {
+        self.ensure_generated_image_source(canonical_file).await?;
+
+        let metadata = tokio::fs::metadata(canonical_file).await?;
+        anyhow::ensure!(metadata.is_file(), "path is not a regular file");
+        anyhow::ensure!(
+            metadata.len() <= self.max_bytes,
+            "file is {} bytes, over the {} byte limit",
+            metadata.len(),
+            self.max_bytes
+        );
+
+        let data = tokio::fs::read(canonical_file).await?;
+        anyhow::ensure!(
+            data.len() as u64 <= self.max_bytes,
+            "file is {} bytes, over the {} byte limit",
+            data.len(),
+            self.max_bytes
+        );
+        ensure_supported_image(&data)?;
+
+        let stage_dir = self.resolve_auto_stage_dir().await?;
+        let file_name = canonical_file
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| anyhow::anyhow!("path has no valid filename"))?;
+        let safe_filename = sanitize_stage_filename(file_name);
+        let destination = next_available_stage_path(&stage_dir, &safe_filename).await?;
+        move_file(canonical_file, &destination).await?;
+        let staged = tokio::fs::canonicalize(&destination).await?;
+        self.ensure_allowed_path(&staged).await?;
+
+        tracing::warn!(
+            source = %canonical_file.display(),
+            destination = %staged.display(),
+            "outbound image path outside allowed dirs; moved into allowed auto-stage directory"
+        );
+        Ok(staged)
+    }
+
+    async fn ensure_generated_image_source(&self, canonical_file: &Path) -> Result<()> {
+        for dir in self.generated_image_source_dirs() {
+            if let Ok(canonical_dir) = tokio::fs::canonicalize(dir).await {
+                if canonical_file.starts_with(&canonical_dir) {
+                    return Ok(());
+                }
+            }
+        }
+        Err(anyhow::anyhow!(
+            "path is outside generated-image auto-stage source directories"
+        ))
+    }
+
+    fn generated_image_source_dirs(&self) -> Vec<PathBuf> {
+        let mut dirs = Vec::new();
+        if let Some(home) = std::env::var_os("HOME") {
+            let home = PathBuf::from(home);
+            dirs.push(home.join(".codex/generated_images"));
+            dirs.push(home.join(".codex/openab-images"));
+        }
+        dirs.push(std::env::temp_dir().join("openab-images"));
+        #[cfg(unix)]
+        dirs.push(PathBuf::from("/tmp/openab-images"));
+        dirs
+    }
+
+    async fn resolve_auto_stage_dir(&self) -> Result<PathBuf> {
+        let candidate = self
+            .auto_stage_dir
+            .as_deref()
+            .or_else(|| self.allowed_dirs.first().map(PathBuf::as_path))
+            .ok_or_else(|| anyhow::anyhow!("no attachments.allowed_dirs available"))?;
+        let canonical = tokio::fs::canonicalize(candidate).await.map_err(|e| {
+            anyhow::anyhow!(
+                "cannot resolve auto-stage directory {}: {e}",
+                candidate.display()
+            )
+        })?;
+        let metadata = tokio::fs::metadata(&canonical).await?;
+        anyhow::ensure!(
+            metadata.is_dir(),
+            "auto-stage destination is not a directory"
+        );
+        self.ensure_allowed_path(&canonical).await.map_err(|e| {
+            anyhow::anyhow!("auto-stage destination is outside attachments.allowed_dirs: {e}")
+        })?;
+        Ok(canonical)
+    }
 }
 
 fn ensure_supported_image(data: &[u8]) -> Result<()> {
@@ -771,6 +878,99 @@ fn sanitize_attachment_label(value: &str) -> String {
     format::truncate_chars_tail(&flat, 160)
 }
 
+fn sanitize_stage_filename(value: &str) -> String {
+    let path = Path::new(value);
+    let stem = path
+        .file_stem()
+        .and_then(|part| part.to_str())
+        .map(sanitize_stage_component)
+        .filter(|part| !part.is_empty())
+        .unwrap_or_else(|| "attachment".to_string());
+    let extension = path
+        .extension()
+        .and_then(|part| part.to_str())
+        .map(sanitize_stage_component)
+        .filter(|part| !part.is_empty());
+
+    match extension {
+        Some(extension) => format!("{stem}.{extension}"),
+        None => stem,
+    }
+}
+
+fn sanitize_stage_component(value: &str) -> String {
+    value
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string()
+}
+
+async fn next_available_stage_path(stage_dir: &Path, file_name: &str) -> Result<PathBuf> {
+    let initial = stage_dir.join(file_name);
+    match tokio::fs::metadata(&initial).await {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(initial),
+        Err(e) => return Err(e.into()),
+    }
+
+    let path = Path::new(file_name);
+    let stem = path
+        .file_stem()
+        .and_then(|part| part.to_str())
+        .filter(|part| !part.is_empty())
+        .unwrap_or("attachment");
+    let extension = path
+        .extension()
+        .and_then(|part| part.to_str())
+        .filter(|part| !part.is_empty())
+        .map(|part| format!(".{part}"))
+        .unwrap_or_default();
+
+    for index in 1..1000 {
+        let candidate = stage_dir.join(format!("{stem}-{index}{extension}"));
+        match tokio::fs::metadata(&candidate).await {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(candidate),
+            Err(e) => return Err(e.into()),
+        }
+    }
+
+    Err(anyhow::anyhow!(
+        "could not find an unused auto-stage filename in {}",
+        stage_dir.display()
+    ))
+}
+
+async fn move_file(source: &Path, destination: &Path) -> Result<()> {
+    match tokio::fs::rename(source, destination).await {
+        Ok(()) => Ok(()),
+        Err(rename_error) => {
+            tokio::fs::copy(source, destination)
+                .await
+                .map_err(|copy_error| {
+                    anyhow::anyhow!(
+                        "rename failed: {rename_error}; copy fallback failed: {copy_error}"
+                    )
+                })?;
+            tokio::fs::remove_file(source).await.map_err(|remove_error| {
+                anyhow::anyhow!(
+                    "rename failed: {rename_error}; copied to {}, but failed to remove source: {remove_error}",
+                    destination.display()
+                )
+            })?;
+            Ok(())
+        }
+    }
+}
+
 // --- AdapterRouter ---
 
 /// Shared logic for routing messages to ACP agents, managing sessions,
@@ -782,13 +982,11 @@ pub struct AdapterRouter {
     prompt_hard_timeout: Option<Duration>,
     /// Polling cadence for the recv-loop liveness check (#732).
     liveness_check_interval: std::time::Duration,
-    /// Session keys whose next text chunk should start a new visible response
-    /// section because a mid-turn steer prompt was accepted.
-    pending_steer_separators: Arc<Mutex<HashSet<String>>>,
-    /// Streaming post controllers keyed by session. A mid-turn steer cannot move
-    /// a Discord message, so the controller creates a fresh active post after the
-    /// latest user message and points future edits at it.
-    active_posts: Arc<Mutex<HashMap<String, Arc<StreamingPostController>>>>,
+    /// Session keys with an accepted mid-turn steer awaiting its first post-steer
+    /// text chunk, mapped to the steer prompt text. On that chunk the recv loop
+    /// seals the pre-steer message in place and starts a fresh continuation post
+    /// (below the user's steer message) headed by the steer content.
+    pending_steer_separators: Arc<Mutex<HashMap<String, String>>>,
     outbound_attachments: OutboundAttachments,
     /// Workspace aliases from `[workspace.aliases]` config.
     workspace_aliases: std::collections::HashMap<String, String>,
@@ -859,28 +1057,37 @@ impl StreamingPostController {
         inner.current_msgs = updated_msgs;
     }
 
-    async fn move_after_latest(&self) -> Result<()> {
-        let (adapter, thread_channel, old_msgs, chunks) = {
+    /// Seal the current (pre-steer) message(s) in place and start a fresh
+    /// continuation post below the user's steer message, headed by `header`
+    /// (the rendered steer content). Future edits target the new message(s),
+    /// so the pre-steer content stays visible above as its own section instead
+    /// of being deleted and reflowed.
+    ///
+    /// If the pre-steer content is still just the streaming placeholder (no real
+    /// output yet), the old message(s) are deleted instead of sealed so an empty
+    /// "…" bubble is not left behind.
+    async fn seal_and_start_continuation(&self, header: &str) -> Result<()> {
+        let (adapter, thread_channel, old_msgs, pre_steer_empty) = {
             let inner = self.inner.lock().await;
             (
                 inner.adapter.clone(),
                 inner.thread_channel.clone(),
                 inner.current_msgs.clone(),
-                split_streaming_display(&inner.latest_display, inner.message_limit),
+                is_placeholder_display(&inner.latest_display),
             )
         };
 
-        let mut new_msgs = Vec::with_capacity(chunks.len());
-        for chunk in &chunks {
-            new_msgs.push(adapter.send_message(&thread_channel, chunk).await?);
-        }
+        let new_msg = adapter.send_message(&thread_channel, header).await?;
         {
             let mut inner = self.inner.lock().await;
-            inner.current_msgs = new_msgs;
+            inner.current_msgs = vec![new_msg];
+            inner.latest_display = header.to_string();
         }
-        for msg in &old_msgs {
-            if let Err(e) = adapter.delete_message(msg).await {
-                tracing::warn!(error = ?e, "delete superseded streaming post failed");
+        if pre_steer_empty {
+            for msg in &old_msgs {
+                if let Err(e) = adapter.delete_message(msg).await {
+                    tracing::warn!(error = ?e, "delete placeholder pre-steer post failed");
+                }
             }
         }
         Ok(())
@@ -899,49 +1106,9 @@ impl StreamingPostController {
     }
 }
 
-struct ActivePostGuard {
-    map: Arc<Mutex<HashMap<String, Arc<StreamingPostController>>>>,
-    session_key: String,
-    controller: Arc<StreamingPostController>,
-}
-
-impl ActivePostGuard {
-    async fn enter(
-        map: Arc<Mutex<HashMap<String, Arc<StreamingPostController>>>>,
-        session_key: String,
-        controller: Arc<StreamingPostController>,
-    ) -> Self {
-        map.lock()
-            .await
-            .insert(session_key.clone(), controller.clone());
-        Self {
-            map,
-            session_key,
-            controller,
-        }
-    }
-}
-
-impl Drop for ActivePostGuard {
-    fn drop(&mut self) {
-        let map = self.map.clone();
-        let session_key = self.session_key.clone();
-        let controller = self.controller.clone();
-        tokio::spawn(async move {
-            let mut map = map.lock().await;
-            if let Some(current) = map.get(&session_key) {
-                if Arc::ptr_eq(current, &controller) {
-                    map.remove(&session_key);
-                }
-            }
-        });
-    }
-}
-
 fn prompt_hard_timeout_from_secs(secs: u64) -> Option<Duration> {
     (secs > 0).then(|| Duration::from_secs(secs))
 }
-
 impl AdapterRouter {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -971,8 +1138,7 @@ impl AdapterRouter {
             table_mode,
             prompt_hard_timeout,
             liveness_check_interval: std::time::Duration::from_secs(liveness_check_secs),
-            pending_steer_separators: Arc::new(Mutex::new(HashSet::new())),
-            active_posts: Arc::new(Mutex::new(HashMap::new())),
+            pending_steer_separators: Arc::new(Mutex::new(HashMap::new())),
             outbound_attachments: OutboundAttachments::new(attachments_config, agent_working_dir),
             workspace_aliases,
             bot_home,
@@ -1133,25 +1299,20 @@ impl AdapterRouter {
         thread_key: &str,
         content_blocks: Vec<ContentBlock>,
     ) -> Result<()> {
+        // Record the steer prompt text so the in-flight recv loop can seal the
+        // pre-steer message and head the continuation post with it. The actual
+        // post split happens on the first post-steer text chunk (in the recv
+        // loop), so the new continuation message lands below the user's steer.
+        let steer_text = steer_prompt_text(&content_blocks);
         {
             let mut pending = self.pending_steer_separators.lock().await;
-            pending.insert(thread_key.to_string());
+            pending.insert(thread_key.to_string(), steer_text);
         }
 
         if let Err(e) = self.pool.steer_session(thread_key, &content_blocks).await {
             let mut pending = self.pending_steer_separators.lock().await;
             pending.remove(thread_key);
             return Err(e);
-        }
-
-        let active_post = {
-            let posts = self.active_posts.lock().await;
-            posts.get(thread_key).cloned()
-        };
-        if let Some(post) = active_post {
-            if let Err(e) = post.move_after_latest().await {
-                warn!(error = ?e, "failed to move streaming post after latest message");
-            }
         }
 
         Ok(())
@@ -1220,8 +1381,6 @@ impl AdapterRouter {
         let liveness_check_interval = self.liveness_check_interval;
         let pending_steer_separators = self.pending_steer_separators.clone();
         let thread_key_for_separator = thread_key.to_string();
-        let active_posts = self.active_posts.clone();
-        let thread_key_for_post = thread_key.to_string();
         let outbound_attachments = self.outbound_attachments.clone();
 
         self.pool
@@ -1256,9 +1415,10 @@ impl AdapterRouter {
                     let mut native_last_flush = tokio::time::Instant::now();
                     const NATIVE_FLUSH_MS: u128 = 400;
 
-                    // Streaming edit: send placeholder, spawn edit loop
-                    let (buf_tx, placeholder_post, _active_post_guard, edit_handle) =
-                        if streaming && !native {
+                    // Streaming edit: send placeholder, spawn edit loop.
+                    // Native streaming uses stream_begin/append/finish instead of
+                    // editing a placeholder message.
+                    let (buf_tx, placeholder_post, edit_handle) = if streaming && !native {
                         let initial = if reset {
                             "⚠️ _Session expired, starting fresh..._\n\n…".to_string()
                         } else {
@@ -1281,13 +1441,9 @@ impl AdapterRouter {
                             rx.borrow().clone(),
                             message_limit,
                         ));
-                        let active_post_guard = ActivePostGuard::enter(
-                            active_posts.clone(),
-                            thread_key_for_post.clone(),
-                            post.clone(),
-                        )
-                        .await;
-                        let placeholder_post = active_post_guard.controller.clone();
+                        // The recv loop keeps `placeholder_post` (same controller) to
+                        // seal+roll the post on a mid-turn steer and to finalize.
+                        let placeholder_post = post.clone();
                         let mut buf_rx = rx;
                         let edit_handle = tokio::spawn(async move {
                             let mut last = String::new();
@@ -1305,14 +1461,9 @@ impl AdapterRouter {
                                 }
                             }
                         });
-                        (
-                            Some(tx),
-                            Some(placeholder_post),
-                            Some(active_post_guard),
-                            Some(edit_handle),
-                        )
+                        (Some(tx), Some(placeholder_post), Some(edit_handle))
                     } else {
-                        (None, None, None, None)
+                        (None, None, None)
                     };
 
                     // (#732) Liveness-aware recv loop. Filters stale id-bearing
@@ -1369,11 +1520,42 @@ impl AdapterRouter {
                         if let Some(event) = classify_notification(&notification) {
                             match event {
                                 AcpEvent::Text(t) => {
-                                    let separate = {
+                                    let steer = {
                                         let mut pending = pending_steer_separators.lock().await;
                                         pending.remove(&thread_key_for_separator)
                                     };
-                                    append_text_chunk(&mut text_buf, &t, separate);
+                                    let native_delta = if let Some(steer_text) = steer {
+                                        // First post-steer chunk: open a new section
+                                        // headed by the steer content.
+                                        let header = render_steer_header(&steer_text);
+                                        if let Some(post) = &placeholder_post {
+                                            // Streaming edit path: seal the pre-steer
+                                            // message in place and roll edits onto a
+                                            // fresh post below the user's steer message.
+                                            tool_lines.clear();
+                                            text_buf.clear();
+                                            text_buf.push_str(&header);
+                                            text_buf.push_str("\n\n");
+                                            if let Err(e) =
+                                                post.seal_and_start_continuation(&header).await
+                                            {
+                                                warn!(error = ?e, "failed to start steer continuation post");
+                                            }
+                                            text_buf.push_str(&t);
+                                        } else {
+                                            // Non-streaming and native-streaming paths
+                                            // keep the steer section inline in the
+                                            // final turn content.
+                                            ensure_response_separator(&mut text_buf, &header);
+                                            text_buf.push_str(&header);
+                                            text_buf.push_str("\n\n");
+                                            text_buf.push_str(&t);
+                                        }
+                                        format!("{header}\n\n{t}")
+                                    } else {
+                                        append_text_chunk(&mut text_buf, &t, false);
+                                        t.clone()
+                                    };
                                     if native {
                                         // Lazy stream_begin: open the stream on first text.
                                         if native_msg.is_none() && !stream_begin_failed {
@@ -1386,7 +1568,7 @@ impl AdapterRouter {
                                             }
                                         }
                                         if let Some(msg) = &native_msg {
-                                            native_pending.push_str(&t);
+                                            native_pending.push_str(&native_delta);
                                             if native_last_flush.elapsed().as_millis()
                                                 >= NATIVE_FLUSH_MS
                                                 && !native_pending.is_empty()
@@ -1742,8 +1924,30 @@ impl AdapterRouter {
                                 post.delete_current_messages().await;
                             }
                         } else {
+                            // Normal streaming: edit the placeholder post into the
+                            // final content. Mention-bearing paragraphs are pulled
+                            // out and posted as a fresh message so the ping fires —
+                            // Discord does not notify on edits, so a mention folded
+                            // into the edited post would never notify the target.
                             if !final_content.is_empty() {
-                                post.edit(&final_content).await;
+                                let (body, mentions) =
+                                    split_off_mention_paragraphs(&final_content);
+                                if mentions.is_empty() {
+                                    post.edit(&final_content).await;
+                                } else {
+                                    if body.is_empty() {
+                                        post.delete_current_messages().await;
+                                    } else {
+                                        post.edit(&body).await;
+                                    }
+                                    for chunk in
+                                        format::split_message(&mentions, message_limit)
+                                    {
+                                        let _ = adapter
+                                            .send_message(&thread_channel, &chunk)
+                                            .await;
+                                    }
+                                }
                             }
                             if !attachments.is_empty() {
                                 match send_outbound_attachments(
@@ -1921,6 +2125,92 @@ fn append_text_chunk(text_buf: &mut String, chunk: &str, separate_response: bool
         text_buf.push('\n');
     }
     text_buf.push_str(chunk);
+}
+
+/// Concatenate the text of a steer prompt's content blocks (non-text blocks,
+/// e.g. images, are ignored for the header).
+fn steer_prompt_text(blocks: &[ContentBlock]) -> String {
+    blocks
+        .iter()
+        .filter_map(|b| match b {
+            ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string()
+}
+
+/// Render the steer content as the header of the continuation post — a Markdown
+/// quote so the "Steer内容" section reads clearly above the post-steer output.
+fn render_steer_header(steer_text: &str) -> String {
+    let trimmed = steer_text.trim();
+    if trimmed.is_empty() {
+        return "↪ **Steer**".to_string();
+    }
+    let quoted = trimmed
+        .lines()
+        .map(|l| format!("> {l}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("↪ **Steer**\n{quoted}")
+}
+
+/// True when the streaming post still only holds the placeholder ("…") or the
+/// session-reset notice — i.e. no real pre-steer output to keep.
+fn is_placeholder_display(display: &str) -> bool {
+    let t = display.trim();
+    if t.is_empty() || t == "…" || t == "\u{200b}" {
+        return true;
+    }
+    let stripped = t
+        .trim_start_matches("⚠️ _Session expired, starting fresh..._")
+        .trim();
+    stripped.is_empty() || stripped == "…"
+}
+
+/// True when `s` contains a Discord mention that would notify on a fresh post:
+/// `@everyone`/`@here`, or an id mention `<@id>` / `<@!id>` / `<@&id>`.
+fn contains_mention(s: &str) -> bool {
+    s.contains("@everyone") || s.contains("@here") || has_id_mention(s)
+}
+
+fn has_id_mention(s: &str) -> bool {
+    let mut rest = s;
+    while let Some(pos) = rest.find("<@") {
+        let after = &rest[pos + 2..];
+        let after = after
+            .strip_prefix('!')
+            .or_else(|| after.strip_prefix('&'))
+            .unwrap_or(after);
+        let digit_len = after.chars().take_while(|c| c.is_ascii_digit()).count();
+        if digit_len > 0 && after[digit_len..].starts_with('>') {
+            return true;
+        }
+        rest = &rest[pos + 2..];
+    }
+    false
+}
+
+/// Split rendered content into (body, mentions): paragraphs (blank-line
+/// separated) that contain a mention are pulled out, preserving order, so they
+/// can be posted as a fresh message — Discord does not notify on edits, so a
+/// mention folded into the edited streaming post would never ping.
+fn split_off_mention_paragraphs(content: &str) -> (String, String) {
+    let mut body: Vec<&str> = Vec::new();
+    let mut mentions: Vec<&str> = Vec::new();
+    for para in content.split("\n\n") {
+        if contains_mention(para) {
+            mentions.push(para);
+        } else {
+            body.push(para);
+        }
+    }
+    (
+        body.join("\n\n").trim().to_string(),
+        mentions.join("\n\n").trim().to_string(),
+    )
 }
 
 fn should_separate_stream_chunk(text_buf: &str, chunk: &str) -> bool {
@@ -2567,6 +2857,71 @@ mod tests {
         assert_eq!(chunks, vec!["\u{200b}".to_string()]);
     }
 
+    #[test]
+    fn steer_prompt_text_joins_text_blocks_only() {
+        let blocks = vec![
+            ContentBlock::Text {
+                text: "  use bun instead".to_string(),
+            },
+            ContentBlock::Text {
+                text: "and add a test  ".to_string(),
+            },
+        ];
+        assert_eq!(
+            steer_prompt_text(&blocks),
+            "use bun instead\nand add a test"
+        );
+    }
+
+    #[test]
+    fn render_steer_header_quotes_each_line() {
+        let header = render_steer_header("change the title\nkeep the body");
+        assert_eq!(header, "↪ **Steer**\n> change the title\n> keep the body");
+    }
+
+    #[test]
+    fn render_steer_header_empty_falls_back_to_label() {
+        assert_eq!(render_steer_header("   "), "↪ **Steer**");
+    }
+
+    #[test]
+    fn is_placeholder_display_detects_placeholders() {
+        assert!(is_placeholder_display(""));
+        assert!(is_placeholder_display("…"));
+        assert!(is_placeholder_display("\u{200b}"));
+        assert!(is_placeholder_display(
+            "⚠️ _Session expired, starting fresh..._\n\n…"
+        ));
+        assert!(!is_placeholder_display("real pre-steer output"));
+    }
+
+    #[test]
+    fn contains_mention_detects_all_mention_forms() {
+        assert!(contains_mention("ping <@123456789>"));
+        assert!(contains_mention("nick <@!123456789> form"));
+        assert!(contains_mention("role <@&987654321> form"));
+        assert!(contains_mention("attention @everyone please"));
+        assert!(contains_mention("hey @here now"));
+        assert!(!contains_mention("just <@notanid> and an email a@b.com"));
+        assert!(!contains_mention("plain text with no mention"));
+    }
+
+    #[test]
+    fn split_off_mention_paragraphs_separates_only_mention_paragraphs() {
+        let content = "intro paragraph\n\nping <@123456789> please\n\nclosing paragraph";
+        let (body, mentions) = split_off_mention_paragraphs(content);
+        assert_eq!(body, "intro paragraph\n\nclosing paragraph");
+        assert_eq!(mentions, "ping <@123456789> please");
+    }
+
+    #[test]
+    fn split_off_mention_paragraphs_no_mention_keeps_body() {
+        let content = "first\n\nsecond";
+        let (body, mentions) = split_off_mention_paragraphs(content);
+        assert_eq!(body, "first\n\nsecond");
+        assert!(mentions.is_empty());
+    }
+
     fn test_png_bytes() -> Vec<u8> {
         let img = image::RgbImage::new(1, 1);
         let mut buf = Cursor::new(Vec::new());
@@ -2582,6 +2937,8 @@ mod tests {
         let cfg = AttachmentsConfig {
             enabled: true,
             allowed_dirs: vec![dir.path().to_string_lossy().to_string()],
+            auto_stage_generated_images: false,
+            auto_stage_dir: None,
             max_bytes: 1024 * 1024,
             max_files: 10,
         };
@@ -2605,6 +2962,8 @@ mod tests {
         let cfg = AttachmentsConfig {
             enabled: true,
             allowed_dirs: vec![dir.path().to_string_lossy().to_string()],
+            auto_stage_generated_images: false,
+            auto_stage_dir: None,
             max_bytes: 1024 * 1024,
             max_files: 10,
         };
@@ -2628,6 +2987,8 @@ mod tests {
         let cfg = AttachmentsConfig {
             enabled: true,
             allowed_dirs: vec![dir.path().to_string_lossy().to_string()],
+            auto_stage_generated_images: false,
+            auto_stage_dir: None,
             max_bytes: 1024 * 1024,
             max_files: 10,
         };
@@ -2651,6 +3012,8 @@ mod tests {
         let cfg = AttachmentsConfig {
             enabled: true,
             allowed_dirs: vec![allowed.path().to_string_lossy().to_string()],
+            auto_stage_generated_images: false,
+            auto_stage_dir: None,
             max_bytes: 1024 * 1024,
             max_files: 10,
         };
@@ -2666,12 +3029,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn outbound_attachments_auto_stages_generated_image_into_allowed_dir() {
+        let allowed = tempfile::tempdir().unwrap();
+        let generated_root = std::env::temp_dir().join("openab-images");
+        std::fs::create_dir_all(&generated_root).unwrap();
+        let generated_dir = tempfile::tempdir_in(&generated_root).unwrap();
+        let image_path = generated_dir.path().join("generated.png");
+        std::fs::write(&image_path, test_png_bytes()).unwrap();
+        let cfg = AttachmentsConfig {
+            enabled: true,
+            allowed_dirs: vec![allowed.path().to_string_lossy().to_string()],
+            auto_stage_generated_images: true,
+            auto_stage_dir: Some(allowed.path().to_string_lossy().to_string()),
+            max_bytes: 1024 * 1024,
+            max_files: 10,
+        };
+        let outbound = OutboundAttachments::new(cfg, allowed.path().to_string_lossy().to_string());
+
+        let (files, warnings) = outbound
+            .load_attachments(&[image_path.to_string_lossy().to_string()], &[])
+            .await;
+
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].filename, "generated.png");
+        assert!(allowed.path().join("generated.png").exists());
+        assert!(!image_path.exists());
+    }
+
+    #[tokio::test]
+    async fn outbound_attachments_auto_stage_rejects_untrusted_outside_image() {
+        let allowed = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let image_path = outside.path().join("secret.png");
+        std::fs::write(&image_path, test_png_bytes()).unwrap();
+        let cfg = AttachmentsConfig {
+            enabled: true,
+            allowed_dirs: vec![allowed.path().to_string_lossy().to_string()],
+            auto_stage_generated_images: true,
+            auto_stage_dir: Some(allowed.path().to_string_lossy().to_string()),
+            max_bytes: 1024 * 1024,
+            max_files: 10,
+        };
+        let outbound = OutboundAttachments::new(cfg, allowed.path().to_string_lossy().to_string());
+
+        let (files, warnings) = outbound
+            .load_attachments(&[image_path.to_string_lossy().to_string()], &[])
+            .await;
+
+        assert!(files.is_empty());
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("outside attachments.allowed_dirs"));
+        assert!(image_path.exists());
+    }
+
+    #[tokio::test]
     async fn outbound_attachments_relative_path_uses_agent_working_dir() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("relative.png"), test_png_bytes()).unwrap();
         let cfg = AttachmentsConfig {
             enabled: true,
             allowed_dirs: Vec::new(),
+            auto_stage_generated_images: false,
+            auto_stage_dir: None,
             max_bytes: 1024 * 1024,
             max_files: 10,
         };
@@ -2692,6 +3112,8 @@ mod tests {
         let cfg = AttachmentsConfig {
             enabled: false,
             allowed_dirs: vec![dir.path().to_string_lossy().to_string()],
+            auto_stage_generated_images: false,
+            auto_stage_dir: None,
             max_bytes: 1024 * 1024,
             max_files: 10,
         };

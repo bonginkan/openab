@@ -112,6 +112,7 @@ allowed_dirs = ["/home/node", "/home/node/.codex/generated_images"]
 - Multiple `attach_image` directives are allowed; `attachments.max_files` caps files per response.
 - Unlike other directives, `attach_image` can be emitted either in the initial directive header or later in the response outside code blocks.
 - Directives are stripped from visible text.
+- When `attachments.auto_stage_generated_images = true`, OpenAB can move generated images from known Codex/OpenAB staging directories into `attachments.auto_stage_dir` before upload. The destination must still be inside `attachments.allowed_dirs`.
 - If validation or upload fails, OpenAB sends a warning instead of exposing the directive.
 
 **Security**: OpenAB canonicalizes the requested file path and only reads files under `attachments.allowed_dirs` (or `[agent].working_dir` by default). Do not set `allowed_dirs` wider than the directory where agents intentionally write shareable artifacts.
