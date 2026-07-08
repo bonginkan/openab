@@ -2358,7 +2358,10 @@ mod tests {
                 text: "and add a test  ".to_string(),
             },
         ];
-        assert_eq!(steer_prompt_text(&blocks), "use bun instead\nand add a test");
+        assert_eq!(
+            steer_prompt_text(&blocks),
+            "use bun instead\nand add a test"
+        );
     }
 
     #[test]

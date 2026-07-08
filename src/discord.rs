@@ -253,6 +253,7 @@ pub struct Handler {
     pub allowed_channels: HashSet<u64>,
     pub allowed_users: HashSet<u64>,
     pub stt_config: SttConfig,
+    pub inbound_attachment_content_blocks: bool,
     pub adapter: OnceLock<Arc<dyn ChatAdapter>>,
     pub allow_bot_messages: AllowBots,
     pub trusted_bot_ids: HashSet<u64>,
@@ -738,8 +739,10 @@ impl EventHandler for Handler {
 
         let prompt = resolve_mentions(&msg.content, bot_id, &self.allowed_role_ids);
 
-        // No text and no attachments → skip
-        if prompt.is_empty() && msg.attachments.is_empty() {
+        // No dispatchable text/content → skip.
+        if prompt.is_empty()
+            && (msg.attachments.is_empty() || !self.inbound_attachment_content_blocks)
+        {
             return;
         }
 
@@ -761,8 +764,8 @@ impl EventHandler for Handler {
             &bot_id.to_string(),
         );
 
-        // Build extra content blocks from attachments (audio -> STT, text -> inline,
-        // image -> encode, video -> URL for agent-side inspection).
+        // Build extra content blocks from attachments when enabled (audio -> STT,
+        // text -> inline, image -> encode, video -> URL for agent-side inspection).
         let mut extra_blocks = Vec::new();
         let mut echo_entries: Vec<crate::stt::EchoEntry> = Vec::new();
         let mut failed_image_files: Vec<String> = Vec::new();
@@ -771,105 +774,114 @@ impl EventHandler for Handler {
         const TEXT_TOTAL_CAP: u64 = 1024 * 1024; // 1 MB total for all text file attachments
         const TEXT_FILE_COUNT_CAP: u32 = 5;
 
-        for attachment in &msg.attachments {
-            let mime = attachment.content_type.as_deref().unwrap_or("");
-            if media::is_audio_mime(mime) {
-                if self.stt_config.enabled {
-                    let mime_clean = mime.split(';').next().unwrap_or(mime).trim();
-                    match media::download_and_transcribe(
+        if self.inbound_attachment_content_blocks {
+            for attachment in &msg.attachments {
+                let mime = attachment.content_type.as_deref().unwrap_or("");
+                if media::is_audio_mime(mime) {
+                    if self.stt_config.enabled {
+                        let mime_clean = mime.split(';').next().unwrap_or(mime).trim();
+                        match media::download_and_transcribe(
+                            &attachment.url,
+                            &attachment.filename,
+                            mime_clean,
+                            u64::from(attachment.size),
+                            &self.stt_config,
+                            None,
+                        )
+                        .await
+                        {
+                            Some(transcript) => {
+                                debug!(filename = %attachment.filename, chars = transcript.len(), "voice transcript injected");
+                                extra_blocks.insert(
+                                    0,
+                                    ContentBlock::Text {
+                                        text: format!("[Voice message transcript]: {transcript}"),
+                                    },
+                                );
+                                echo_entries.push(crate::stt::EchoEntry::Success(transcript));
+                            }
+                            None => {
+                                warn!(filename = %attachment.filename, "STT failed for voice attachment");
+                                echo_entries.push(crate::stt::EchoEntry::Failed);
+                            }
+                        }
+                    } else {
+                        tracing::warn!(filename = %attachment.filename, "skipping audio attachment (STT disabled)");
+                        let msg_ref = discord_msg_ref(&msg);
+                        let _ = adapter.add_reaction(&msg_ref, "🎤").await;
+                    }
+                } else if media::is_text_file(
+                    &attachment.filename,
+                    attachment.content_type.as_deref(),
+                ) {
+                    if text_file_count >= TEXT_FILE_COUNT_CAP {
+                        tracing::warn!(filename = %attachment.filename, count = text_file_count, "text file count cap reached, skipping");
+                        continue;
+                    }
+                    // Pre-check with Discord-reported size (fast path, avoids unnecessary download).
+                    // Running total uses actual downloaded bytes for accurate accounting.
+                    if text_file_bytes + u64::from(attachment.size) > TEXT_TOTAL_CAP {
+                        tracing::warn!(filename = %attachment.filename, total = text_file_bytes, "text attachments total exceeds 1MB cap, skipping remaining");
+                        continue;
+                    }
+                    if let Some((block, actual_bytes)) = media::download_and_read_text_file(
                         &attachment.url,
                         &attachment.filename,
-                        mime_clean,
                         u64::from(attachment.size),
-                        &self.stt_config,
                         None,
                     )
                     .await
                     {
-                        Some(transcript) => {
-                            debug!(filename = %attachment.filename, chars = transcript.len(), "voice transcript injected");
-                            extra_blocks.insert(
-                                0,
-                                ContentBlock::Text {
-                                    text: format!("[Voice message transcript]: {transcript}"),
-                                },
-                            );
-                            echo_entries.push(crate::stt::EchoEntry::Success(transcript));
-                        }
-                        None => {
-                            warn!(filename = %attachment.filename, "STT failed for voice attachment");
-                            echo_entries.push(crate::stt::EchoEntry::Failed);
-                        }
-                    }
-                } else {
-                    tracing::warn!(filename = %attachment.filename, "skipping audio attachment (STT disabled)");
-                    let msg_ref = discord_msg_ref(&msg);
-                    let _ = adapter.add_reaction(&msg_ref, "🎤").await;
-                }
-            } else if media::is_text_file(&attachment.filename, attachment.content_type.as_deref())
-            {
-                if text_file_count >= TEXT_FILE_COUNT_CAP {
-                    tracing::warn!(filename = %attachment.filename, count = text_file_count, "text file count cap reached, skipping");
-                    continue;
-                }
-                // Pre-check with Discord-reported size (fast path, avoids unnecessary download).
-                // Running total uses actual downloaded bytes for accurate accounting.
-                if text_file_bytes + u64::from(attachment.size) > TEXT_TOTAL_CAP {
-                    tracing::warn!(filename = %attachment.filename, total = text_file_bytes, "text attachments total exceeds 1MB cap, skipping remaining");
-                    continue;
-                }
-                if let Some((block, actual_bytes)) = media::download_and_read_text_file(
-                    &attachment.url,
-                    &attachment.filename,
-                    u64::from(attachment.size),
-                    None,
-                )
-                .await
-                {
-                    text_file_bytes += actual_bytes;
-                    text_file_count += 1;
-                    debug!(filename = %attachment.filename, "adding text file attachment");
-                    extra_blocks.push(block);
-                }
-            } else {
-                match media::download_and_encode_image(
-                    &attachment.url,
-                    attachment.content_type.as_deref(),
-                    &attachment.filename,
-                    u64::from(attachment.size),
-                    None,
-                )
-                .await
-                {
-                    Ok(block) => {
-                        debug!(url = %attachment.url, filename = %attachment.filename, "adding image attachment");
+                        text_file_bytes += actual_bytes;
+                        text_file_count += 1;
+                        debug!(filename = %attachment.filename, "adding text file attachment");
                         extra_blocks.push(block);
                     }
-                    Err(media::MediaFetchError::NotAnImage) => {
-                        if media::is_video_file(
-                            &attachment.filename,
-                            attachment.content_type.as_deref(),
-                        ) {
-                            debug!(url = %attachment.url, filename = %attachment.filename, "adding video attachment link");
-                            extra_blocks.push(video_attachment_block(
+                } else {
+                    match media::download_and_encode_image(
+                        &attachment.url,
+                        attachment.content_type.as_deref(),
+                        &attachment.filename,
+                        u64::from(attachment.size),
+                        None,
+                    )
+                    .await
+                    {
+                        Ok(block) => {
+                            debug!(url = %attachment.url, filename = %attachment.filename, "adding image attachment");
+                            extra_blocks.push(block);
+                        }
+                        Err(media::MediaFetchError::NotAnImage) => {
+                            if media::is_video_file(
                                 &attachment.filename,
                                 attachment.content_type.as_deref(),
-                                u64::from(attachment.size),
-                                &attachment.url,
-                            ));
+                            ) {
+                                debug!(url = %attachment.url, filename = %attachment.filename, "adding video attachment link");
+                                extra_blocks.push(video_attachment_block(
+                                    &attachment.filename,
+                                    attachment.content_type.as_deref(),
+                                    u64::from(attachment.size),
+                                    &attachment.url,
+                                ));
+                            }
                         }
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            url = %attachment.url,
-                            filename = %attachment.filename,
-                            error = %e,
-                            "image attachment failed"
-                        );
-                        failed_image_files.push(attachment.filename.clone());
+                        Err(e) => {
+                            tracing::warn!(
+                                url = %attachment.url,
+                                filename = %attachment.filename,
+                                error = %e,
+                                "image attachment failed"
+                            );
+                            failed_image_files.push(attachment.filename.clone());
+                        }
                     }
                 }
             }
+        } else if !msg.attachments.is_empty() {
+            tracing::debug!(
+                num_attachments = msg.attachments.len(),
+                "inbound attachment ContentBlocks disabled; not forwarding attachments to ACP"
+            );
         }
 
         tracing::debug!(

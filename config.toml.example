@@ -75,6 +75,12 @@ working_dir = "/home/agent"
 # list them in inherit_env. Keys in [agent].env take precedence over inherited ones.
 # inherit_env = ["API_BASE_URL", "MODEL_NAME"]
 
+# [inbound_attachments]
+# # Forward inbound attachments into ACP as ContentBlocks. Default true keeps
+# # image/text/STT attachment behavior; set false to leave files on the source
+# # platform and send only typed message text to the agent.
+# content_blocks = true
+
 # [attachments]
 # enabled = false
 # # Enable agent-generated image uploads via [[attach_image:path]] output directives.

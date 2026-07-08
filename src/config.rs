@@ -82,6 +82,8 @@ pub struct Config {
     #[serde(default)]
     pub attachments: AttachmentsConfig,
     #[serde(default)]
+    pub inbound_attachments: InboundAttachmentsConfig,
+    #[serde(default)]
     pub cron: CronConfig,
     #[serde(default)]
     pub hooks: HooksConfig,
@@ -229,6 +231,26 @@ pub struct AttachmentsConfig {
     /// Max outbound files per ACP response.
     #[serde(default = "default_attachment_max_files")]
     pub max_files: usize,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+pub struct InboundAttachmentsConfig {
+    /// Forward inbound attachments into ACP as extra ContentBlocks. Default:
+    /// true to preserve existing image/text/STT attachment behavior.
+    #[serde(default = "default_inbound_attachment_content_blocks")]
+    pub content_blocks: bool,
+}
+
+fn default_inbound_attachment_content_blocks() -> bool {
+    true
+}
+
+impl Default for InboundAttachmentsConfig {
+    fn default() -> Self {
+        Self {
+            content_blocks: default_inbound_attachment_content_blocks(),
+        }
+    }
 }
 
 impl Default for AttachmentsConfig {
@@ -1208,6 +1230,35 @@ max_files = 2
         );
         assert_eq!(cfg.attachments.max_bytes, 1024);
         assert_eq!(cfg.attachments.max_files, 2);
+    }
+
+    #[test]
+    fn inbound_attachments_default_to_content_blocks_enabled() {
+        let toml = r#"
+[discord]
+bot_token = "t"
+
+[agent]
+command = "echo"
+"#;
+        let cfg = parse_config(toml, "test").unwrap();
+        assert!(cfg.inbound_attachments.content_blocks);
+    }
+
+    #[test]
+    fn inbound_attachments_content_blocks_can_be_disabled() {
+        let toml = r#"
+[discord]
+bot_token = "t"
+
+[agent]
+command = "echo"
+
+[inbound_attachments]
+content_blocks = false
+"#;
+        let cfg = parse_config(toml, "test").unwrap();
+        assert!(!cfg.inbound_attachments.content_blocks);
     }
 
     #[test]

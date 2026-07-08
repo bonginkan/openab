@@ -107,6 +107,21 @@ The AI agent subprocess that OpenAB spawns to handle messages via ACP.
 
 ---
 
+## `[inbound_attachments]`
+
+Controls whether user-uploaded attachments are forwarded into the ACP request.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `content_blocks` | bool | `true` | Convert inbound image/text/audio attachments into ACP `ContentBlock`s. Set false to leave files on the source platform and send only typed message text to the agent. |
+
+```toml
+[inbound_attachments]
+content_blocks = false
+```
+
+---
+
 ## `[attachments]`
 
 Outbound file/image attachments from the agent back to the user.
