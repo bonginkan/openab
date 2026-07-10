@@ -1789,6 +1789,36 @@ fn steer_prompt_text(blocks: &[ContentBlock]) -> String {
         .to_string()
 }
 
+/// Make mention syntax inert inside a quoted steer prompt while keeping the
+/// original text readable. Normal response mentions are left untouched.
+fn neutralize_steer_mentions(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut previous = None;
+    let mut chars = text.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        output.push(ch);
+        if ch == '@' {
+            let mention_body = chars.peek().is_some_and(|next| {
+                next.is_ascii_alphanumeric() || matches!(next, '_' | '!' | '&')
+            });
+            let mention_boundary = previous.is_none_or(|prev: char| {
+                !prev.is_ascii_alphanumeric() && !matches!(prev, '_' | '.' | '-')
+            });
+            if mention_body && mention_boundary {
+                output.push('\u{200b}');
+            }
+        }
+        previous = Some(ch);
+    }
+
+    output
+        .replace("<!here>", "<!\u{200b}here>")
+        .replace("<!channel>", "<!\u{200b}channel>")
+        .replace("<!everyone>", "<!\u{200b}everyone>")
+        .replace("<!subteam^", "<!\u{200b}subteam^")
+}
+
 /// Render the steer content as the header of the continuation post — a Markdown
 /// quote so the "Steer内容" section reads clearly above the post-steer output.
 fn render_steer_header(steer_text: &str) -> String {
@@ -1796,7 +1826,8 @@ fn render_steer_header(steer_text: &str) -> String {
     if trimmed.is_empty() {
         return "↪ **Steer**".to_string();
     }
-    let quoted = trimmed
+    let neutralized = neutralize_steer_mentions(trimmed);
+    let quoted = neutralized
         .lines()
         .map(|l| format!("> {l}"))
         .collect::<Vec<_>>()
@@ -2373,6 +2404,27 @@ mod tests {
     #[test]
     fn render_steer_header_empty_falls_back_to_label() {
         assert_eq!(render_steer_header("   "), "↪ **Steer**");
+    }
+
+    #[test]
+    fn render_steer_header_neutralizes_cross_platform_mentions() {
+        let header = render_steer_header(
+            "ask <@123456789> <@!234567890> <@U123ABC|alice> @telegram_user\nnotify <@&345678901> @everyone @here <!here> <!channel> <!everyone> <!subteam^S123>",
+        );
+        assert_eq!(
+            header,
+            "↪ **Steer**\n> ask <@\u{200b}123456789> <@\u{200b}!234567890> <@\u{200b}U123ABC|alice> @\u{200b}telegram_user\n> notify <@\u{200b}&345678901> @\u{200b}everyone @\u{200b}here <!\u{200b}here> <!\u{200b}channel> <!\u{200b}everyone> <!\u{200b}subteam^S123>"
+        );
+        assert!(!contains_mention(&header));
+    }
+
+    #[test]
+    fn render_steer_header_preserves_email_and_channel_reference() {
+        let header = render_steer_header("email dev@example.com; keep <#123456789> unchanged");
+        assert_eq!(
+            header,
+            "↪ **Steer**\n> email dev@example.com; keep <#123456789> unchanged"
+        );
     }
 
     #[test]
