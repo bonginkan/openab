@@ -2853,7 +2853,7 @@ mod tests {
     /// Hard limit also carries count for warn-once semantics.
     #[test]
     fn hard_limit_warn_once_semantics() {
-        let mut t = BotTurnTracker::new(HARD_BOT_TURN_LIMIT + 1); // soft > hard so hard fires first
+        let mut t = BotTurnTracker::new(HARD_BOT_TURN_LIMIT);
         for _ in 0..HARD_BOT_TURN_LIMIT - 1 {
             assert_eq!(t.on_bot_message("t1"), TurnResult::Ok);
         }
