@@ -1,0 +1,75 @@
+[discord]
+bot_token = "${DISCORD_BOT_TOKEN}"
+allow_all_channels = true
+allow_all_users = true
+allowed_users = ["473730953735438336", "1517895542213181480"]
+# Bot gate aligned with the other MISAs (Jun 2026-07-02, msg 1522227634660966531):
+# "mentions" drops un-mentioned bot messages BEFORE the turn-cap history fetch, so
+# webhook/notifier floods (e.g. channel 1500052146459119739) are never counted and
+# can't exhaust the bot turn limit. Sibling-MISA collaboration always uses explicit
+# mentions, so nothing legitimate is lost. trusted_bot_ids = Team MISA siblings +
+# worktime dispatcher; all other bots are ignored even when they mention this bot.
+allow_bot_messages = "mentions"
+trusted_bot_ids = [
+  "1510042936027381821", # CC MISA
+  "1522113695482904716", # CC MISA cool
+  "1522126202914213979", # CC MISA hime
+  "1510912873981804627", # Codex MISA
+  "1516725819517567077", # MISA 3
+  "1522154540865163376", # CCL MISA 無印
+  "1522157785050251364", # CCL MISA cool
+  "1522159343242313849", # CCL MISA hime
+  "1510149889462370445", # worktime job dispatcher
+]
+allow_user_messages = "multibot-mentions"
+allow_dm = false
+max_bot_turns = 10000
+
+[agent]
+command = "/home/thep/Documents/GitHub/codex-acp/target/release/codex-acp"
+args = [
+  "-c", "model=\"gpt-5.6-sol\"",
+  "-c", "model_reasoning_effort=\"xhigh\"",
+  "-c", "approval_policy=\"never\"",
+  "-c", "sandbox_mode=\"danger-full-access\"",
+  "-c", "features.fast_mode=true",
+  "-c", "mcp_oauth_credentials_store=\"file\"",
+]
+working_dir = "/home/thep/Documents/GitHub"
+inherit_env = [
+  "AGENT_INVOCATION_MONITOR_WEBHOOK_URL",
+  "CODEX_MISA_SUDO_PASSWORD",
+  "SUDO_ASKPASS",
+]
+
+[attachments]
+enabled = true
+allowed_dirs = [
+  "/home/thep/Documents/GitHub",
+  "/home/thep/.codex/generated_images",
+]
+auto_stage_generated_images = true
+auto_stage_dir = "/home/thep/Documents/GitHub/openab/images"
+max_bytes = 10485760
+max_files = 10
+
+[pool]
+max_sessions = 10
+session_ttl_hours = 24
+prompt_hard_timeout_secs = 0
+liveness_check_secs = 30
+
+[markdown]
+tables = "code"
+
+[reactions]
+enabled = true
+remove_after_reply = false
+tool_display = "compact"
+
+[reactions.timing]
+debounce_ms = 700
+stall_soft_ms = 10000
+stall_hard_ms = 30000
+done_hold_ms = 1500
+error_hold_ms = 2500
