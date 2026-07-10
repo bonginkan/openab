@@ -64,7 +64,6 @@ pub struct SessionPool {
     default_config_options: HashMap<String, String>,
 }
 
-type CancelHandle = (Arc<tokio::sync::Mutex<tokio::process::ChildStdin>>, String);
 type ActiveSnapshot = Vec<(String, Arc<Mutex<AcpConnection>>)>;
 type EvictionCandidate = (String, Arc<Mutex<AcpConnection>>, Instant, Option<String>);
 
@@ -773,7 +772,7 @@ impl SessionPool {
             let Ok(conn) = conn.try_lock() else {
                 if let Some(activity) = activity_map.get(&key) {
                     if classify_hung(activity.in_flight(), activity.age(), hung_threshold) {
-                        let session_id = cancel_map.get(&key).map(|(_, sid)| sid.clone());
+                        let session_id = cancel_map.get(&key).map(|(_, sid, _, _)| sid.clone());
                         warn!(
                             thread_id = %key,
                             session_id = session_id.as_deref().unwrap_or(""),
@@ -787,7 +786,7 @@ impl SessionPool {
                         // task never unwinds, so AcpConnection::Drop never
                         // fires; after the cancel attempt, kill the child
                         // process group directly or the agent leaks forever (F4).
-                        let stdin_handle = cancel_map.get(&key).map(|(stdin, _)| Arc::clone(stdin));
+                        let stdin_handle = cancel_map.get(&key).map(|(stdin, _, _, _)| Arc::clone(stdin));
                         let pgid = pgid_map.get(&key).copied();
                         tokio::spawn(async move {
                             if let (Some(stdin), Some(session_id)) = (stdin_handle, session_id) {

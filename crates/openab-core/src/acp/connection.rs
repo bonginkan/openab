@@ -1107,6 +1107,8 @@ mod reader_loop_tests {
 
         drop(agent_stdout_writer);
         handle.await.unwrap();
+    }
+
     #[test]
     fn session_activity_touch_advances_last_active() {
         let activity = SessionActivity::new();
