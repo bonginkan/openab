@@ -5,8 +5,11 @@ mod config;
 mod create;
 mod get;
 mod delete;
+mod ingress;
+mod secrets;
 
 use clap::{Parser, Subcommand};
+use anyhow::Context;
 
 #[derive(Parser)]
 #[command(name = "oabctl", about = "OAB agent provisioner for ECS")]
@@ -52,14 +55,19 @@ enum Commands {
     },
     /// Delete an OAB service
     Delete {
-        /// Resource type
-        resource: String,
-        /// Resource name
-        name: String,
-        /// ECS cluster name
+        /// Resource type (omit when using -f)
+        resource: Option<String>,
+        /// Resource name (omit when using -f)
+        name: Option<String>,
+        /// Delete all services defined in a manifest file or directory,
+        /// instead of specifying <resource> <name> directly (mirrors `apply -f`)
+        #[arg(short, long, conflicts_with_all = ["resource", "name"])]
+        file: Option<String>,
+        /// ECS cluster name (ignored when using -f — manifests are always
+        /// deployed to the "oab" cluster, same as `apply`)
         #[arg(long, default_value = "default")]
         cluster: String,
-        /// Namespace
+        /// Namespace (ignored when using -f — read from each manifest instead)
         #[arg(long, default_value = "prod")]
         namespace: String,
     },
@@ -126,8 +134,14 @@ async fn main() -> anyhow::Result<()> {
         Commands::Apply { file, no_sync, wait } => apply::run(&config, &file, !no_sync, wait).await,
         Commands::Create { name, namespace, auto_apply } => create::run(&config, &name, &namespace, auto_apply).await,
         Commands::Get { resource, name, cluster } => get::run(&config, &resource, name.as_deref(), &cluster).await,
-        Commands::Delete { resource, name, cluster, namespace } => {
-            delete::run(&config, &resource, &name, &cluster, &namespace).await
+        Commands::Delete { resource, name, file, cluster, namespace } => {
+            if let Some(file) = file {
+                delete::run_from_file(&config, &file).await
+            } else {
+                let resource = resource.context("<RESOURCE> is required when not using -f")?;
+                let name = name.context("<NAME> is required when not using -f")?;
+                delete::run(&config, &resource, &name, &cluster, &namespace).await
+            }
         }
         Commands::Exec { agent, command } => {
             let resolved = ecsctl::alias::resolve(&config, &agent).await?;

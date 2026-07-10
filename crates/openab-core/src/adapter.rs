@@ -992,6 +992,10 @@ pub struct AdapterRouter {
     workspace_aliases: std::collections::HashMap<String, String>,
     /// Bot home directory (security boundary for workspace directives).
     bot_home: std::path::PathBuf,
+    /// Per-platform trust gate (L2 scope + L3 identity). Populated via
+    /// [`AdapterRouter::with_trust`]; empty default = deny-all per platform
+    /// (only consulted by paths wired to the gate — currently the gateway path).
+    trust: crate::trust::PlatformTrustConfigs,
 }
 
 struct StreamingPostInner {
@@ -1142,7 +1146,30 @@ impl AdapterRouter {
             outbound_attachments: OutboundAttachments::new(attachments_config, agent_working_dir),
             workspace_aliases,
             bot_home,
+            trust: crate::trust::PlatformTrustConfigs::default(),
         }
+    }
+
+    /// Attach the per-platform trust registry (builder style, before `Arc`-wrapping).
+    /// Keeps `new()`'s signature stable across its many call sites.
+    pub fn with_trust(mut self, trust: crate::trust::PlatformTrustConfigs) -> Self {
+        self.trust = trust;
+        self
+    }
+
+    /// The single ingress trust gate: evaluate L2 (scope) + L3 (identity) for an
+    /// inbound message. This is the long-term choke point — dispatch paths should
+    /// only be reachable after an `Allow` here. Returns the [`Decision`] so the
+    /// caller can echo on `DenyIdentity` (request-access UX) vs silently drop on
+    /// `DenyScope`.
+    pub fn gate_incoming(
+        &self,
+        platform: &str,
+        channel_id: &str,
+        is_dm: bool,
+        sender_id: &str,
+    ) -> crate::trust::Decision {
+        self.trust.decide(platform, channel_id, is_dm, sender_id)
     }
 
     /// Access the underlying session pool (e.g. for config option queries).

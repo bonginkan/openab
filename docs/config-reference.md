@@ -280,6 +280,18 @@ Session pool settings for managing concurrent agent sessions.
 | `session_ttl_hours` | u64 | `4` | Session time-to-live in hours. Idle sessions are reclaimed after this period. The example config uses `24`. |
 | `prompt_hard_timeout_secs` | u64 | `0` | Hard ceiling for a single prompt in seconds. Set `0` to disable the prompt hard timeout. |
 | `liveness_check_secs` | u64 | `30` | Polling cadence for detecting dead agent processes and enforcing the optional prompt hard timeout. Must be greater than `0`. |
+| `hung_grace_secs` | u64 | `120` | Grace period after `prompt_hard_timeout_secs` before a session stuck with its connection mutex held (in-flight prompt) is force-evicted from the pool. Eviction threshold: `prompt_hard_timeout_secs + hung_grace_secs`. |
+| `default_config_options` | map | `{}` | Config options to set automatically after session creation. Keys are config option IDs (e.g. `mode`, `model`), values are the desired values (e.g. `bypass`, `swe-1-6`). Sent via ACP `session/set_config_option` after each `session/new`. |
+
+**Example** — force Devin to bypass mode and use a specific model:
+
+```toml
+[pool]
+max_sessions = 3
+session_ttl_hours = 1
+default_config_options = { mode = "bypass", model = "swe-1-6" }
+```
+
 
 ---
 
