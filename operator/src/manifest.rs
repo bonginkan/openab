@@ -251,6 +251,10 @@ pub struct EcsRuntime {
     /// Valid values: `X86_64`, `ARM64`.
     #[serde(default = "default_architecture")]
     pub architecture: String,
+    /// Optional task role ARN. When set, overrides the bootstrap-provided
+    /// shared task role. Use for per-service IAM isolation.
+    #[serde(default)]
+    pub task_role_arn: Option<String>,
     pub networking: EcsNetworking,
 }
 

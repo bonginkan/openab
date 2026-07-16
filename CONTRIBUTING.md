@@ -147,13 +147,16 @@ Command::new("/usr/local/bin/agy")
 
 ### E2E testing PRs
 
-Use the PR Preview Build workflow for fast iteration:
+Use the PR Preview Build workflow for fast iteration. For the complete
+workflow, safety requirements, acceptance criteria, evidence template, and
+cleanup steps, see [Canary Testing Pull Requests](/docs/canary-tests.md).
 
 ```bash
 # 1. Push code to PR branch
-# 2. Build the image
-gh workflow run "PR Preview Build" --repo openabdev/openab \
-  --ref <branch> -f pr_number=<N> -f variant=<antigravity|codex|claude|default>
+# 2. A maintainer builds the image from the upstream workflow on main.
+#    The workflow resolves and checks out the PR head automatically.
+gh workflow run pr-preview.yml --repo openabdev/openab \
+  --ref main -f pr_number=<N> -f variant=<antigravity|codex|claude|default>
 
 # 3. Wait for build
 gh run view <run_id> --repo openabdev/openab --json conclusion -q .conclusion
@@ -171,6 +174,18 @@ gh run view <run_id> --repo openabdev/openab --json conclusion -q .conclusion
 - Run `cargo fmt` before committing
 - Run `cargo clippy` and address warnings
 - Keep PRs focused — one feature or fix per PR
+
+## Platform Schema
+
+When modifying a platform adapter (`crates/openab-gateway/src/adapters/*.rs`), check whether the change affects the platform's documented capabilities or feature status. If it does, update the corresponding `docs/platforms/schema/<platform>.toml`.
+
+See [`docs/platforms/README.md`](docs/platforms/README.md) for:
+- The three-schema structure (capability, feature-support, quirks)
+- How to add a new feature to the closed set
+- How to add a new platform
+- Architecture: TOML (machine facts) vs `docs/<platform>.md` (human setup guide)
+
+CI runs conformance tests on schema changes — missing features, invalid enums, or broken code-ref `source` fields will fail the build.
 
 ## PR Lifecycle
 

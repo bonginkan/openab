@@ -3,6 +3,7 @@ use crate::adapter::{ChannelRef, ChatAdapter, MessageRef, SenderContext};
 use crate::bot_turns::{BotTurnTracker, TurnAction, TurnSeverity};
 use crate::config::{AllowBots, AllowUsers, SttConfig};
 use crate::media;
+use crate::trust::l3_gate_applies;
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
@@ -142,6 +143,7 @@ impl SlackAdapter {
         // Persist to disk — multibot is irreversible
         self.multibot_cache.mark_multibot(thread_ts).await;
     }
+
 
     /// Insert a stream entry, bounding the map so aborted turns (begin without a
     /// matching finish) can't leak unboundedly. Normal lifecycle: stream_begin
@@ -449,8 +451,7 @@ impl ChatAdapter for SlackAdapter {
             // instead of failing outright.
             Err(e) if is_block_payload_rejected(&e) => {
                 warn!(error = %e, "markdown block rejected; retrying chat.postMessage text-only");
-                let fallback =
-                    build_post_message_text_only(&channel.channel_id, thread_ts, content);
+                let fallback = build_post_message_text_only(&channel.channel_id, thread_ts, content);
                 self.api_post("chat.postMessage", fallback).await?
             }
             Err(e) => return Err(e),
@@ -544,7 +545,7 @@ impl ChatAdapter for SlackAdapter {
         self.streaming && !other_bot_present
     }
 
-    fn renders_native_tables(&self) -> bool {
+    fn renders_native_tables(&self, _platform: &str) -> bool {
         true
     }
 
@@ -590,10 +591,7 @@ impl ChatAdapter for SlackAdapter {
                     if let Some(ts) = resp["ts"].as_str() {
                         self.insert_stream(
                             ts.to_string(),
-                            StreamEntry {
-                                active: true,
-                                degraded_buf: String::new(),
-                            },
+                            StreamEntry { active: true, degraded_buf: String::new() },
                         )
                         .await;
                         return Ok(make_ref(ts.to_string()));
@@ -607,20 +605,14 @@ impl ChatAdapter for SlackAdapter {
         } else {
             // Expected for bot-authored turns (no recipient bound) and non-user
             // triggers, so warn! rather than error! to avoid on-call noise.
-            warn!(
-                thread_ts,
-                "no recipient for turn; falling back to post+edit"
-            );
+            warn!(thread_ts, "no recipient for turn; falling back to post+edit");
         }
 
         // Degraded fallback: plain placeholder via send_message; mark inactive.
         let msg = self.send_message(channel, "…").await?;
         self.insert_stream(
             msg.message_id.clone(),
-            StreamEntry {
-                active: false,
-                degraded_buf: String::new(),
-            },
+            StreamEntry { active: false, degraded_buf: String::new() },
         )
         .await;
         Ok(msg)
@@ -708,10 +700,96 @@ const MAX_CONSECUTIVE_BOT_TURNS: usize = 1000;
 const PING_INTERVAL_SECS: u64 = 30;
 const IDLE_TIMEOUT_SECS: u64 = 75;
 const MAX_BACKOFF_SECS: u64 = 30;
+/// Bounds `connect_async` (the WebSocket handshake) in the reconnect path.
+/// `tokio_tungstenite` carries no timeout of its own, so this is the sole
+/// bound against a stalled TLS/WS handshake parking the reconnect task
+/// forever with no logs (see #1279).
+const RECONNECT_TIMEOUT_SECS: u64 = 30;
+/// Bounds `get_socket_mode_url` (the `apps.connections.open` Web API call) in
+/// the reconnect path. Set strictly above the adapter client's own 30s
+/// timeout (see `SlackAdapter::new`) so that timeout — which carries a
+/// diagnosable cause — fires first in the normal case; this constant is a
+/// backstop for the rare case the client builder failed and fell back to an
+/// unbounded `reqwest::Client::new()` (see #1279).
+const RECONNECT_HTTP_TIMEOUT_SECS: u64 = 35;
+/// Bounds outbound `write.send(...)` calls in the live socket loop. The
+/// inbound half-open case is guarded by `IDLE_TIMEOUT_SECS`, but a stalled
+/// *outbound* send parks the loop inside that `select!` branch forever too —
+/// and since it can never reach `ping_interval.tick()`, the idle watchdog
+/// itself becomes unreachable. Same bug class as #1279, on the write side.
+const WRITE_TIMEOUT_SECS: u64 = 10;
+
+/// The Socket Mode WebSocket write half, as produced by splitting the stream
+/// returned from `connect_with_reconnect_timeout`. Named so the nested
+/// generic doesn't have to be repeated at every `send_with_timeout` call
+/// site.
+type SlackWsSink = futures_util::stream::SplitSink<
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    tungstenite::Message,
+>;
+
+/// Result of `connect_with_reconnect_timeout`: the outer `Result` is the
+/// timeout, the inner `Result` is `connect_async`'s own outcome.
+type ConnectResult = std::result::Result<
+    std::result::Result<
+        (
+            tokio_tungstenite::WebSocketStream<
+                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+            >,
+            tungstenite::handshake::client::Response,
+        ),
+        tungstenite::Error,
+    >,
+    tokio::time::error::Elapsed,
+>;
+
+/// Result of `get_socket_mode_url_with_timeout`: `Err` is the outer timeout;
+/// `Ok` carries `get_socket_mode_url`'s own `anyhow::Result`.
+type SocketModeUrlResult = std::result::Result<Result<String>, tokio::time::error::Elapsed>;
 
 /// Next reconnect delay: double, capped. Reset to 1 on a successful connect.
 fn next_backoff(cur: u64) -> u64 {
     (cur * 2).min(MAX_BACKOFF_SECS)
+}
+
+/// Wraps `connect_async` in the reconnect-path timeout. Extracted so the
+/// regression test exercises the exact same code path `run_slack_adapter`
+/// uses, instead of duplicating the timeout expression (#1279).
+async fn connect_with_reconnect_timeout(ws_url: &str) -> ConnectResult {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(RECONNECT_TIMEOUT_SECS),
+        tokio_tungstenite::connect_async(ws_url),
+    )
+    .await
+}
+
+/// Send `msg` on `write`, bounded by `WRITE_TIMEOUT_SECS`. Mirrors
+/// `connect_with_reconnect_timeout`: extracted so every write in the live
+/// socket loop shares one bounded-send implementation instead of each call
+/// site duplicating (or omitting) the timeout.
+async fn send_with_timeout(
+    write: &mut SlackWsSink,
+    msg: tungstenite::Message,
+) -> std::result::Result<std::result::Result<(), tungstenite::Error>, tokio::time::error::Elapsed> {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(WRITE_TIMEOUT_SECS),
+        write.send(msg),
+    )
+    .await
+}
+
+/// Sleep for `backoff_secs`, honoring shutdown. Returns the next backoff
+/// value, or `None` if a shutdown signal arrived during the sleep (caller
+/// should return immediately). Shared by every retry point in the reconnect
+/// loop so backoff/shutdown handling only needs to change in one place.
+async fn wait_backoff_or_shutdown(
+    backoff_secs: u64,
+    shutdown_rx: &mut watch::Receiver<bool>,
+) -> Option<u64> {
+    tokio::select! {
+        _ = tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)) => Some(next_backoff(backoff_secs)),
+        _ = shutdown_rx.changed() => None,
+    }
 }
 
 /// The socket is considered dead (half-open) when no inbound frame has arrived
@@ -726,6 +804,7 @@ fn socket_idle(since_last_inbound: std::time::Duration, timeout: std::time::Dura
 #[allow(clippy::too_many_arguments)]
 pub async fn run_slack_adapter(
     adapter: Arc<SlackAdapter>,
+    router: Arc<crate::adapter::AdapterRouter>,
     app_token: String,
     allow_all_channels: bool,
     allow_all_users: bool,
@@ -739,6 +818,7 @@ pub async fn run_slack_adapter(
     inbound_attachment_content_blocks: bool,
     mut shutdown_rx: watch::Receiver<bool>,
     dispatcher: Arc<crate::dispatch::Dispatcher>,
+    #[cfg(feature = "filestore")] filestore: Option<Arc<crate::filestore::Filestore>>,
 ) -> Result<()> {
     let bot_token = adapter.bot_token().to_string();
     let bot_turns = Arc::new(tokio::sync::Mutex::new(BotTurnTracker::new(max_bot_turns)));
@@ -754,22 +834,33 @@ pub async fn run_slack_adapter(
             return Ok(());
         }
 
-        let ws_url = match get_socket_mode_url(&app_token).await {
-            Ok(url) => url,
-            Err(e) => {
+        let ws_url = match get_socket_mode_url_with_timeout(&adapter.client, &app_token).await {
+            Ok(Ok(url)) => url,
+            Ok(Err(e)) => {
                 error!(err = %e, backoff = backoff_secs, "failed to get Socket Mode URL, retrying");
-                tokio::select! {
-                    _ = tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)) => {}
-                    _ = shutdown_rx.changed() => { return Ok(()); }
+                match wait_backoff_or_shutdown(backoff_secs, &mut shutdown_rx).await {
+                    Some(next) => backoff_secs = next,
+                    None => return Ok(()),
                 }
-                backoff_secs = next_backoff(backoff_secs);
+                continue;
+            }
+            Err(_) => {
+                error!(
+                    backoff = backoff_secs,
+                    timeout = RECONNECT_HTTP_TIMEOUT_SECS,
+                    "get Socket Mode URL timed out, retrying"
+                );
+                match wait_backoff_or_shutdown(backoff_secs, &mut shutdown_rx).await {
+                    Some(next) => backoff_secs = next,
+                    None => return Ok(()),
+                }
                 continue;
             }
         };
         info!(url = %ws_url, "connecting to Slack Socket Mode");
 
-        match tokio_tungstenite::connect_async(&ws_url).await {
-            Ok((ws_stream, _)) => {
+        match connect_with_reconnect_timeout(&ws_url).await {
+            Ok(Ok((ws_stream, _))) => {
                 info!("Slack Socket Mode connected");
                 backoff_secs = 1; // reset on success
                 let (mut write, mut read) = ws_stream.split();
@@ -794,9 +885,31 @@ pub async fn run_slack_adapter(
                                     // Acknowledge the envelope immediately
                                     if let Some(envelope_id) = envelope["envelope_id"].as_str() {
                                         let ack = serde_json::json!({"envelope_id": envelope_id});
-                                        let _ = write
-                                            .send(tungstenite::Message::Text(ack.to_string()))
-                                            .await;
+                                        // Reconnect before dispatch if the ack cannot be written;
+                                        // Slack redelivers unacked envelopes, avoiding work it
+                                        // still considers pending.
+                                        match send_with_timeout(
+                                            &mut write,
+                                            tungstenite::Message::Text(ack.to_string()),
+                                        )
+                                        .await
+                                        {
+                                            Ok(Err(e)) => {
+                                                warn!(
+                                                    error = %e,
+                                                    "Slack Socket Mode envelope ack failed, reconnecting"
+                                                );
+                                                break;
+                                            }
+                                            Err(_) => {
+                                                warn!(
+                                                    timeout = WRITE_TIMEOUT_SECS,
+                                                    "Slack Socket Mode envelope ack timed out, reconnecting"
+                                                );
+                                                break;
+                                            }
+                                            Ok(Ok(())) => {}
+                                        }
                                     }
 
                                     // Slash commands and interactive block_actions aren't
@@ -843,6 +956,7 @@ pub async fn run_slack_adapter(
                                                 }
                                                 let event = event.clone();
                                                 let adapter = adapter.clone();
+                                                let router = router.clone();
                                                 let bot_token = bot_token.clone();
                                                 let allowed_channels = allowed_channels.clone();
                                                 let allowed_users = allowed_users.clone();
@@ -850,6 +964,8 @@ pub async fn run_slack_adapter(
                                                 let inbound_attachment_content_blocks =
                                                     inbound_attachment_content_blocks;
                                                 let dispatcher = dispatcher.clone();
+                                                #[cfg(feature = "filestore")]
+                                                let filestore = filestore.clone();
                                                 let team_id = envelope["payload"]["team_id"]
                                                     .as_str()
                                                     .unwrap_or("")
@@ -859,6 +975,7 @@ pub async fn run_slack_adapter(
                                                         &event,
                                                         &team_id,
                                                         &adapter,
+                                                        &router,
                                                         &bot_token,
                                                         allow_all_channels,
                                                         allow_all_users,
@@ -867,6 +984,8 @@ pub async fn run_slack_adapter(
                                                         &stt_config,
                                                         inbound_attachment_content_blocks,
                                                         &dispatcher,
+                                                        #[cfg(feature = "filestore")]
+                                                        filestore.as_deref(),
                                                     )
                                                     .await;
                                                 });
@@ -1097,6 +1216,7 @@ pub async fn run_slack_adapter(
                                                     .to_string();
                                                 let event = event.clone();
                                                 let adapter = adapter.clone();
+                                                let router = router.clone();
                                                 let bot_token = bot_token.clone();
                                                 let allowed_channels = allowed_channels.clone();
                                                 let allowed_users = allowed_users.clone();
@@ -1104,11 +1224,14 @@ pub async fn run_slack_adapter(
                                                 let inbound_attachment_content_blocks =
                                                     inbound_attachment_content_blocks;
                                                 let dispatcher = dispatcher.clone();
+                                                #[cfg(feature = "filestore")]
+                                                let filestore = filestore.clone();
                                                 tokio::spawn(async move {
                                                     handle_message(
                                                         &event,
                                                         &team_id,
                                                         &adapter,
+                                                        &router,
                                                         &bot_token,
                                                         allow_all_channels,
                                                         allow_all_users,
@@ -1117,6 +1240,8 @@ pub async fn run_slack_adapter(
                                                         &stt_config,
                                                         inbound_attachment_content_blocks,
                                                         &dispatcher,
+                                                        #[cfg(feature = "filestore")]
+                                                        filestore.as_deref(),
                                                     )
                                                     .await;
                                                 });
@@ -1126,7 +1251,28 @@ pub async fn run_slack_adapter(
                                     }
                                 }
                                 Ok(tungstenite::Message::Ping(data)) => {
-                                    let _ = write.send(tungstenite::Message::Pong(data)).await;
+                                    match send_with_timeout(
+                                        &mut write,
+                                        tungstenite::Message::Pong(data),
+                                    )
+                                    .await
+                                    {
+                                        Ok(Err(e)) => {
+                                            warn!(
+                                                error = %e,
+                                                "Slack Socket Mode pong send failed, reconnecting"
+                                            );
+                                            break;
+                                        }
+                                        Err(_) => {
+                                            warn!(
+                                                timeout = WRITE_TIMEOUT_SECS,
+                                                "Slack Socket Mode pong send timed out, reconnecting"
+                                            );
+                                            break;
+                                        }
+                                        Ok(Ok(())) => {}
+                                    }
                                 }
                                 Ok(tungstenite::Message::Close(_)) => {
                                     warn!("Slack Socket Mode connection closed by server");
@@ -1150,36 +1296,56 @@ pub async fn run_slack_adapter(
                                 );
                                 break;
                             }
-                            if let Err(e) = write.send(tungstenite::Message::Ping(Vec::new())).await {
-                                warn!(error = %e, "Slack Socket Mode ping failed, reconnecting");
-                                break;
+                            match send_with_timeout(&mut write, tungstenite::Message::Ping(Vec::new())).await {
+                                Ok(Err(e)) => {
+                                    warn!(error = %e, "Slack Socket Mode ping failed, reconnecting");
+                                    break;
+                                }
+                                Err(_) => {
+                                    warn!(
+                                        timeout = WRITE_TIMEOUT_SECS,
+                                        "Slack Socket Mode ping timed out, reconnecting"
+                                    );
+                                    break;
+                                }
+                                Ok(Ok(())) => {}
                             }
                         }
                         _ = shutdown_rx.changed() => {
                             info!("Slack adapter received shutdown signal");
-                            let _ = write.send(tungstenite::Message::Close(None)).await;
+                            let _ = send_with_timeout(&mut write, tungstenite::Message::Close(None)).await;
                             return Ok(());
                         }
                     }
                 }
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 error!(err = %e, backoff = backoff_secs, "failed to connect to Slack Socket Mode, retrying");
+            }
+            Err(_) => {
+                error!(
+                    backoff = backoff_secs,
+                    timeout = RECONNECT_TIMEOUT_SECS,
+                    "Slack Socket Mode connect timed out, retrying"
+                );
             }
         }
 
         warn!(backoff = backoff_secs, "reconnecting to Slack Socket Mode");
-        tokio::select! {
-            _ = tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)) => {}
-            _ = shutdown_rx.changed() => { return Ok(()); }
+        match wait_backoff_or_shutdown(backoff_secs, &mut shutdown_rx).await {
+            Some(next) => backoff_secs = next,
+            None => return Ok(()),
         }
-        backoff_secs = next_backoff(backoff_secs);
     }
 }
 
 /// Call apps.connections.open to get a WebSocket URL for Socket Mode.
-async fn get_socket_mode_url(app_token: &str) -> Result<String> {
-    let client = reqwest::Client::new();
+/// Reuses the adapter's `reqwest::Client` instead of building a fresh
+/// unbounded one per call (#386). The reconnect path is bounded by the
+/// caller's explicit `tokio::time::timeout(RECONNECT_HTTP_TIMEOUT_SECS, ...)`
+/// (see #1279); the client's own 30s timeout (see `SlackAdapter::new`) is a
+/// secondary bound that fires first in the normal case, since it's shorter.
+async fn get_socket_mode_url(client: &reqwest::Client, app_token: &str) -> Result<String> {
     let resp = client
         .post(format!("{SLACK_API}/apps.connections.open"))
         .header("Authorization", format!("Bearer {app_token}"))
@@ -1197,11 +1363,36 @@ async fn get_socket_mode_url(app_token: &str) -> Result<String> {
         .ok_or_else(|| anyhow!("no url in apps.connections.open response"))
 }
 
+/// Wraps `get_socket_mode_url` in the reconnect-path HTTP timeout. Extracted
+/// (mirroring `connect_with_reconnect_timeout`) so the regression test calls
+/// the same production code path `run_slack_adapter` uses, instead of
+/// duplicating the timeout expression.
+async fn get_socket_mode_url_with_timeout(
+    client: &reqwest::Client,
+    app_token: &str,
+) -> SocketModeUrlResult {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(RECONNECT_HTTP_TIMEOUT_SECS),
+        get_socket_mode_url(client, app_token),
+    )
+    .await
+}
+
+/// Whether a Slack conversation ID denotes a DM. Slack conversation IDs are
+/// prefix-typed: `C…` public channel, `G…` private channel/group, `D…` DM.
+/// Only informational for the gate today — Slack's registry entry is L2-open
+/// with `allow_dm=true`, so the decision is identical either way — but passing
+/// the real surface keeps the gate's inputs truthful (cf. #1270 review F2).
+fn is_dm_channel(channel_id: &str) -> bool {
+    channel_id.starts_with('D')
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_message(
     event: &serde_json::Value,
     team_id: &str,
     adapter: &Arc<SlackAdapter>,
+    router: &Arc<crate::adapter::AdapterRouter>,
     bot_token: &str,
     allow_all_channels: bool,
     allow_all_users: bool,
@@ -1210,6 +1401,7 @@ async fn handle_message(
     stt_config: &SttConfig,
     inbound_attachment_content_blocks: bool,
     dispatcher: &Arc<crate::dispatch::Dispatcher>,
+    #[cfg(feature = "filestore")] filestore: Option<&crate::filestore::Filestore>,
 ) {
     let channel_id = match event["channel"].as_str() {
         Some(ch) => ch.to_string(),
@@ -1254,6 +1446,32 @@ async fn handle_message(
         return;
     }
 
+    // Shared ingress trust gate (L3 identity). Redundant-but-matching with
+    // Slack's own user check that already ran above, so it cannot deny anything
+    // already admitted (non-regressive). L2 (channel allowlist) stays in the
+    // adapter for Slack — its registry entry is L2-open.
+    //
+    // Bots are skipped here: the user check above has the same `!is_bot_msg`
+    // bypass (bot admission is handled separately by allow_bot_messages +
+    // trusted_bot_ids), and the shared L3 gate is human-identity only. Running
+    // it on bots would wrongly drop trusted bot-to-bot messages when
+    // allow_all_users=false (multi-agent). Same rationale as Discord (#1270
+    // review F1). Phase 1c makes this authoritative and removes the scattered
+    // check (#1361).
+    if l3_gate_applies(is_bot_msg) {
+        let decision =
+            router.gate_incoming("slack", &channel_id, is_dm_channel(&channel_id), &user_id);
+        if !decision.is_allowed() {
+            tracing::info!(
+                user_id,
+                channel = %channel_id,
+                ?decision,
+                "slack message denied by trust gate"
+            );
+            return;
+        }
+    }
+
     // Capture the native-streaming recipient for THIS turn, now that the sender has
     // passed the channel + user allow-list checks above (so denied/unauthorized
     // senders are never recorded). It rides on the per-turn BufferedMessage to
@@ -1293,154 +1511,195 @@ async fn handle_message(
     let mut text_file_count: u32 = 0;
     let mut failed_image_files: Vec<String> = Vec::new();
 
-    if inbound_attachment_content_blocks {
-        if let Some(files) = files {
-            for file in files {
-                let mimetype_raw = file["mimetype"].as_str().unwrap_or("");
-                let mimetype = strip_mime_params(mimetype_raw);
-                let filename = file["name"].as_str().unwrap_or("file");
-                let size = file["size"].as_u64().unwrap_or(0);
-                // Slack private files require Bearer token to download
-                let url = slack_file_download_url(file);
+    if !inbound_attachment_content_blocks && has_files {
+        debug!("inbound attachment ContentBlocks disabled; not forwarding Slack files to ACP");
+    }
+    if let Some(files) = files.filter(|_| inbound_attachment_content_blocks) {
+        for file in files {
+            let mimetype_raw = file["mimetype"].as_str().unwrap_or("");
+            let mimetype = strip_mime_params(mimetype_raw);
+            let filename = file["name"].as_str().unwrap_or("file");
+            let size = file["size"].as_u64().unwrap_or(0);
+            // Slack private files require Bearer token to download
+            let url = slack_file_download_url(file);
 
-                if url.is_empty() {
+            if url.is_empty() {
+                continue;
+            }
+
+            if media::is_audio_mime(mimetype) {
+                if stt_config.enabled {
+                    match media::download_and_transcribe(
+                        url,
+                        filename,
+                        mimetype,
+                        size,
+                        stt_config,
+                        Some(bot_token),
+                    )
+                    .await
+                    {
+                        Some(transcript) => {
+                            debug!(
+                                filename,
+                                chars = transcript.len(),
+                                "voice transcript injected"
+                            );
+                            extra_blocks.insert(
+                                0,
+                                ContentBlock::Text {
+                                    text: format!("[Voice message transcript]: {transcript}"),
+                                },
+                            );
+                            echo_entries.push(crate::stt::EchoEntry::Success(transcript));
+                        }
+                        None => {
+                            warn!(filename, "STT failed for voice attachment");
+                            echo_entries.push(crate::stt::EchoEntry::Failed);
+                        }
+                    }
+                } else {
+                    debug!(filename, "skipping audio attachment (STT disabled)");
+                    let msg_ref = MessageRef {
+                        channel: ChannelRef {
+                            platform: "slack".into(),
+                            channel_id: channel_id.clone(),
+                            thread_id: thread_ts.clone(),
+                            parent_id: None,
+                            origin_event_id: None,
+                        },
+                        message_id: ts.clone(),
+                    };
+                    let _ = adapter.add_reaction(&msg_ref, "🎤").await;
+                }
+            } else if media::is_text_file(filename, Some(mimetype)) {
+                if text_file_count >= TEXT_FILE_COUNT_CAP {
+                    debug!(
+                        filename,
+                        count = text_file_count,
+                        "text file count cap reached, skipping"
+                    );
                     continue;
                 }
-
-                if media::is_audio_mime(mimetype) {
-                    if stt_config.enabled {
-                        match media::download_and_transcribe(
-                            url,
-                            filename,
-                            mimetype,
-                            size,
-                            stt_config,
-                            Some(bot_token),
-                        )
-                        .await
-                        {
-                            Some(transcript) => {
-                                debug!(
-                                    filename,
-                                    chars = transcript.len(),
-                                    "voice transcript injected"
-                                );
-                                extra_blocks.insert(
-                                    0,
-                                    ContentBlock::Text {
-                                        text: format!("[Voice message transcript]: {transcript}"),
-                                    },
-                                );
-                                echo_entries.push(crate::stt::EchoEntry::Success(transcript));
-                            }
-                            None => {
-                                warn!(filename, "STT failed for voice attachment");
-                                echo_entries.push(crate::stt::EchoEntry::Failed);
-                            }
-                        }
-                    } else {
-                        debug!(filename, "skipping audio attachment (STT disabled)");
-                        let msg_ref = MessageRef {
-                            channel: ChannelRef {
-                                platform: "slack".into(),
-                                channel_id: channel_id.clone(),
-                                thread_id: thread_ts.clone(),
-                                parent_id: None,
-                                origin_event_id: None,
-                            },
-                            message_id: ts.clone(),
-                        };
-                        let _ = adapter.add_reaction(&msg_ref, "🎤").await;
-                    }
-                } else if media::is_text_file(filename, Some(mimetype)) {
-                    if text_file_count >= TEXT_FILE_COUNT_CAP {
+                // Pre-check with Slack-reported size as a fast path when the
+                // field is populated. Slack can report `size == 0` for
+                // externally-backed files, so this is advisory only — the
+                // authoritative cap check happens after download using
+                // `actual_bytes`.
+                // When filestore is configured, skip the cap for files > 512KB (they'll
+                // be uploaded to S3, not inlined).
+                #[cfg(feature = "filestore")]
+                let skip_cap = filestore.is_some() && size > crate::media::TEXT_INLINE_LIMIT;
+                #[cfg(not(feature = "filestore"))]
+                let skip_cap = false;
+                if !skip_cap && size > 0 && text_file_bytes + size > TEXT_TOTAL_CAP {
+                    debug!(
+                        filename,
+                        total = text_file_bytes,
+                        "text attachments total exceeds 1MB cap, skipping remaining"
+                    );
+                    continue;
+                }
+                #[cfg(feature = "filestore")]
+                let text_file_result = media::download_and_read_text_file(
+                    url,
+                    filename,
+                    size,
+                    Some(bot_token),
+                    filestore,
+                ).await;
+                #[cfg(not(feature = "filestore"))]
+                let text_file_result = media::download_and_read_text_file(
+                    url,
+                    filename,
+                    size,
+                    Some(bot_token),
+                ).await;
+                if let Some((block, actual_bytes)) = text_file_result {
+                    if text_file_bytes + actual_bytes > TEXT_TOTAL_CAP {
                         debug!(
-                            filename,
-                            count = text_file_count,
-                            "text file count cap reached, skipping"
-                        );
-                        continue;
-                    }
-                    // Pre-check with Slack-reported size as a fast path when the
-                    // field is populated. Slack can report `size == 0` for
-                    // externally-backed files, so this is advisory only — the
-                    // authoritative cap check happens after download using
-                    // `actual_bytes`.
-                    if size > 0 && text_file_bytes + size > TEXT_TOTAL_CAP {
-                        debug!(
-                            filename,
-                            total = text_file_bytes,
-                            "text attachments total exceeds 1MB cap, skipping remaining"
-                        );
-                        continue;
-                    }
-                    if let Some((block, actual_bytes)) =
-                        media::download_and_read_text_file(url, filename, size, Some(bot_token))
-                            .await
-                    {
-                        if text_file_bytes + actual_bytes > TEXT_TOTAL_CAP {
-                            debug!(
                             filename,
                             running = text_file_bytes,
                             actual = actual_bytes,
                             "text attachments total exceeds 1MB cap after download, dropping file",
                         );
-                            continue;
-                        }
-                        text_file_bytes += actual_bytes;
-                        text_file_count += 1;
-                        debug!(filename, "adding text file attachment");
+                        continue;
+                    }
+                    text_file_bytes += actual_bytes;
+                    text_file_count += 1;
+                    debug!(filename, "adding text file attachment");
+                    extra_blocks.push(block);
+                }
+            } else {
+                match media::download_and_encode_image(
+                    url,
+                    Some(mimetype),
+                    filename,
+                    size,
+                    Some(bot_token),
+                )
+                .await
+                {
+                    Ok(block) => {
+                        debug!(filename, "adding image attachment");
                         extra_blocks.push(block);
                     }
-                } else {
-                    match media::download_and_encode_image(
-                        url,
-                        Some(mimetype),
-                        filename,
-                        size,
-                        Some(bot_token),
-                    )
-                    .await
-                    {
-                        Ok(block) => {
-                            debug!(filename, "adding image attachment");
-                            extra_blocks.push(block);
+                    Err(media::MediaFetchError::NotAnImage) => {
+                        if media::is_video_file(filename, Some(mimetype)) {
+                            extra_blocks.push(ContentBlock::Text {
+                                text: format!(
+                                    "[Video attachment]\nfilename: {}\ncontent_type: {}\nsize_bytes: {}\nurl: {}",
+                                    filename, mimetype, size, url
+                                ),
+                            });
+                        } else {
+                            // Upload unsupported file types to filestore if available
+                            #[cfg(feature = "filestore")]
+                            if let Some(fs) = filestore {
+                                if let Some((block, _)) = media::download_and_upload_any_file(
+                                    url,
+                                    filename,
+                                    size,
+                                    Some(mimetype),
+                                    Some(bot_token),
+                                    fs,
+                                ).await {
+                                    extra_blocks.push(block);
+                                }
+                            }
                         }
-                        Err(media::MediaFetchError::NotAnImage) => {}
-                        Err(media::MediaFetchError::SizeExceeded { actual, limit }) => {
-                            warn!(filename, actual, limit, "image exceeds size limit");
-                            failed_image_files.push(filename.to_string());
-                        }
-                        Err(
-                            media::MediaFetchError::UnsupportedResponseType { .. }
-                            | media::MediaFetchError::InvalidImageBody { .. },
-                        ) => {
-                            warn!(
+                    }
+                    Err(media::MediaFetchError::SizeExceeded { actual, limit }) => {
+                        warn!(filename, actual, limit, "image exceeds size limit");
+                        failed_image_files.push(filename.to_string());
+                    }
+                    Err(
+                        media::MediaFetchError::UnsupportedResponseType { .. }
+                        | media::MediaFetchError::InvalidImageBody { .. },
+                    ) => {
+                        warn!(
                             filename,
                             "image validation failed; server may have returned non-image content"
                         );
-                            failed_image_files.push(filename.to_string());
-                        }
-                        Err(media::MediaFetchError::ProcessingFailed(ref e)) => {
-                            warn!(filename, error = %e, "image post-processing failed");
-                            failed_image_files.push(filename.to_string());
-                        }
-                        Err(media::MediaFetchError::HttpStatus(status))
-                            if status.is_client_error() =>
-                        {
-                            warn!(filename, %status, "image download denied");
-                            failed_image_files.push(filename.to_string());
-                        }
-                        Err(e) => {
-                            warn!(filename, error = %e, "image download failed");
-                            failed_image_files.push(filename.to_string());
-                        }
+                        failed_image_files.push(filename.to_string());
+                    }
+                    Err(media::MediaFetchError::ProcessingFailed(ref e)) => {
+                        warn!(filename, error = %e, "image post-processing failed");
+                        failed_image_files.push(filename.to_string());
+                    }
+                    Err(media::MediaFetchError::HttpStatus(status))
+                        if status.is_client_error() =>
+                    {
+                        warn!(filename, %status, "image download denied");
+                        failed_image_files.push(filename.to_string());
+                    }
+                    Err(e) => {
+                        warn!(filename, error = %e, "image download failed");
+                        failed_image_files.push(filename.to_string());
                     }
                 }
             }
         }
-    } else if has_files {
-        debug!("inbound attachment ContentBlocks disabled; not forwarding Slack files to ACP");
     }
 
     // Notify user if any images couldn't be processed.
@@ -1632,10 +1891,7 @@ fn strip_mime_params(mimetype: &str) -> &str {
 /// mrkdwn delimiters; without escaping, `<!here>` or `` `<@U123>` `` would render
 /// as mentions or @-here pings.
 pub(crate) fn sanitize_slack_filename(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('`', "'")
-        .replace('<', "(")
-        .replace('>', ")")
+    s.replace('&', "&amp;").replace('`', "'").replace('<', "(").replace('>', ")")
 }
 
 /// Returns `true` if `text` contains a Slack user mention for `uid`.
@@ -1646,12 +1902,8 @@ pub(crate) fn sanitize_slack_filename(s: &str) -> String {
 /// misses it.
 fn text_mentions_uid(text: &str, uid: &str) -> bool {
     let prefix = format!("<@{uid}");
-    text.match_indices(&prefix).any(|(i, _)| {
-        matches!(
-            text.as_bytes().get(i + prefix.len()),
-            Some(b'>') | Some(b'|')
-        )
-    })
+    text.match_indices(&prefix)
+        .any(|(i, _)| matches!(text.as_bytes().get(i + prefix.len()), Some(b'>') | Some(b'|')))
 }
 
 fn bot_id_matches_trusted(
@@ -1820,12 +2072,7 @@ fn markdown_to_mrkdwn(text: &str) -> String {
     text.into_owned()
 }
 
-fn build_start_stream_body(
-    channel: &str,
-    thread_ts: &str,
-    user_id: &str,
-    team_id: &str,
-) -> serde_json::Value {
+fn build_start_stream_body(channel: &str, thread_ts: &str, user_id: &str, team_id: &str) -> serde_json::Value {
     serde_json::json!({
         "channel": channel,
         "thread_ts": thread_ts,
@@ -1853,6 +2100,28 @@ fn build_set_status_body(channel_id: &str, thread_ts: &str, status: &str) -> ser
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- trust gate tests ---
+
+    /// Pins the L3 bot-bypass: the shared identity gate must not run for bot
+    /// senders (bot admission = allow_bot_messages + trusted_bot_ids), matching
+    /// the inline user check's `!is_bot_msg` bypass. Regression for #1361
+    /// (mirrors the Discord test for PR #1270 review F4).
+    #[test]
+    fn l3_gate_skips_bots_applies_to_humans() {
+        assert!(!l3_gate_applies(true)); // bot → gate skipped
+        assert!(l3_gate_applies(false)); // human → gate applies
+    }
+
+    /// Pins Slack conversation-ID prefix typing for the gate's `is_dm` input:
+    /// `D…` = DM; `C…` (public) and `G…` (private/group) are not DMs.
+    #[test]
+    fn is_dm_channel_by_prefix() {
+        assert!(is_dm_channel("D0123456789"));
+        assert!(!is_dm_channel("C0123456789"));
+        assert!(!is_dm_channel("G0123456789"));
+        assert!(!is_dm_channel(""));
+    }
 
     // --- builder tests ---
 
@@ -1883,29 +2152,13 @@ mod tests {
 
     #[tokio::test]
     async fn degraded_stream_append_accumulates() {
-        let adapter = SlackAdapter::new(
-            "xoxb-test".into(),
-            std::time::Duration::from_secs(60),
-            AllowBots::Off,
-            true,
-            crate::multibot_cache::MultibotCache::load("/dev/null".into()),
-            true,
-        );
+        let adapter = SlackAdapter::new("xoxb-test".into(), std::time::Duration::from_secs(60), AllowBots::Off, true, crate::multibot_cache::MultibotCache::load("/dev/null".into()), true);
         adapter.streams.lock().await.insert(
             "TS".into(),
-            StreamEntry {
-                active: false,
-                degraded_buf: String::new(),
-            },
+            StreamEntry { active: false, degraded_buf: String::new() },
         );
-        assert_eq!(
-            adapter.accumulate_degraded("TS", "a").await.as_deref(),
-            Some("a")
-        );
-        assert_eq!(
-            adapter.accumulate_degraded("TS", "b").await.as_deref(),
-            Some("ab")
-        );
+        assert_eq!(adapter.accumulate_degraded("TS", "a").await.as_deref(), Some("a"));
+        assert_eq!(adapter.accumulate_degraded("TS", "b").await.as_deref(), Some("ab"));
         // missing stream is not resurrected:
         assert_eq!(adapter.accumulate_degraded("MISSING", "x").await, None);
     }
@@ -1996,10 +2249,7 @@ mod tests {
 
     #[test]
     fn mentions_uid_labelled_form_mid_sentence() {
-        assert!(text_mentions_uid(
-            "please ask <@U123BOT|handle> to run",
-            "U123BOT"
-        ));
+        assert!(text_mentions_uid("please ask <@U123BOT|handle> to run", "U123BOT"));
     }
 
     #[test]
@@ -2117,10 +2367,7 @@ mod tests {
     #[test]
     fn sanitize_leaves_normal_filename_unchanged() {
         assert_eq!(sanitize_slack_filename("photo.png"), "photo.png");
-        assert_eq!(
-            sanitize_slack_filename("my file (1).jpg"),
-            "my file (1).jpg"
-        );
+        assert_eq!(sanitize_slack_filename("my file (1).jpg"), "my file (1).jpg");
     }
 
     #[test]
@@ -2138,7 +2385,10 @@ mod tests {
     #[test]
     fn sanitize_combined_injection_attempt() {
         // A filename constructed to inject a Slack @here ping.
-        assert_eq!(sanitize_slack_filename("`<!here>`"), "'(!here)'");
+        assert_eq!(
+            sanitize_slack_filename("`<!here>`"),
+            "'(!here)'"
+        );
     }
 
     #[test]
@@ -2147,14 +2397,8 @@ mod tests {
         // "&lt;@here&gt;" would round-trip back to "<@here>" and trigger a mention
         // ping if & is not escaped. The & must be escaped first so downstream
         // Slack entity decoding cannot reconstruct a mrkdwn delimiter.
-        assert_eq!(
-            sanitize_slack_filename("&lt;@here&gt;"),
-            "&amp;lt;@here&amp;gt;"
-        );
-        assert_eq!(
-            sanitize_slack_filename("file&name.png"),
-            "file&amp;name.png"
-        );
+        assert_eq!(sanitize_slack_filename("&lt;@here&gt;"), "&amp;lt;@here&amp;gt;");
+        assert_eq!(sanitize_slack_filename("file&name.png"), "file&amp;name.png");
     }
 
     // --- strip_mime_params tests ---
@@ -2194,7 +2438,11 @@ mod tests {
     #[test]
     fn trusted_bot_ids_accepts_resolved_bot_user_id() {
         let trusted = HashSet::from(["U123BOT".to_string()]);
-        assert!(bot_id_matches_trusted(&trusted, "B123BOT", Some("U123BOT")));
+        assert!(bot_id_matches_trusted(
+            &trusted,
+            "B123BOT",
+            Some("U123BOT")
+        ));
     }
 
     #[test]
@@ -2213,14 +2461,7 @@ mod tests {
     #[test]
     fn streaming_per_thread() {
         let ttl = std::time::Duration::from_secs(300);
-        let adapter = SlackAdapter::new(
-            "xoxb-test".into(),
-            ttl,
-            AllowBots::Mentions,
-            false,
-            crate::multibot_cache::MultibotCache::load("/dev/null".into()),
-            true,
-        );
+        let adapter = SlackAdapter::new("xoxb-test".into(), ttl, AllowBots::Mentions, false, crate::multibot_cache::MultibotCache::load("/dev/null".into()), true);
 
         assert!(
             adapter.use_streaming(false),
@@ -2237,70 +2478,22 @@ mod tests {
         let ttl = std::time::Duration::from_secs(60);
         // assistant_mode=true → status API on; native streaming on (no other bot),
         // off when another bot is present; post+edit streaming on regardless.
-        let adapter = SlackAdapter::new(
-            "xoxb-test".into(),
-            ttl,
-            AllowBots::Off,
-            true,
-            crate::multibot_cache::MultibotCache::load("/dev/null".into()),
-            true,
-        );
-        assert!(
-            adapter.uses_assistant_status(),
-            "assistant_mode enables status API"
-        );
-        assert!(
-            adapter.use_streaming(false),
-            "post+edit streaming on when no other bot"
-        );
-        assert!(
-            adapter.uses_native_streaming(false),
-            "native streaming on when no other bot"
-        );
-        assert!(
-            !adapter.uses_native_streaming(true),
-            "other bot present disables native"
-        );
+        let adapter = SlackAdapter::new("xoxb-test".into(), ttl, AllowBots::Off, true, crate::multibot_cache::MultibotCache::load("/dev/null".into()), true);
+        assert!(adapter.uses_assistant_status(), "assistant_mode enables status API");
+        assert!(adapter.use_streaming(false), "post+edit streaming on when no other bot");
+        assert!(adapter.uses_native_streaming(false), "native streaming on when no other bot");
+        assert!(!adapter.uses_native_streaming(true), "other bot present disables native");
         // assistant_mode=false → no status API, no native streaming; post+edit still streams.
-        let adapter2 = SlackAdapter::new(
-            "xoxb-test".into(),
-            ttl,
-            AllowBots::Off,
-            false,
-            crate::multibot_cache::MultibotCache::load("/dev/null".into()),
-            true,
-        );
+        let adapter2 = SlackAdapter::new("xoxb-test".into(), ttl, AllowBots::Off, false, crate::multibot_cache::MultibotCache::load("/dev/null".into()), true);
         assert!(!adapter2.uses_assistant_status());
-        assert!(
-            adapter2.use_streaming(false),
-            "post+edit streaming independent of assistant_mode"
-        );
-        assert!(
-            !adapter2.uses_native_streaming(false),
-            "native streaming requires assistant_mode"
-        );
+        assert!(adapter2.use_streaming(false), "post+edit streaming independent of assistant_mode");
+        assert!(!adapter2.uses_native_streaming(false), "native streaming requires assistant_mode");
 
         // streaming=false → send-once: neither post+edit nor native, even alone.
-        let adapter3 = SlackAdapter::new(
-            "xoxb-test".into(),
-            ttl,
-            AllowBots::Off,
-            true,
-            crate::multibot_cache::MultibotCache::load("/dev/null".into()),
-            false,
-        );
-        assert!(
-            !adapter3.use_streaming(false),
-            "streaming=false forces send-once (no post+edit)"
-        );
-        assert!(
-            !adapter3.uses_native_streaming(false),
-            "streaming=false disables native even with assistant_mode"
-        );
-        assert!(
-            adapter3.uses_assistant_status(),
-            "streaming switch does not affect assistant status API"
-        );
+        let adapter3 = SlackAdapter::new("xoxb-test".into(), ttl, AllowBots::Off, true, crate::multibot_cache::MultibotCache::load("/dev/null".into()), false);
+        assert!(!adapter3.use_streaming(false), "streaming=false forces send-once (no post+edit)");
+        assert!(!adapter3.uses_native_streaming(false), "streaming=false disables native even with assistant_mode");
+        assert!(adapter3.uses_assistant_status(), "streaming switch does not affect assistant status API");
     }
 
     /// chat.postMessage body carries Block Kit `markdown` blocks with the raw
@@ -2313,10 +2506,7 @@ mod tests {
         assert_eq!(b["blocks"][0]["type"], "markdown");
         // Raw markdown preserved — heading is NOT flattened to `*Heading*`.
         assert_eq!(b["blocks"][0]["text"], "## Heading\n- item");
-        assert!(
-            b["text"].is_string(),
-            "text fallback present for a11y/notifs"
-        );
+        assert!(b["text"].is_string(), "text fallback present for a11y/notifs");
     }
 
     /// thread_ts is omitted (top-level post) when the channel has no thread.
@@ -2357,14 +2547,7 @@ mod tests {
     #[test]
     fn typical_long_table_stays_in_one_chunk() {
         let ttl = std::time::Duration::from_secs(300);
-        let adapter = SlackAdapter::new(
-            "xoxb-test".into(),
-            ttl,
-            AllowBots::Mentions,
-            true,
-            crate::multibot_cache::MultibotCache::load("/dev/null".into()),
-            true,
-        );
+        let adapter = SlackAdapter::new("xoxb-test".into(), ttl, AllowBots::Mentions, true, crate::multibot_cache::MultibotCache::load("/dev/null".into()), true);
         let limit = adapter.message_limit();
         assert_eq!(limit, MARKDOWN_BLOCK_LIMIT);
         let mut table = String::from("| col a | col b | col c |\n|---|---|---|\n");
@@ -2416,9 +2599,7 @@ mod tests {
         // Exact error-code match, not substring: a future code that merely
         // contains `invalid_blocks` must NOT trigger a text-only retry.
         assert!(
-            !is_block_payload_rejected(&anyhow!(
-                "Slack API chat.postMessage: invalid_blocks_field"
-            )),
+            !is_block_payload_rejected(&anyhow!("Slack API chat.postMessage: invalid_blocks_field")),
             "must match the error code exactly, not as a substring"
         );
     }
@@ -2428,21 +2609,17 @@ mod tests {
     #[test]
     fn slack_renders_native_tables() {
         let ttl = std::time::Duration::from_secs(300);
-        let adapter = SlackAdapter::new(
-            "xoxb-test".into(),
-            ttl,
-            AllowBots::Mentions,
-            true,
-            crate::multibot_cache::MultibotCache::load("/dev/null".into()),
-            true,
-        );
-        assert!(adapter.renders_native_tables());
+        let adapter = SlackAdapter::new("xoxb-test".into(), ttl, AllowBots::Mentions, true, crate::multibot_cache::MultibotCache::load("/dev/null".into()), true);
+        assert!(adapter.renders_native_tables("slack"));
     }
 }
 
 #[cfg(test)]
 mod socket_keepalive_tests {
-    use super::{next_backoff, socket_idle, IDLE_TIMEOUT_SECS, MAX_BACKOFF_SECS};
+    use super::{
+        connect_with_reconnect_timeout, get_socket_mode_url_with_timeout, next_backoff,
+        socket_idle, wait_backoff_or_shutdown, IDLE_TIMEOUT_SECS, MAX_BACKOFF_SECS,
+    };
     use std::time::Duration;
 
     /// Backoff doubles and caps, matching the gateway adapter (1,2,4,8,16,30,30…).
@@ -2456,19 +2633,7 @@ mod socket_keepalive_tests {
                 cur
             })
             .collect();
-        assert_eq!(
-            seq,
-            vec![
-                1,
-                2,
-                4,
-                8,
-                16,
-                MAX_BACKOFF_SECS,
-                MAX_BACKOFF_SECS,
-                MAX_BACKOFF_SECS
-            ]
-        );
+        assert_eq!(seq, vec![1, 2, 4, 8, 16, MAX_BACKOFF_SECS, MAX_BACKOFF_SECS, MAX_BACKOFF_SECS]);
         assert_eq!(next_backoff(MAX_BACKOFF_SECS), MAX_BACKOFF_SECS);
     }
 
@@ -2478,14 +2643,94 @@ mod socket_keepalive_tests {
     fn idle_detects_half_open_at_boundary() {
         let timeout = Duration::from_secs(IDLE_TIMEOUT_SECS);
         assert!(!socket_idle(Duration::from_secs(0), timeout));
-        assert!(!socket_idle(
-            Duration::from_secs(IDLE_TIMEOUT_SECS - 1),
-            timeout
-        ));
+        assert!(!socket_idle(Duration::from_secs(IDLE_TIMEOUT_SECS - 1), timeout));
         assert!(socket_idle(Duration::from_secs(IDLE_TIMEOUT_SECS), timeout));
-        assert!(socket_idle(
-            Duration::from_secs(IDLE_TIMEOUT_SECS + 10),
-            timeout
-        ));
+        assert!(socket_idle(Duration::from_secs(IDLE_TIMEOUT_SECS + 10), timeout));
+    }
+
+    /// Regression test for #1279: a stalled WebSocket handshake during reconnect
+    /// must surface as a timeout instead of parking the reconnect task forever.
+    /// Calls `connect_with_reconnect_timeout` directly (the same helper
+    /// `run_slack_adapter` calls) so this pins the actual production code
+    /// path, not just a copy of the timeout expression. `start_paused` lets
+    /// the 30s timeout resolve instantly under Tokio's virtual clock instead
+    /// of a real wall-clock wait.
+    #[tokio::test(start_paused = true)]
+    async fn connect_async_timeout_fires_on_stalled_handshake() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local listener");
+        let addr = listener.local_addr().expect("local addr");
+
+        // Accept the TCP connection but never send any WS handshake bytes, so
+        // `connect_async` blocks forever waiting for the server's HTTP
+        // upgrade response — the exact stall this timeout is meant to catch.
+        tokio::spawn(async move {
+            let _socket = listener.accept().await.expect("accept");
+            std::future::pending::<()>().await;
+        });
+
+        let ws_url = format!("ws://{addr}");
+        let result = connect_with_reconnect_timeout(&ws_url).await;
+
+        assert!(
+            result.is_err(),
+            "connect_async on a stalled handshake must time out, not hang"
+        );
+    }
+
+    /// Regression test for #1279 (the HTTP leg): a stalled `apps.connections.open`
+    /// call during reconnect must surface as a timeout instead of parking the
+    /// reconnect task forever. Overrides DNS resolution for `slack.com` to a
+    /// local listener that accepts the TCP connection and never responds, so
+    /// the client's TLS handshake stalls exactly like a silently-dropped peer
+    /// would. Calls `get_socket_mode_url_with_timeout` directly (the same
+    /// helper `run_slack_adapter` calls) so this pins the actual production
+    /// code path, mirroring `connect_async_timeout_fires_on_stalled_handshake`
+    /// above.
+    #[tokio::test(start_paused = true)]
+    async fn get_socket_mode_url_timeout_fires_on_stalled_http_call() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local listener");
+        let addr = listener.local_addr().expect("local addr");
+
+        tokio::spawn(async move {
+            let _socket = listener.accept().await.expect("accept");
+            std::future::pending::<()>().await;
+        });
+
+        let client = reqwest::Client::builder()
+            .resolve("slack.com", addr)
+            .build()
+            .expect("build client");
+
+        let result = get_socket_mode_url_with_timeout(&client, "xapp-test-token").await;
+
+        assert!(
+            result.is_err(),
+            "get_socket_mode_url on a stalled HTTP call must time out, not hang"
+        );
+    }
+
+    /// With no shutdown signal, `wait_backoff_or_shutdown` sleeps out the
+    /// backoff and returns the next (doubled) value. `start_paused` resolves
+    /// the sleep instantly under Tokio's virtual clock.
+    #[tokio::test(start_paused = true)]
+    async fn wait_backoff_or_shutdown_returns_next_backoff_when_no_shutdown() {
+        let (_tx, mut rx) = tokio::sync::watch::channel(false);
+        let result = wait_backoff_or_shutdown(2, &mut rx).await;
+        assert_eq!(result, Some(next_backoff(2)));
+    }
+
+    /// A shutdown signal wins the race against an arbitrarily long backoff,
+    /// returning `None` so the caller returns immediately instead of parking
+    /// until the backoff elapses.
+    #[tokio::test(start_paused = true)]
+    async fn wait_backoff_or_shutdown_returns_none_on_shutdown() {
+        let (tx, mut rx) = tokio::sync::watch::channel(false);
+        tx.send(true).expect("receiver still open");
+        let result = wait_backoff_or_shutdown(3600, &mut rx).await;
+        assert_eq!(result, None);
     }
 }

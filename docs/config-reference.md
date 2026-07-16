@@ -137,6 +137,142 @@ Custom Gateway adapter for platforms like Telegram, LINE, Feishu/Lark, and Googl
 
 ---
 
+## `[line]`
+
+First-class LINE section — credentials, connection, and L3 identity trust (config-first parity, #1376). Replaces the uniform `GATEWAY_ALLOW_ALL_USERS` / `GATEWAY_ALLOWED_USERS` env vars for LINE trust — relying on those for LINE is deprecated and warns at startup.
+
+> **Trust resolution:** applies in **both** deployment modes (see the note under `[wecom]` / `[googlechat]` / `[teams]` below — the same applies here).
+
+Each field resolves: config value → `LINE_*` env var → default (deny-all).
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `channel_secret` | string | — | Channel secret for webhook HMAC-SHA256 validation (L1). Env fallback: `LINE_CHANNEL_SECRET`. |
+| `channel_access_token` | string | — | Channel access token for the Reply/Push Message API and media downloads. Env fallback: `LINE_CHANNEL_ACCESS_TOKEN`. |
+| `webhook_path` | string | `/webhook/line` | Webhook mount path. Env fallback: `LINE_WEBHOOK_PATH`. |
+| `allow_all_users` | bool \| omit | `false` (deny-all) | `true` = any user may interact (bypasses `allowed_users` entirely); `false`/omitted = only `allowed_users`. Env fallback: `LINE_ALLOW_ALL_USERS`. |
+| `allowed_users` | string[] | `[]` | LINE user IDs (`U…`, 33 chars) allowed to interact. Only checked when `allow_all_users` resolves to false. Env fallback: `LINE_ALLOWED_USERS` (comma-separated). |
+
+```toml
+[line]
+allowed_users = ["U1234567890abcdef0123456789abcdef"]
+# allow_all_users = true   # explicit opt-in only — any user can drive the agent
+```
+
+---
+
+## `[wecom]`
+
+Full first-class WeCom section (config-first parity, #1378) — credentials, connection, and L3 identity trust. Each field resolves: config → `WECOM_*` env → default. The adapter requires all five credentials (`corp_id`, `secret`, `token`, `encoding_aes_key`, `agent_id`); an incomplete section (after env fallback) disables the adapter, matching env-only semantics.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `corp_id` | string | — | Corp ID. Env: `WECOM_CORP_ID`. |
+| `secret` | string | — | App secret. Env: `WECOM_SECRET`. |
+| `token` | string | — | Callback token (L1 signature). Env: `WECOM_TOKEN`. |
+| `encoding_aes_key` | string | — | 43-char callback AES key (L1). Env: `WECOM_ENCODING_AES_KEY`. |
+| `agent_id` | string | — | Numeric agent id. Env: `WECOM_AGENT_ID`. |
+| `webhook_path` | string | `/webhook/wecom` | Env: `WECOM_WEBHOOK_PATH`. |
+| `streaming_enabled` | bool | `false` | Recall+resend streaming opt-in. Env: `WECOM_STREAMING_ENABLED`. |
+| `debounce_secs` | u64 | `3` | Debounce window. Env: `WECOM_DEBOUNCE_SECS`. |
+| `allow_all_users` | bool \| omit | `false` (deny-all) | Env: `WECOM_ALLOW_ALL_USERS`. |
+| `allowed_users` | string[] | `[]` | WeCom UserIDs. Env: `WECOM_ALLOWED_USERS` (comma-separated). |
+
+---
+
+## `[googlechat]`
+
+Full first-class Google Chat section (config-first parity, #1379) — credentials, connection, and L3 identity trust. Each field resolves: config → `GOOGLE_CHAT_*` env → default.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | bool | `false` | Enable the adapter. Env: `GOOGLE_CHAT_ENABLED`. |
+| `sa_key_json` | string | — | Inline service-account key JSON (wins over `sa_key_file`). Env: `GOOGLE_CHAT_SA_KEY_JSON`. |
+| `sa_key_file` | string | — | Path to a service-account key file. Env: `GOOGLE_CHAT_SA_KEY_FILE`. |
+| `access_token` | string | — | Static access token alternative. Env: `GOOGLE_CHAT_ACCESS_TOKEN`. |
+| `audience` | string | — | JWT audience — enables webhook JWT verification (L1). Env: `GOOGLE_CHAT_AUDIENCE`. |
+| `webhook_path` | string | `/webhook/googlechat` | Env: `GOOGLE_CHAT_WEBHOOK_PATH`. |
+| `allow_all_users` | bool \| omit | `false` (deny-all) | Env: `GOOGLE_CHAT_ALLOW_ALL_USERS`. |
+| `allowed_users` | string[] | `[]` | User resource names (`users/<id>`). Env: `GOOGLE_CHAT_ALLOWED_USERS`. |
+
+---
+
+## `[teams]`
+
+Full first-class Teams section (config-first parity, #1380) — credentials, connection, and L3 identity trust. Each field resolves: config → `TEAMS_*` env → default. `app_id` + `app_secret` are mandatory (after env fallback); an incomplete section disables the adapter.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `app_id` | string | — | Azure AD app (bot) ID. Env: `TEAMS_APP_ID`. |
+| `app_secret` | string | — | App client secret. Env: `TEAMS_APP_SECRET`. |
+| `allowed_tenants` | string[] | `[]` (all) | Restrict to tenant IDs. Env: `TEAMS_ALLOWED_TENANTS`. |
+| `oauth_endpoint` | string | Bot Framework | Env: `TEAMS_OAUTH_ENDPOINT`. |
+| `openid_metadata` | string | Bot Framework | Env: `TEAMS_OPENID_METADATA`. |
+| `webhook_path` | string | `/webhook/teams` | Env: `TEAMS_WEBHOOK_PATH`. |
+| `allow_all_users` | bool \| omit | `false` (deny-all) | Env: `TEAMS_ALLOW_ALL_USERS`. |
+| `allowed_users` | string[] | `[]` | `activity.from.id` values (`29:…`). Env: `TEAMS_ALLOWED_USERS`. |
+
+<details><summary>Previous trust-only description</summary>
+
+First-class L3 identity trust — same shape and semantics as `[line]`. Each section replaces the uniform `GATEWAY_ALLOW_ALL_USERS` / `GATEWAY_ALLOWED_USERS` env vars for its platform (deprecated: warns at startup, becomes an error in Phase 2). Platform credentials remain on the gateway env vars (`TEAMS_APP_ID`/`TEAMS_APP_SECRET`) until the Teams config-first parity slice lands (#1380).
+
+> **Trust resolution:** these sections (like `[line]`) apply in **both** deployment modes — the embedded/unified adapter path and the broker's WebSocket path to the standalone `openab-gateway` companion both consult the shared per-platform trust registry. Precedence per platform: `GATEWAY_*` env < `[gateway]` section < `[<platform>]` section (the platform section wins when both are set).
+
+Each field resolves: config value → `TEAMS_*` env var → default (deny-all).
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `allow_all_users` | bool \| omit | `false` (deny-all) | `true` = any user may interact (bypasses `allowed_users` entirely). Env fallback: `{PREFIX}_ALLOW_ALL_USERS`. |
+| `allowed_users` | string[] | `[]` | Platform user IDs allowed to interact. Only checked when `allow_all_users` resolves to false. Env fallback: `{PREFIX}_ALLOWED_USERS` (comma-separated). |
+
+Sender ID formats per platform:
+
+| Platform | Sender ID format | Example |
+|----------|-----------------|---------|
+| MS Teams | Bot Framework `activity.from.id` | `"29:1abc..."` |
+
+```toml
+[teams]
+allowed_users = ["29:1abc..."]
+# allow_all_users = true   # explicit opt-in only
+```
+
+</details>
+
+---
+
+## `[feishu]`
+
+Full first-class Feishu/Lark section (config-first parity, #1377) — credentials, connection, behavior, and L3 identity trust. Each field resolves: config → `FEISHU_*` env → default. `app_id` + `app_secret` are mandatory (after env fallback); an incomplete section disables the adapter. The gateway adapter's parser remains the single source of truth — the section renders into the same form the env vars use, so defaults and enum rules cannot diverge.
+
+| Key | Type | Default | Env |
+|-----|------|---------|-----|
+| `app_id` / `app_secret` | string | — (mandatory) | `FEISHU_APP_ID` / `FEISHU_APP_SECRET` |
+| `verification_token` | string | — | `FEISHU_VERIFICATION_TOKEN` |
+| `encrypt_key` | string | — (enables webhook signature, L1) | `FEISHU_ENCRYPT_KEY` |
+| `domain` | string | `feishu` (`feishu`\|`lark`) | `FEISHU_DOMAIN` |
+| `connection_mode` | string | `websocket` (`websocket`\|`webhook`) | `FEISHU_CONNECTION_MODE` |
+| `webhook_path` | string | `/webhook/feishu` | `FEISHU_WEBHOOK_PATH` |
+| `allowed_users` | string[] | `[]` (open_ids — per-app!) | `FEISHU_ALLOWED_USERS` |
+| `allowed_groups` | string[] | `[]` | `FEISHU_ALLOWED_GROUPS` |
+| `trusted_bot_ids` | string[] | `[]` | `FEISHU_TRUSTED_BOT_IDS` |
+| `require_mention` | bool | `true` | `FEISHU_REQUIRE_MENTION` |
+| `allow_bots` | string | `off` (`off`\|`mentions`\|`all`) | `FEISHU_ALLOW_BOTS` |
+| `allow_user_messages` | string | `multibot_mentions` (`multibot_mentions`\|`mentions`\|`involved`) | `FEISHU_ALLOW_USER_MESSAGES` |
+| `max_bot_turns` | u32 | `20` | `FEISHU_MAX_BOT_TURNS` |
+| `dedupe_ttl_secs` | u64 | `300` | `FEISHU_DEDUPE_TTL_SECS` |
+| `message_limit` | u64 | `4000` | `FEISHU_MESSAGE_LIMIT` |
+| `session_ttl_hours` | u64 | `24` (`0` disables) | `FEISHU_SESSION_TTL_HOURS` |
+| `card_streaming_mode` | string | `auto` (`auto`\|`post`\|`card`) | `FEISHU_CARD_STREAMING_MODE` |
+| `card_fallback_to_post` | bool | `true` | `FEISHU_CARD_FALLBACK_TO_POST` |
+| `card_promote_bytes` | u64 | `4000` | `FEISHU_CARD_PROMOTE_BYTES` |
+| `card_idle_finalize_ms` | u64 | `3000` | `FEISHU_CARD_IDLE_FINALIZE_MS` |
+| `allow_all_users` | bool \| omit | `false` (deny-all at the shared L3 gate) | `FEISHU_ALLOW_ALL_USERS` |
+
+> The `[feishu]` section also feeds the shared trust registry (feishu was the last platform on the uniform `GATEWAY_*` seed). The gateway-side `allowed_users`/`allowed_groups` double-gate elimination is tracked on #1357.
+
+---
+
 ## `[agent]`
 
 The AI agent subprocess that OpenAB spawns to handle messages via ACP.
@@ -246,6 +382,12 @@ working_dir = "/home/node"
 command = "codex-acp"
 working_dir = "/home/node"
 env = { OPENAI_API_KEY = "${OPENAI_API_KEY}" }
+
+# Recommended for containerized OpenAB deployments: the outer container is the
+# security boundary; Codex's inner sandbox needs user namespaces containers
+# typically don't grant. See docs/codex.md §ACP Modes and Migration.
+[pool]
+default_config_options = { mode = "agent-full-access" }
 
 # Gemini CLI
 [agent]
@@ -559,6 +701,86 @@ context_flushes = 3
 channels = []                     # Channel ID allowlist — and their threads (required)
 allow_bot_messages = true
 ```
+
+---
+
+## `[filestore]`
+
+Optional S3/R2-compatible object store for handling file attachments.
+
+When configured, text files exceeding the 512 KB inline limit are uploaded to the
+object store and a presigned GET URL is returned to the agent. This eliminates
+the silent-drop behavior for large files and works with any agent that can perform
+HTTP GET (no platform auth tokens required).
+
+```toml
+[filestore]
+bucket = "my-oab-files"
+region = "us-west-2"
+# endpoint = "https://<account_id>.r2.cloudflarestorage.com"  # Cloudflare R2
+# endpoint = "http://localhost:9000"                           # MinIO
+prefix = "incoming/"       # object key prefix (default: "incoming/")
+presigned_ttl = 3600       # URL expiry in seconds (default: 3600 = 1 hour)
+# max_file_size_mb = 250   # max upload size in MB (default: 250, max: 500)
+# access_key_id = "${secrets.filestore_key}"         # recommended: use secret refs
+# secret_access_key = "${secrets.filestore_secret}"  # recommended: use secret refs
+```
+
+> **Credentials best practice:** For R2 and explicit S3 credentials, always use
+> `[secrets.refs]` to resolve credentials from AWS Secrets Manager or an exec
+> provider. Avoid hardcoding credentials or relying solely on env vars in production.
+> For AWS S3 with IRSA/Pod Identity/instance roles, omit both fields entirely.
+
+| Field | Required | Default | Description |
+|-------|----------|---------|-------------|
+| `bucket` | ✅ | — | S3 bucket name |
+| `region` | ✅ | — | AWS region (use `"auto"` for Cloudflare R2) |
+| `endpoint` | ❌ | AWS default | Custom S3-compatible endpoint URL (R2, MinIO, etc.) |
+| `prefix` | ❌ | `"incoming/"` | Object key prefix for uploaded files |
+| `presigned_ttl` | ❌ | `3600` | Presigned URL expiry in seconds |
+| `max_file_size_mb` | ❌ | `250` | Maximum file size for upload in MB (hard cap: 500) |
+| `access_key_id` | ❌ | provider chain | Explicit access key (falls back to IRSA/env/config) |
+| `secret_access_key` | ❌ | provider chain | Explicit secret key |
+
+**Behavior when configured:**
+
+- Text files ≤ 512 KB: inlined into the prompt as before (unchanged)
+- Text files > 512 KB: downloaded by OAB, uploaded to S3/R2, presigned URL returned
+- PDF, ZIP, binary, and other unsupported formats (Discord/Slack): uploaded to S3/R2, presigned URL returned
+- The presigned URL requires no authentication — any HTTP GET works
+- File count cap (5 files) still applies
+- Aggregate 1 MB cap only applies to inlined files; filestore uploads bypass it
+
+**Behavior when NOT configured (default):**
+
+- Text files > 512 KB and unsupported formats are silently dropped (existing behavior)
+
+**Supported backends:**
+
+- AWS S3
+- Cloudflare R2 (S3-compatible, zero egress fees)
+- MinIO
+- Any S3-compatible object store
+
+**Build requirement:** The filestore feature is enabled by default in standard builds. When built without it (e.g. `--no-default-features`), the `[filestore]` config section is ignored and all behavior is unchanged.
+
+**Minimum IAM policy:**
+
+```json
+{
+  "Effect": "Allow",
+  "Action": [
+    "s3:PutObject",
+    "s3:GetObject",
+    "s3:AbortMultipartUpload",
+    "s3:ListMultipartUploadParts"
+  ],
+  "Resource": "arn:aws:s3:::my-oab-files/incoming/*"
+}
+```
+
+For Cloudflare R2, use the equivalent R2 API token with Object Read & Write
+permissions scoped to the bucket.
 
 ---
 

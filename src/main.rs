@@ -130,18 +130,121 @@ enum Commands {
     },
 }
 
-/// Returns true if any unified platform env var is set AND the corresponding feature is compiled in.
+/// Returns true if any unified platform is enabled and its corresponding
+/// feature is compiled in. Google Chat uses its config-first resolver so
+/// `[googlechat].enabled` can activate the adapter without a duplicate env var,
+/// and WeCom activates on either `WECOM_CORP_ID` or a credential-complete
+/// `[wecom]` section (#1389). Remaining platforms are still env-signaled —
+/// config-only activation parity is tracked on #1356.
 /// Single source of truth — used by both startup validation and adapter init.
-fn has_unified_platform_env() -> bool {
+fn has_unified_platform(cfg: &config::Config) -> bool {
     (cfg!(feature = "telegram") && std::env::var("TELEGRAM_BOT_TOKEN").is_ok())
         || (cfg!(feature = "line") && std::env::var("LINE_CHANNEL_SECRET").is_ok())
         || (cfg!(feature = "feishu") && std::env::var("FEISHU_APP_ID").is_ok())
-        || (cfg!(feature = "wecom") && std::env::var("WECOM_CORP_ID").is_ok())
+        || (cfg!(feature = "wecom")
+            && (std::env::var("WECOM_CORP_ID").is_ok() || has_unified_wecom_config(cfg)))
         || (cfg!(feature = "teams") && std::env::var("TEAMS_APP_ID").is_ok())
         || (cfg!(feature = "googlechat")
-            && std::env::var("GOOGLE_CHAT_ENABLED")
-                .map(|v| v == "true" || v == "1")
-                .unwrap_or(false))
+            && cfg
+                .googlechat
+                .clone()
+                .unwrap_or_default()
+                .resolve()
+                .enabled)
+}
+
+/// Returns true when the first-class `[wecom]` section resolves all credentials
+/// required to construct the embedded WeCom adapter. This must remain separate
+/// from the env arms of [`has_unified_platform`]: config-first deployments may intentionally
+/// provide literal or secret-substituted values without exporting `WECOM_*`.
+fn has_unified_wecom_config(cfg: &config::Config) -> bool {
+    if !cfg!(feature = "wecom") {
+        return false;
+    }
+    cfg.wecom.as_ref().is_some_and(|wecom| {
+        let resolved = wecom.resolve();
+        resolved.corp_id.is_some()
+            && resolved.secret.is_some()
+            && resolved.token.is_some()
+            && resolved.encoding_aes_key.is_some()
+            && resolved.agent_id.is_some()
+    })
+}
+
+/// Trust view of the `[gateway]` section for the standalone WebSocket platform.
+/// Same `resolve_allow_all` semantics the WS path's inline allowlist filter used
+/// before L2/L3 moved to the shared registry (#1356 Phase 1c prerequisite):
+/// explicit flag wins; otherwise a non-empty list implies deny-by-default.
+fn gateway_section_trust(gw: &config::GatewayConfig) -> openab_core::trust::TrustConfig {
+    openab_core::trust::TrustConfig::new(
+        Some(config::resolve_allow_all(
+            gw.allow_all_channels,
+            &gw.allowed_channels,
+        )),
+        gw.allowed_channels.clone(),
+        None, // allow_dm unused in Phase 1 (is_dm passed as false)
+        Some(config::resolve_allow_all(
+            gw.allow_all_users,
+            &gw.allowed_users,
+        )),
+        gw.allowed_users.clone(),
+    )
+}
+
+/// Apply a platform's first-class trust section to the registry, or — when the
+/// platform is active but still trust-driven by the deprecated uniform
+/// `GATEWAY_ALLOW_ALL_USERS`/`GATEWAY_ALLOWED_USERS` env — log the Phase 1
+/// deprecation warning (#1356). Shared by the `[wecom]`/`[googlechat]`/`[teams]`
+/// overrides; same override shape as the bespoke `[telegram]`/`[line]` blocks.
+///
+/// L2 (channels) stays on the shared gateway values passed in; L3 mirrors the
+/// resolved section (config → `{env_prefix}_*` env → deny-all).
+#[allow(clippy::too_many_arguments)]
+fn platform_trust_override(
+    reg: &mut openab_core::trust::PlatformTrustConfigs,
+    platform: &str,
+    section: &Option<config::PlatformTrustConfig>,
+    env_prefix: &str,
+    platform_active: bool,
+    allow_all_channels: bool,
+    allowed_channels: &[String],
+) {
+    use openab_core::trust::TrustConfig;
+    let resolved = if let Some(s) = section {
+        Some(s.resolve_with_env(env_prefix))
+    } else if config::PlatformTrustConfig::env_trust_present(env_prefix) {
+        Some(config::PlatformTrustConfig::default().resolve_with_env(env_prefix))
+    } else {
+        None
+    };
+    match resolved {
+        Some(r) => {
+            reg.insert(
+                platform,
+                TrustConfig::new(
+                    Some(allow_all_channels),
+                    allowed_channels.to_vec(),
+                    None,
+                    Some(r.allow_all_users),
+                    r.allowed_users,
+                ),
+            );
+        }
+        None => {
+            let legacy_env_set = std::env::var("GATEWAY_ALLOW_ALL_USERS").is_ok()
+                || std::env::var("GATEWAY_ALLOWED_USERS").is_ok();
+            if platform_active && legacy_env_set {
+                warn!(
+                    platform,
+                    "platform trust is driven by deprecated GATEWAY_ALLOW_ALL_USERS/\
+                     GATEWAY_ALLOWED_USERS env vars — migrate to a [{platform}] section \
+                     (allow_all_users/allowed_users) or {env_prefix}_ALLOW_ALL_USERS/\
+                     {env_prefix}_ALLOWED_USERS; the uniform GATEWAY_* fallback will \
+                     become a startup error in Phase 2 (#1356)"
+                );
+            }
+        }
+    }
 }
 
 #[tokio::main]
@@ -225,10 +328,10 @@ async fn main() -> anyhow::Result<()> {
         && cfg.slack.is_none()
         && cfg.gateway.is_none()
         && cfg.telegram.is_none()
-        && !has_unified_platform_env()
+        && !has_unified_platform(&cfg)
     {
         anyhow::bail!(
-            "no adapter configured — add [discord], [slack], [telegram], or [gateway] to config, or set platform env vars (TELEGRAM_BOT_TOKEN, etc.)"
+            "no adapter configured — add [discord], [slack], [telegram], [wecom], [googlechat], or [gateway] to config, or set platform env vars (TELEGRAM_BOT_TOKEN, etc.)"
         );
     }
 
@@ -258,6 +361,22 @@ async fn main() -> anyhow::Result<()> {
         let substituted = secrets::substitute(&raw_expanded, &resolved);
         cfg = config::parse_config_str(&substituted, &config_source)?;
     }
+
+    // Resolve before adapter-specific config fields are moved into their
+    // runtime components below. Secret-backed values have been substituted by
+    // now (the earlier bail-gate call only needed reachability — placeholder
+    // values are non-empty, so this recompute is the authoritative one).
+    // cfg-gated like the unified block that consumes it, else unused under
+    // default features.
+    #[cfg(any(
+        feature = "telegram",
+        feature = "line",
+        feature = "feishu",
+        feature = "googlechat",
+        feature = "wecom",
+        feature = "teams",
+    ))]
+    let unified_platform_enabled = has_unified_platform(&cfg);
 
     let shutdown_hook = cfg.hooks.pre_shutdown.clone();
 
@@ -334,6 +453,17 @@ async fn main() -> anyhow::Result<()> {
             );
         }
 
+        // [gateway] section seed for the standalone WS platform: the WebSocket
+        // path now enforces L2/L3 via this registry (gate_gateway_event) instead
+        // of its own inline allowlist checks, so the section's values must land
+        // here (behavior-preserving: same resolve_allow_all semantics the old
+        // inline filter used). Precedence: GATEWAY_* env (uniform seed above)
+        // < [gateway] (this insert) < [<platform>] section
+        // (platform_trust_override below, which runs in both modes).
+        if let Some(ref gw) = cfg.gateway {
+            reg.insert(&gw.platform, gateway_section_trust(gw));
+        }
+
         // Discord: gate L3 (identity) only via the shared gate. Discord's L2 is
         // richer than the flat allowed_channels model (threads are admitted by
         // *parent* channel, DMs by allow_dm), so we leave channel/DM enforcement
@@ -353,6 +483,30 @@ async fn main() -> anyhow::Result<()> {
                         &d.allowed_users,
                     )),
                     d.allowed_users.clone(),
+                ),
+            );
+        }
+
+        // Slack: gate L3 (identity) only via the shared gate, mirroring the
+        // Discord entry above. Slack's L2 (channel allowlist) stays in the
+        // adapter — its registry entry is L2-open — and L3 mirrors the resolved
+        // [slack].allow_all_users/allowed_users, so the gate agrees with
+        // Slack's existing user check (behavior-preserving). Without this
+        // entry, Slack was the only configured platform absent from the
+        // registry, falling back to the deny-all default if the gate ever ran
+        // for it (#1361).
+        if let Some(s) = &cfg.slack {
+            reg.insert(
+                "slack",
+                TrustConfig::new(
+                    Some(true), // L2 open — Slack's own channel check still applies
+                    Vec::<String>::new(),
+                    Some(true),
+                    Some(config::resolve_allow_all(
+                        s.allow_all_users,
+                        &s.allowed_users,
+                    )),
+                    s.allowed_users.clone(),
                 ),
             );
         }
@@ -389,6 +543,107 @@ async fn main() -> anyhow::Result<()> {
                 ),
             );
         }
+
+        // LINE: L3 (identity) mirrors the resolved
+        // [line].allow_all_users/allowed_users, so config.toml can restrict
+        // who can message the bot without the uniform
+        // GATEWAY_ALLOW_ALL_USERS/GATEWAY_ALLOWED_USERS env vars (#1355). L2
+        // (channels) has no LINE-specific concept distinct from the generic
+        // gateway model yet (group policy is a follow-up), so it stays on the
+        // shared GATEWAY_* values set above.
+        //
+        // NOTE: deliberately NOT routed through platform_trust_override —
+        // LineConfig is a bespoke type that grows group-policy fields next
+        // (#1355 follow-up), unlike the shared PlatformTrustConfig used by
+        // wecom/googlechat/teams below.
+        //
+        // Also resolves when running env-only (no [line] section but
+        // LINE_ALLOW_ALL_USERS / LINE_ALLOWED_USERS set), matching the
+        // Telegram pattern.
+        let line_resolved = if let Some(l) = &cfg.line {
+            Some(l.resolve())
+        } else if config::LineConfig::env_trust_present() {
+            Some(config::LineConfig::default().resolve())
+        } else {
+            None
+        };
+        match line_resolved {
+            Some(r) => {
+                reg.insert(
+                    "line",
+                    TrustConfig::new(
+                        Some(allow_all_channels),
+                        allowed_channels.clone(),
+                        None,
+                        Some(r.allow_all_users),
+                        r.allowed_users,
+                    ),
+                );
+            }
+            None => {
+                // Phase 1 deprecation (#1355/#1356): LINE trust still rides on
+                // the uniform GATEWAY_* seed. Warn when the unified LINE
+                // adapter is active and the legacy env is what admits users,
+                // so operators migrate before Phase 2 turns this into an error.
+                let line_active =
+                    cfg!(feature = "line") && std::env::var("LINE_CHANNEL_SECRET").is_ok();
+                let legacy_env_set = std::env::var("GATEWAY_ALLOW_ALL_USERS").is_ok()
+                    || std::env::var("GATEWAY_ALLOWED_USERS").is_ok();
+                if line_active && legacy_env_set {
+                    warn!(
+                        "LINE trust is driven by deprecated GATEWAY_ALLOW_ALL_USERS/\
+                         GATEWAY_ALLOWED_USERS env vars — migrate to a [line] section \
+                         (allow_all_users/allowed_users) or LINE_ALLOW_ALL_USERS/\
+                         LINE_ALLOWED_USERS; the uniform GATEWAY_* fallback will \
+                         become a startup error in Phase 2 (#1356)"
+                    );
+                }
+            }
+        }
+
+        // WeCom / Google Chat / MS Teams: same first-class override shape as
+        // LINE above, via the shared [wecom]/[googlechat]/[teams] trust
+        // sections (#1358, #1359, #1360). L2 stays on the shared GATEWAY_*
+        // channel values; L3 mirrors the resolved per-platform section.
+        platform_trust_override(
+            &mut reg,
+            "wecom",
+            &cfg.wecom.as_ref().map(|w| w.trust_config()),
+            "WECOM",
+            cfg!(feature = "wecom") && std::env::var("WECOM_CORP_ID").is_ok(),
+            allow_all_channels,
+            &allowed_channels,
+        );
+        platform_trust_override(
+            &mut reg,
+            "googlechat",
+            &cfg.googlechat.as_ref().map(|g| g.trust_config()),
+            "GOOGLE_CHAT",
+            cfg!(feature = "googlechat")
+                && std::env::var("GOOGLE_CHAT_ENABLED")
+                    .map(|v| v == "true" || v == "1")
+                    .unwrap_or(false),
+            allow_all_channels,
+            &allowed_channels,
+        );
+        platform_trust_override(
+            &mut reg,
+            "teams",
+            &cfg.teams.as_ref().map(|t| t.trust_config()),
+            "TEAMS",
+            cfg!(feature = "teams") && std::env::var("TEAMS_APP_ID").is_ok(),
+            allow_all_channels,
+            &allowed_channels,
+        );
+        platform_trust_override(
+            &mut reg,
+            "feishu",
+            &cfg.feishu.as_ref().map(|f| f.trust_config()),
+            "FEISHU",
+            cfg!(feature = "feishu") && std::env::var("FEISHU_APP_ID").is_ok(),
+            allow_all_channels,
+            &allowed_channels,
+        );
         reg
     };
 
@@ -452,6 +707,25 @@ async fn main() -> anyhow::Result<()> {
         .join("threads.json");
     let multibot_cache = multibot_cache::MultibotCache::load(multibot_cache_path);
 
+    // Initialize filestore (for uploading file attachments to S3/R2).
+    #[cfg(feature = "filestore")]
+    let filestore: Option<Arc<openab_core::filestore::Filestore>> = if let Some(ref fs_cfg) =
+        cfg.filestore
+    {
+        info!(
+            bucket = %fs_cfg.bucket,
+            region = %fs_cfg.region,
+            prefix = %fs_cfg.prefix,
+            presigned_ttl = fs_cfg.presigned_ttl,
+            "filestore enabled"
+        );
+        Some(Arc::new(
+            openab_core::filestore::Filestore::new(fs_cfg).await,
+        ))
+    } else {
+        None
+    };
+
     #[cfg(feature = "slack")]
     let shared_slack_adapter: Option<Arc<slack::SlackAdapter>> = cfg.slack.as_ref().map(|s| {
         Arc::new(slack::SlackAdapter::new(
@@ -505,6 +779,20 @@ async fn main() -> anyhow::Result<()> {
     if cfg.slack.is_some() {
         configured_platforms.push("slack");
     }
+    #[cfg(feature = "telegram")]
+    if cfg.telegram.is_some() || std::env::var("TELEGRAM_BOT_TOKEN").is_ok() {
+        configured_platforms.push("telegram");
+    }
+    #[cfg(feature = "googlechat")]
+    if cfg
+        .googlechat
+        .clone()
+        .unwrap_or_default()
+        .resolve()
+        .enabled
+    {
+        configured_platforms.push("googlechat");
+    }
     cron::validate_cronjobs(&cfg.cron.jobs, &configured_platforms)?;
 
     // Spawn Slack adapter (background task)
@@ -550,9 +838,13 @@ async fn main() -> anyhow::Result<()> {
         dispatchers.lock().unwrap().push(slack_dispatcher.clone());
         let slack_allowed_users: std::collections::HashSet<String> =
             slack_cfg.allowed_users.into_iter().collect();
+        let slack_router = router.clone();
+        #[cfg(feature = "filestore")]
+        let slack_filestore = filestore.clone();
         Some(tokio::spawn(async move {
             if let Err(e) = slack::run_slack_adapter(
                 adapter,
+                slack_router,
                 slack_cfg.app_token,
                 allow_all_channels,
                 allow_all_users,
@@ -566,6 +858,8 @@ async fn main() -> anyhow::Result<()> {
                 inbound_attachment_content_blocks,
                 slack_shutdown_rx,
                 slack_dispatcher,
+                #[cfg(feature = "filestore")]
+                slack_filestore,
             )
             .await
             {
@@ -603,27 +897,27 @@ async fn main() -> anyhow::Result<()> {
             platform: gw_cfg.platform,
             token: gw_cfg.token,
             bot_username: gw_cfg.bot_username,
-            allow_all_channels: config::resolve_allow_all(
-                gw_cfg.allow_all_channels,
-                &gw_cfg.allowed_channels,
-            ),
-            allowed_channels: gw_cfg.allowed_channels,
-            allow_all_users: config::resolve_allow_all(
-                gw_cfg.allow_all_users,
-                &gw_cfg.allowed_users,
-            ),
-            allowed_users: gw_cfg.allowed_users,
             allow_bot_messages: gw_cfg.allow_bot_messages,
             trusted_bot_ids: gw_cfg.trusted_bot_ids,
             streaming: gw_cfg.streaming,
             streaming_placeholder: gw_cfg.streaming_placeholder,
+            telegram_rich_messages: gw_cfg.telegram_rich_messages,
             stt: cfg.stt.clone(),
             inbound_attachment_content_blocks,
         };
         let gw_router = router.clone();
+        #[cfg(feature = "filestore")]
+        let gw_filestore = filestore.clone();
         Some(tokio::spawn(async move {
             if let Err(e) =
-                gateway::run_gateway_adapter(params, shutdown_rx, gw_dispatcher, gw_router).await
+                gateway::run_gateway_adapter(
+                    params,
+                    shutdown_rx,
+                    gw_dispatcher,
+                    gw_router,
+                    #[cfg(feature = "filestore")]
+                    gw_filestore,
+                ).await
             {
                 error!("gateway adapter error: {e}");
             }
@@ -644,10 +938,10 @@ async fn main() -> anyhow::Result<()> {
         feature = "wecom",
         feature = "teams",
     ))]
-    let _unified_handle = {
+    let (_unified_handle, shared_unified_adapter) = {
         use openab_core::gateway::{process_gateway_event, GatewayEventContext};
 
-        if has_unified_platform_env() || cfg.telegram.is_some() {
+        if unified_platform_enabled || cfg.telegram.is_some() {
             let listen_addr =
                 std::env::var("GATEWAY_LISTEN").unwrap_or_else(|_| "0.0.0.0:8080".into());
 
@@ -669,6 +963,7 @@ async fn main() -> anyhow::Result<()> {
             // Build gateway AppState from env vars (shared factory with standalone gateway)
             let mut gw_state_inner = openab_gateway::AppState::from_env(event_tx.clone(), None);
 
+
             // First-class `[telegram]` config overrides env-derived values
             // (config-authoritative + ${} expansion + TELEGRAM_* env fallback).
             #[cfg_attr(not(feature = "telegram"), allow(unused_variables))]
@@ -686,7 +981,88 @@ async fn main() -> anyhow::Result<()> {
             } else {
                 None
             };
+
+            // First-class `[line]` config overrides env-derived values
+            // (config-authoritative + ${} expansion + LINE_* env fallback,
+            // #1376). Applied before warn_unenforceable_l1 so a
+            // config-supplied channel_secret is not falsely flagged.
+            if let Some(ref l) = cfg.line {
+                let r = l.resolve();
+                gw_state_inner.apply_line_config(openab_gateway::GatewayLineConfig {
+                    channel_secret: r.channel_secret,
+                    channel_access_token: r.channel_access_token,
+                    webhook_path: r.webhook_path,
+                });
+            }
+
+            // First-class `[wecom]` config overrides env-derived values
+            // (config-authoritative + ${} expansion + WECOM_* env fallback,
+            // #1378). The apply rebuilds the adapter through the same
+            // validation as env-only construction.
+            #[cfg(feature = "wecom")]
+            if let Some(ref w) = cfg.wecom {
+                let r = w.resolve();
+                gw_state_inner.apply_wecom_config(openab_gateway::GatewayWecomConfig {
+                    corp_id: r.corp_id,
+                    secret: r.secret,
+                    token: r.token,
+                    encoding_aes_key: r.encoding_aes_key,
+                    agent_id: r.agent_id,
+                    webhook_path: r.webhook_path,
+                    streaming_enabled: r.streaming_enabled,
+                    debounce_secs: r.debounce_secs,
+                });
+            }
+            // First-class `[googlechat]` config overrides env-derived values
+            // (config-authoritative + ${} expansion + GOOGLE_CHAT_* env
+            // fallback, #1379). Applied before warn_unenforceable_l1 so a
+            // config-supplied audience (JWT verifier) is not falsely flagged.
+            #[cfg(feature = "googlechat")]
+            if let Some(ref g) = cfg.googlechat {
+                let r = g.resolve();
+                gw_state_inner.apply_googlechat_config(openab_gateway::GatewayGoogleChatConfig {
+                    enabled: r.enabled,
+                    sa_key_json: r.sa_key_json,
+                    sa_key_file: r.sa_key_file,
+                    access_token: r.access_token,
+                    audience: r.audience,
+                    webhook_path: r.webhook_path,
+                });
+            }
+            // First-class `[teams]` config overrides env-derived values
+            // (config-authoritative + ${} expansion + TEAMS_* env fallback,
+            // #1380).
+            #[cfg(feature = "teams")]
+            if let Some(ref t) = cfg.teams {
+                let r = t.resolve();
+                gw_state_inner.apply_teams_config(openab_gateway::GatewayTeamsConfig {
+                    app_id: r.app_id,
+                    app_secret: r.app_secret,
+                    allowed_tenants: r.allowed_tenants,
+                    oauth_endpoint: r.oauth_endpoint,
+                    openid_metadata: r.openid_metadata,
+                    webhook_path: r.webhook_path,
+                });
+            }
+            // First-class `[feishu]` config overrides env-derived values
+            // (config-authoritative + ${} expansion + FEISHU_* env fallback,
+            // #1377). Applied before warn_unenforceable_l1 so a
+            // config-supplied encrypt_key is not falsely flagged.
+            #[cfg(feature = "feishu")]
+            if let Some(ref fe) = cfg.feishu {
+                gw_state_inner.apply_feishu_config(openab_gateway::GatewayFeishuConfig {
+                    pairs: fe.resolve_pairs(),
+                });
+            }
             let gw_state = Arc::new(gw_state_inner);
+
+            // Phase 1 L1 audit (#1356): warn if any active webhook platform has
+            // no transport authentication configured. Called after
+            // apply_telegram_config so a config-supplied secret is not falsely
+            // flagged as missing. The unified binary mounts the feishu webhook
+            // route unconditionally (see NOTE at the mount below), so feishu
+            // exposure is `true` whenever the adapter is configured.
+            gw_state.warn_unenforceable_l1(true);
 
             // Build axum router with platform webhook routes
             let mut app =
@@ -707,17 +1083,28 @@ async fn main() -> anyhow::Result<()> {
 
             #[cfg(feature = "line")]
             {
-                info!("unified: line adapter enabled");
+                info!(path = %gw_state.line_webhook_path, "unified: line adapter enabled");
                 app = app.route(
-                    "/webhook/line",
+                    &gw_state.line_webhook_path,
                     axum::routing::post(openab_gateway::adapters::line::webhook),
                 );
             }
 
             #[cfg(feature = "feishu")]
             if gw_state.feishu.is_some() {
-                let path = std::env::var("FEISHU_WEBHOOK_PATH")
-                    .unwrap_or_else(|_| "/webhook/feishu".into());
+                // NOTE (#1356 L1 audit): unlike the standalone gateway (which
+                // mounts this route only in Webhook connection mode), the
+                // unified binary mounts it unconditionally — and never spawns
+                // the Websocket client. Deployments relying on Feishu-side
+                // webhook delivery while FEISHU_CONNECTION_MODE is unset
+                // (default: websocket) work only because of this mount, so
+                // gating it is a behavior change that needs its own
+                // deprecation path — tracked on #1356, not changed here.
+                let path = gw_state
+                    .feishu
+                    .as_ref()
+                    .map(|f| f.config.webhook_path.clone())
+                    .unwrap_or_else(|| "/webhook/feishu".into());
                 info!(path = %path, "unified: feishu adapter enabled");
                 app = app.route(
                     &path,
@@ -741,22 +1128,18 @@ async fn main() -> anyhow::Result<()> {
 
             #[cfg(feature = "teams")]
             if gw_state.teams.is_some() {
-                let path =
-                    std::env::var("TEAMS_WEBHOOK_PATH").unwrap_or_else(|_| "/webhook/teams".into());
-                info!(path = %path, "unified: teams adapter enabled");
+                info!(path = %gw_state.teams_webhook_path, "unified: teams adapter enabled");
                 app = app.route(
-                    &path,
+                    &gw_state.teams_webhook_path,
                     axum::routing::post(openab_gateway::adapters::teams::webhook),
                 );
             }
 
             #[cfg(feature = "googlechat")]
             if gw_state.google_chat.is_some() {
-                let path = std::env::var("GOOGLE_CHAT_WEBHOOK_PATH")
-                    .unwrap_or_else(|_| "/webhook/googlechat".into());
-                info!(path = %path, "unified: googlechat adapter enabled");
+                info!(path = %gw_state.googlechat_webhook_path, "unified: googlechat adapter enabled");
                 app = app.route(
-                    &path,
+                    &gw_state.googlechat_webhook_path,
                     axum::routing::post(openab_gateway::adapters::googlechat::webhook),
                 );
             }
@@ -768,27 +1151,9 @@ async fn main() -> anyhow::Result<()> {
                 unified_adapter::UnifiedGatewayAdapter::new(gw_state.clone()),
             );
 
-            // Read security gating from env (mirrors [gateway] config section)
-            let gw_allow_all_channels = std::env::var("GATEWAY_ALLOW_ALL_CHANNELS")
-                .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
-                .unwrap_or(true);
-            let gw_allowed_channels: std::collections::HashSet<String> =
-                std::env::var("GATEWAY_ALLOWED_CHANNELS")
-                    .unwrap_or_default()
-                    .split(',')
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect();
-            let gw_allow_all_users = std::env::var("GATEWAY_ALLOW_ALL_USERS")
-                .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
-                .unwrap_or(true);
-            let gw_allowed_users: std::collections::HashSet<String> =
-                std::env::var("GATEWAY_ALLOWED_USERS")
-                    .unwrap_or_default()
-                    .split(',')
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect();
+            // Bot gating still reads env here (structural, not L2/L3):
+            // channel/user gating moved to the shared trust registry, seeded
+            // from GATEWAY_* env / [gateway] / [<platform>] at startup.
             let gw_bot_username = std::env::var("GATEWAY_BOT_USERNAME").ok();
 
             let gw_allow_bot_messages = std::env::var("GATEWAY_ALLOW_BOT_MESSAGES")
@@ -802,24 +1167,18 @@ async fn main() -> anyhow::Result<()> {
                     .filter(|s| !s.is_empty())
                     .collect();
 
+            let cron_unified_adapter = unified_adapter.clone();
+
             let event_ctx = Arc::new(GatewayEventContext {
                 adapter: unified_adapter,
                 dispatcher: unified_dispatcher,
                 router: router.clone(),
-                allow_all_channels: config::resolve_allow_all(
-                    Some(gw_allow_all_channels),
-                    &gw_allowed_channels.iter().cloned().collect::<Vec<_>>(),
-                ),
-                allowed_channels: gw_allowed_channels,
-                allow_all_users: config::resolve_allow_all(
-                    Some(gw_allow_all_users),
-                    &gw_allowed_users.iter().cloned().collect::<Vec<_>>(),
-                ),
-                allowed_users: gw_allowed_users,
                 allow_bot_messages: gw_allow_bot_messages,
                 trusted_bot_ids: gw_trusted_bot_ids,
                 bot_username: gw_bot_username,
                 stt_config: cfg.stt.clone(),
+                #[cfg(feature = "filestore")]
+                filestore: filestore.clone(),
             });
 
             // Spawn the event bridge (event_tx → process_gateway_event)
@@ -846,7 +1205,7 @@ async fn main() -> anyhow::Result<()> {
 
             info!(addr = %listen_addr, "unified webhook server starting");
 
-            Some(tokio::spawn(async move {
+            (Some(tokio::spawn(async move {
                 let listener = match tokio::net::TcpListener::bind(&listen_addr).await {
                     Ok(l) => l,
                     Err(e) => {
@@ -858,9 +1217,9 @@ async fn main() -> anyhow::Result<()> {
                 if let Err(e) = axum::serve(listener, app).await {
                     error!(error = %e, "unified webhook server error");
                 }
-            }))
+            })), Some(cron_unified_adapter))
         } else {
-            None
+            (None, None)
         }
     };
 
@@ -893,6 +1252,14 @@ async fn main() -> anyhow::Result<()> {
         #[cfg(feature = "slack")]
         if let Some(ref a) = shared_slack_adapter {
             cron_adapters.insert("slack".into(), a.clone() as Arc<dyn adapter::ChatAdapter>);
+        }
+        #[cfg(feature = "telegram")]
+        if let Some(ref a) = shared_unified_adapter {
+            cron_adapters.insert("telegram".into(), a.clone());
+        }
+        #[cfg(feature = "googlechat")]
+        if let Some(ref a) = shared_unified_adapter {
+            cron_adapters.insert("googlechat".into(), a.clone());
         }
         let cron_platforms: Vec<String> =
             configured_platforms.iter().map(|s| s.to_string()).collect();
@@ -1022,6 +1389,8 @@ async fn main() -> anyhow::Result<()> {
             stt_config: cfg.stt.clone(),
             inbound_attachment_content_blocks,
             adapter: std::sync::OnceLock::new(),
+            #[cfg(feature = "filestore")]
+            filestore: filestore.clone(),
             allow_bot_messages: discord_cfg.allow_bot_messages,
             trusted_bot_ids,
             allow_user_messages: discord_cfg.allow_user_messages,
@@ -1202,7 +1571,7 @@ mod tests {
     }
 
     #[test]
-    fn has_unified_platform_env_checks() {
+    fn has_unified_platform_checks_config_and_env() {
         // Run sequentially in one test to avoid env var race conditions
         // (std::env::set_var is process-global, cargo tests run in parallel)
 
@@ -1216,26 +1585,160 @@ mod tests {
             std::env::remove_var("GOOGLE_CHAT_ENABLED");
         }
 
-        // Case 1: no env vars → false
+        let no_platform_cfg = config::parse_config_str("", "test").unwrap();
+
+        // Case 1: no config or env activation → false
         clear_all();
-        assert!(!has_unified_platform_env());
+        assert!(!has_unified_platform(&no_platform_cfg));
 
         // Case 2: GOOGLE_CHAT_ENABLED=true → true only if feature compiled
         clear_all();
         std::env::set_var("GOOGLE_CHAT_ENABLED", "true");
-        assert_eq!(has_unified_platform_env(), cfg!(feature = "googlechat"));
+        assert_eq!(
+            has_unified_platform(&no_platform_cfg),
+            cfg!(feature = "googlechat")
+        );
 
         // Case 3: GOOGLE_CHAT_ENABLED=yes (invalid) → false
         clear_all();
         std::env::set_var("GOOGLE_CHAT_ENABLED", "yes");
-        assert!(!has_unified_platform_env());
+        assert!(!has_unified_platform(&no_platform_cfg));
 
         // Case 4: TELEGRAM_BOT_TOKEN → true only if feature compiled
         clear_all();
         std::env::set_var("TELEGRAM_BOT_TOKEN", "test-token");
-        assert_eq!(has_unified_platform_env(), cfg!(feature = "telegram"));
+        assert_eq!(
+            has_unified_platform(&no_platform_cfg),
+            cfg!(feature = "telegram")
+        );
+
+        // Case 5: config-only Google Chat activation → true without env
+        clear_all();
+        let googlechat_enabled = config::parse_config_str(
+            "[googlechat]\nenabled = true\naccess_token = \"test-token\"\n",
+            "test",
+        )
+        .unwrap();
+        assert_eq!(
+            has_unified_platform(&googlechat_enabled),
+            cfg!(feature = "googlechat")
+        );
+
+        // Case 6: config-authoritative false beats GOOGLE_CHAT_ENABLED=true
+        clear_all();
+        std::env::set_var("GOOGLE_CHAT_ENABLED", "true");
+        let googlechat_disabled =
+            config::parse_config_str("[googlechat]\nenabled = false\n", "test").unwrap();
+        assert!(!has_unified_platform(&googlechat_disabled));
 
         // Cleanup
         clear_all();
+    }
+
+    #[test]
+    fn gateway_section_trust_mirrors_ws_filter_semantics() {
+        use openab_core::trust::Decision;
+
+        // Explicit lists → deny-by-default with listed entries admitted
+        // (resolve_allow_all: no flag + non-empty list = false).
+        let gw = config::parse_config_str(
+            r#"
+[gateway]
+url = "ws://gw:8080/ws"
+platform = "telegram"
+allowed_channels = ["c1"]
+allowed_users = ["u1"]
+"#,
+            "test",
+        )
+        .unwrap()
+        .gateway
+        .unwrap();
+        let trust = gateway_section_trust(&gw);
+        assert_eq!(trust.decide("c1", false, "u1"), Decision::Allow);
+        assert_ne!(trust.decide("c1", false, "u2"), Decision::Allow);
+        assert_ne!(trust.decide("c2", false, "u1"), Decision::Allow);
+
+        // Empty lists → allow-all (matching the old inline filter default).
+        let gw_open = config::parse_config_str(
+            "[gateway]\nurl = \"ws://gw:8080/ws\"\n",
+            "test",
+        )
+        .unwrap()
+        .gateway
+        .unwrap();
+        let trust_open = gateway_section_trust(&gw_open);
+        assert_eq!(trust_open.decide("any", false, "anyone"), Decision::Allow);
+    }
+
+    #[test]
+    fn gateway_trust_seed_precedence_env_lt_gateway_lt_platform() {
+        use openab_core::trust::{Decision, PlatformTrustConfigs, TrustConfig};
+
+        let mut reg = PlatformTrustConfigs::new();
+        // 1. uniform GATEWAY_* env seed: deny-all users
+        reg.insert(
+            "telegram",
+            TrustConfig::new(Some(true), vec![], None, Some(false), vec![]),
+        );
+        assert_ne!(
+            reg.get("telegram").decide("c", false, "alice"),
+            Decision::Allow
+        );
+
+        // 2. [gateway] section seed overwrites the env seed for its platform
+        let gw = config::parse_config_str(
+            r#"
+[gateway]
+url = "ws://gw:8080/ws"
+platform = "telegram"
+allowed_users = ["alice"]
+"#,
+            "test",
+        )
+        .unwrap()
+        .gateway
+        .unwrap();
+        reg.insert("telegram", gateway_section_trust(&gw));
+        assert_eq!(
+            reg.get("telegram").decide("c", false, "alice"),
+            Decision::Allow
+        );
+        assert_ne!(
+            reg.get("telegram").decide("c", false, "bob"),
+            Decision::Allow
+        );
+
+        // 3. [telegram] platform section (platform_trust_override) wins last
+        reg.insert(
+            "telegram",
+            TrustConfig::new(Some(true), vec![], None, Some(false), vec!["bob".into()]),
+        );
+        assert_eq!(
+            reg.get("telegram").decide("c", false, "bob"),
+            Decision::Allow
+        );
+        assert_ne!(
+            reg.get("telegram").decide("c", false, "alice"),
+            Decision::Allow
+        );
+    }
+
+    #[test]
+    fn complete_wecom_section_enables_unified_startup_without_env() {
+        let cfg = config::parse_config_str(
+            r#"
+[wecom]
+corp_id = "ww1234567890abcdef"
+secret = "test-secret"
+token = "test-token"
+encoding_aes_key = "abcdefghijklmnopqrstuvwxyzABCDEFGH123456789"
+agent_id = "1000002"
+"#,
+            "test",
+        )
+        .unwrap();
+
+        assert_eq!(has_unified_wecom_config(&cfg), cfg!(feature = "wecom"));
     }
 }

@@ -40,16 +40,24 @@ Set environment variables:
 
 OAB config (`config.toml`):
 
-**Minimal** — just pass the API key to the agent:
+**Minimal** — bot token via env var, API key passed to agent:
 
 ```toml
+[telegram]
+bot_token = "${TELEGRAM_BOT_TOKEN}"
+allow_all_users = true
+
 [agent]
 env = { KIRO_API_KEY = "${KIRO_API_KEY}" }
 ```
 
-**Recommended** — with tuned pool, streaming, and native table rendering:
+**Recommended** — with access control, tuned pool, and streaming:
 
 ```toml
+[telegram]
+bot_token = "${TELEGRAM_BOT_TOKEN}"
+allowed_users = ["176096071"]
+
 [agent]
 env = { KIRO_API_KEY = "${KIRO_API_KEY}" }
 
@@ -59,9 +67,13 @@ session_ttl_hours = 1
 
 [reactions]
 tool_display = "compact"
+```
 
+Table rendering is automatically disabled for Telegram (tables pass through as native markdown for Rich Messages). To force code-block wrapping, set explicitly:
+
+```toml
 [markdown]
-tables = "off"
+tables = "code"
 ```
 
 Streaming is enabled by default when Rich Messages are active — replies are streamed live via `sendRichMessageDraft` with rich formatting, then finalized with `sendRichMessage`. If `TELEGRAM_RICH_MESSAGES=false`, streaming is also disabled by default. To override, set `TELEGRAM_STREAMING=true` or `TELEGRAM_STREAMING=false` explicitly.
@@ -356,11 +368,11 @@ Agent replies are rendered with Telegram Markdown: **bold**, `code`, and code bl
 
 With **Rich Messages** enabled (default, requires Bot API 10.1+), headings (`##`) and tables render with full formatting via `sendRichMessage`. Code blocks remain on the legacy path for syntax highlighting and copy-button support. Content exceeding 4096 characters is automatically handled via rich messages (up to 32768 chars).
 
-> **Important:** OAB's default table mode wraps markdown tables in code blocks before they reach the gateway. To allow native Telegram table rendering via Rich Messages, disable this conversion in your `config.toml`:
+> **Note:** As of v0.9.0, OAB automatically disables table code-block wrapping for Telegram adapters (both unified and standalone gateway) when Rich Messages are enabled. Tables pass through as raw markdown and render natively. No `[markdown]` config is needed. To override this and force code-block wrapping, add:
 >
 > ```toml
 > [markdown]
-> tables = "off"
+> tables = "code"
 > ```
 >
 > Rich Messages requires gateway version **v0.6.0-rc.1** or above (`ghcr.io/openabdev/openab-gateway:v0.6.0-rc.1`+).

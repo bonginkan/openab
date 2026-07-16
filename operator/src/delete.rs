@@ -3,9 +3,8 @@ use std::path::Path;
 
 /// Delete every OABService defined in a manifest file or directory (mirrors
 /// `apply -f`). Each manifest's `metadata.name`/`metadata.namespace` are used
-/// directly — there's no `--cluster` override here because `apply` itself
-/// only ever deploys to the hardcoded `"oab"` cluster (manifests don't carry
-/// a cluster field), so deletion targets the same cluster unconditionally.
+/// directly — cluster is resolved from bootstrap state (supports imported
+/// clusters with custom names), falling back to "oab" if unavailable.
 /// An `OABFleet` manifest expands to multiple services, all deleted in turn.
 ///
 /// Continues past a failed delete instead of stopping at the first one, so
@@ -20,10 +19,17 @@ pub async fn run_from_file(aws_config: &aws_config::SdkConfig, file_path: &str) 
         anyhow::bail!("no manifests found at {}", file_path);
     }
 
+    // Resolve cluster from config (same source as `get` and CLI `delete` commands).
+    // ~/.oabctl/config.toml defaults.cluster; falls back to "oab".
+    // Propagate config load errors — silently defaulting could target the wrong cluster.
+    let oab_cfg = crate::config::OabConfig::load()
+        .context("failed to load ~/.oabctl/config.toml (run `oabctl bootstrap` first)")?;
+    let cluster = &oab_cfg.defaults.cluster;
+
     let mut failures = Vec::new();
     for m in &manifests {
         println!("Deleting {} (from {})...", m.metadata.name, file_path);
-        if let Err(e) = run(aws_config, "oabservice", &m.metadata.name, "oab", &m.metadata.namespace).await {
+        if let Err(e) = run(aws_config, "oabservice", &m.metadata.name, cluster, &m.metadata.namespace).await {
             eprintln!("  ⚠ failed to delete {}: {e}", m.metadata.name);
             failures.push(m.metadata.name.clone());
         }
@@ -91,8 +97,11 @@ pub async fn run(
     // 2a. Wait for the service to fully drain (INACTIVE status) so that
     // a subsequent `apply` doesn't hit "Unable to Start a service that
     // is still Draining".
+    const DRAIN_POLL_ATTEMPTS: u32 = 12;
+    const DRAIN_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
     eprint!("  ⏳ Waiting for drain to complete...");
-    for i in 0..12 {
+    for i in 0..DRAIN_POLL_ATTEMPTS {
         // Check status first, then sleep — avoids an unnecessary initial delay
         // when the service transitions quickly.
         let resp = ecs
@@ -116,16 +125,16 @@ pub async fn run(
             if i == 0 {
                 eprintln!(" done (immediate)");
             } else {
-                let elapsed = i * 5;
+                let elapsed = u64::from(i) * DRAIN_POLL_INTERVAL.as_secs();
                 eprintln!(" done ({elapsed}s)");
             }
             break;
         }
-        if i == 11 {
+        if i == DRAIN_POLL_ATTEMPTS - 1 {
             eprintln!(" timed out (service may still be draining)");
         } else {
             eprint!(".");
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            tokio::time::sleep(DRAIN_POLL_INTERVAL).await;
         }
     }
 

@@ -44,9 +44,9 @@ thread_id = ""                               # optional: post to existing thread
 |-------|----------|---------|-------------|
 | `enabled` | | `true` | Set `false` to disable without removing the entry |
 | `schedule` | ✅ | — | 5-field POSIX cron expression |
-| `channel` | ✅ | — | Discord channel/thread ID or Slack channel ID |
+| `channel` | ✅ | — | Discord channel/thread ID, Slack channel ID, Telegram chat ID, or Google Chat space name |
 | `message` | ✅ | — | Message sent to the agent as a prompt |
-| `platform` | | `"discord"` | `"discord"` or `"slack"` |
+| `platform` | | `"discord"` | `"discord"`, `"slack"`, `"telegram"`, or `"googlechat"` (non-default platforms require their feature) |
 | `sender_name` | | `"openab-cron"` | Attribution shown in prompt context |
 | `timezone` | | `"UTC"` | IANA timezone (e.g. `"America/New_York"`, `"Europe/Berlin"`) |
 | `thread_id` | | — | Post into an existing thread instead of the channel |
@@ -113,6 +113,21 @@ channel = "C0123456789"
 message = "check for any critical alerts in the last 8 hours"
 platform = "slack"
 sender_name = "OpsBot"
+
+[[cron.jobs]]
+schedule = "* * * * *"
+channel = "176096071"
+message = "講一個冷笑話"
+platform = "telegram"
+sender_name = "JokeBot"
+
+[[cron.jobs]]
+schedule = "0 9 * * 1-5"
+channel = "spaces/AAAA1234567"
+message = "summarize the new support escalations"
+platform = "googlechat"
+sender_name = "SupportDigest"
+timezone = "Asia/Taipei"
 ```
 
 ## Helm Deployment
@@ -323,6 +338,19 @@ When a cron job fires, the agent sees a sender context like:
 ```
 
 Use `sender_name` to distinguish different scheduled tasks in logs and thread titles. The agent can use this to tailor its response (e.g. "DailyOps asked for a summary" vs "WeeklyReport asked for a report").
+
+## Platform Prerequisites
+
+| Platform | Feature Flag | Config / Env Required |
+|----------|-------------|----------------------|
+| `discord` | (always enabled) | `[discord]` section in config.toml |
+| `slack` | `--features slack` | `[slack]` section in config.toml |
+| `telegram` | `--features telegram` | `[telegram]` section in config.toml **or** `TELEGRAM_BOT_TOKEN` env var |
+| `googlechat` | `--features googlechat` | `[googlechat] enabled = true` in config.toml **or** `GOOGLE_CHAT_ENABLED=true` env var, plus credentials (`sa_key_json`/`sa_key_file`/`access_token` fields or their `GOOGLE_CHAT_*` env equivalents) |
+
+> **Note:** The `channel` field for Telegram should be the numeric chat ID (e.g. `"176096071"`). Use [@userinfobot](https://t.me/userinfobot) or the Telegram Bot API `getUpdates` to find your chat ID.
+
+For Google Chat, use the space resource name (for example, `"spaces/AAAA1234567"`). Jobs without `thread_id` stay at the top level of the space because Google Chat does not implement OpenAB's `create_topic` command. To post into an existing thread, set `thread_id` to its full Google Chat thread resource name.
 
 ## When to Use External Schedulers Instead
 

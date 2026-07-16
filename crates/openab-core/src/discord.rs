@@ -1,4 +1,4 @@
-use crate::acp::protocol::ConfigOption;
+use crate::acp::protocol::{ConfigOption, UsageReport};
 use crate::acp::ContentBlock;
 use crate::adapter::{
     AdapterRouter, ChannelRef, ChatAdapter, MessageRef, OutboundAttachment, SenderContext,
@@ -8,12 +8,13 @@ use crate::config::{AllowBots, AllowUsers, SttConfig};
 use crate::format;
 use crate::media;
 use crate::remind::{self, ReminderStore};
+use crate::trust::l3_gate_applies;
 use async_trait::async_trait;
 use serenity::builder::{
     CreateActionRow, CreateAttachment, CreateButton, CreateCommand, CreateCommandOption,
-    CreateInteractionResponse, CreateInteractionResponseFollowup, CreateInteractionResponseMessage,
-    CreateSelectMenu, CreateSelectMenuKind, CreateSelectMenuOption, CreateThread, EditChannel,
-    EditMessage, EditThread, GetMessages,
+    CreateEmbed, CreateEmbedFooter, CreateInteractionResponse, CreateInteractionResponseFollowup,
+    CreateInteractionResponseMessage, CreateSelectMenu, CreateSelectMenuKind,
+    CreateSelectMenuOption, CreateThread, EditChannel, EditMessage, EditThread, GetMessages,
 };
 use serenity::http::Http;
 use serenity::model::application::ButtonStyle;
@@ -38,6 +39,26 @@ const PARTICIPATION_CACHE_MAX: usize = 1000;
 
 /// Discord StringSelectMenu hard limit on options.
 const SELECT_MENU_PAGE_SIZE: usize = 25;
+
+/// Discord caps select menu option labels and descriptions at 100
+/// characters; anything longer makes the entire interaction response fail
+/// with "Invalid Form Body", which surfaces to users as "The application
+/// did not respond". (Hit in the wild when a backend model description
+/// exceeded the cap.)
+const SELECT_OPTION_TEXT_MAX: usize = 100;
+
+/// Truncate to at most `max` characters (not bytes — Discord counts
+/// characters, and slicing on a byte boundary would panic on multi-byte
+/// UTF-8). Appends '…' when truncated.
+fn truncate_for_discord(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+        out.push('…');
+        out
+    }
+}
 
 /// Avoid unbounded Discord history exports from very large threads.
 const THREAD_EXPORT_MESSAGE_LIMIT: usize = 5000;
@@ -282,6 +303,9 @@ pub struct Handler {
     pub stt_config: SttConfig,
     pub inbound_attachment_content_blocks: bool,
     pub adapter: OnceLock<Arc<dyn ChatAdapter>>,
+    /// Optional filestore for uploading file attachments.
+    #[cfg(feature = "filestore")]
+    pub filestore: Option<Arc<crate::filestore::Filestore>>,
     pub allow_bot_messages: AllowBots,
     pub trusted_bot_ids: HashSet<u64>,
     pub allow_user_messages: AllowUsers,
@@ -856,70 +880,114 @@ impl EventHandler for Handler {
                         let msg_ref = discord_msg_ref(&msg);
                         let _ = adapter.add_reaction(&msg_ref, "🎤").await;
                     }
-                } else if media::is_text_file(
+                } else if media::is_text_file(&attachment.filename, attachment.content_type.as_deref())
+                {
+                if text_file_count >= TEXT_FILE_COUNT_CAP {
+                    tracing::warn!(filename = %attachment.filename, count = text_file_count, "text file count cap reached, skipping");
+                    continue;
+                }
+                // Pre-check with Discord-reported size (fast path, avoids unnecessary download).
+                // Running total uses actual downloaded bytes for accurate accounting.
+                // When filestore is configured, skip the cap for files > 512KB (they'll
+                // be uploaded to S3, not inlined).
+                let attachment_size = u64::from(attachment.size);
+                #[cfg(feature = "filestore")]
+                let skip_cap = self.filestore.is_some() && attachment_size > crate::media::TEXT_INLINE_LIMIT;
+                #[cfg(not(feature = "filestore"))]
+                let skip_cap = false;
+                if !skip_cap && text_file_bytes + attachment_size > TEXT_TOTAL_CAP {
+                    tracing::warn!(filename = %attachment.filename, total = text_file_bytes, "text attachments total exceeds 1MB cap, skipping remaining");
+                    continue;
+                }
+                #[cfg(feature = "filestore")]
+                let text_file_result = media::download_and_read_text_file(
+                    &attachment.url,
                     &attachment.filename,
+                    attachment_size,
+                    None,
+                    self.filestore.as_deref(),
+                )
+                .await;
+                #[cfg(not(feature = "filestore"))]
+                let text_file_result = media::download_and_read_text_file(
+                    &attachment.url,
+                    &attachment.filename,
+                    attachment_size,
+                    None,
+                )
+                .await;
+                if let Some((block, actual_bytes)) = text_file_result {
+                    text_file_bytes += actual_bytes;
+                    text_file_count += 1;
+                    debug!(filename = %attachment.filename, "adding text file attachment");
+                    extra_blocks.push(block);
+                }
+            } else {
+                match media::download_and_encode_image(
+                    &attachment.url,
                     attachment.content_type.as_deref(),
-                ) {
-                    if text_file_count >= TEXT_FILE_COUNT_CAP {
-                        tracing::warn!(filename = %attachment.filename, count = text_file_count, "text file count cap reached, skipping");
-                        continue;
-                    }
-                    // Pre-check with Discord-reported size (fast path, avoids unnecessary download).
-                    // Running total uses actual downloaded bytes for accurate accounting.
-                    if text_file_bytes + u64::from(attachment.size) > TEXT_TOTAL_CAP {
-                        tracing::warn!(filename = %attachment.filename, total = text_file_bytes, "text attachments total exceeds 1MB cap, skipping remaining");
-                        continue;
-                    }
-                    if let Some((block, actual_bytes)) = media::download_and_read_text_file(
-                        &attachment.url,
-                        &attachment.filename,
-                        u64::from(attachment.size),
-                        None,
-                    )
-                    .await
-                    {
-                        text_file_bytes += actual_bytes;
-                        text_file_count += 1;
-                        debug!(filename = %attachment.filename, "adding text file attachment");
+                    &attachment.filename,
+                    u64::from(attachment.size),
+                    None,
+                )
+                .await
+                {
+                    Ok(block) => {
+                        debug!(url = %attachment.url, filename = %attachment.filename, "adding image attachment");
                         extra_blocks.push(block);
+                        extra_blocks.push(ContentBlock::Text {
+                            text: format!(
+                                "[Image attachment]\nfilename: {}\ncontent_type: {}\nsize_bytes: {}\nurl: {} (expires ~24h)",
+                                attachment.filename,
+                                attachment.content_type.as_deref().unwrap_or("unknown"),
+                                attachment.size,
+                                attachment.url,
+                            ),
+                        });
                     }
-                } else {
-                    match media::download_and_encode_image(
-                        &attachment.url,
-                        attachment.content_type.as_deref(),
-                        &attachment.filename,
-                        u64::from(attachment.size),
-                        None,
-                    )
-                    .await
-                    {
-                        Ok(block) => {
-                            debug!(url = %attachment.url, filename = %attachment.filename, "adding image attachment");
-                            extra_blocks.push(block);
-                        }
-                        Err(media::MediaFetchError::NotAnImage) => {
-                            if media::is_video_file(
+                    Err(media::MediaFetchError::NotAnImage) => {
+                        if media::is_video_file(
+                            &attachment.filename,
+                            attachment.content_type.as_deref(),
+                        ) {
+                            debug!(url = %attachment.url, filename = %attachment.filename, "adding video attachment link");
+                            extra_blocks.push(video_attachment_block(
                                 &attachment.filename,
                                 attachment.content_type.as_deref(),
-                            ) {
-                                debug!(url = %attachment.url, filename = %attachment.filename, "adding video attachment link");
-                                extra_blocks.push(video_attachment_block(
-                                    &attachment.filename,
-                                    attachment.content_type.as_deref(),
-                                    u64::from(attachment.size),
+                                u64::from(attachment.size),
+                                &attachment.url,
+                            ));
+                        }
+                        // For all other unsupported formats (PDF, ZIP, binary, etc.):
+                        // upload to filestore if available so the agent gets a presigned URL.
+                        #[cfg(feature = "filestore")]
+                        if !media::is_video_file(
+                            &attachment.filename,
+                            attachment.content_type.as_deref(),
+                        ) {
+                            if let Some(ref fs) = self.filestore {
+                                if let Some((block, _)) = media::download_and_upload_any_file(
                                     &attachment.url,
-                                ));
+                                    &attachment.filename,
+                                    u64::from(attachment.size),
+                                    attachment.content_type.as_deref(),
+                                    None,
+                                    fs,
+                                ).await {
+                                    extra_blocks.push(block);
+                                }
                             }
                         }
-                        Err(e) => {
-                            tracing::warn!(
-                                url = %attachment.url,
-                                filename = %attachment.filename,
-                                error = %e,
-                                "image attachment failed"
-                            );
-                            failed_image_files.push(attachment.filename.clone());
-                            let reason = match &e {
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            url = %attachment.url,
+                            filename = %attachment.filename,
+                            error = %e,
+                            "image attachment failed"
+                        );
+                        failed_image_files.push(attachment.filename.clone());
+                        let reason = match &e {
                             media::MediaFetchError::SizeExceeded { .. } => "size exceeded".into(),
                             media::MediaFetchError::Network(_) => {
                                 "download failed: network error".into()
@@ -946,9 +1014,9 @@ impl EventHandler for Handler {
                                 attachment.filename, reason
                             ),
                         });
-                        }
                     }
                 }
+            }
             }
         } else if !msg.attachments.is_empty() {
             tracing::debug!(
@@ -1362,30 +1430,25 @@ impl EventHandler for Handler {
             CreateCommand::new("reset").description("Reset the conversation session"),
             CreateCommand::new("remind")
                 .description("Set a one-shot reminder to mention users/roles after a delay")
-                .add_option(
-                    CreateCommandOption::new(
-                        CommandOptionType::String,
-                        "targets",
-                        "Users/roles to mention (e.g. @user1 @role1)",
-                    )
-                    .required(true),
-                )
-                .add_option(
-                    CreateCommandOption::new(
-                        CommandOptionType::String,
-                        "message",
-                        "Reminder message",
-                    )
-                    .required(true),
-                )
-                .add_option(
-                    CreateCommandOption::new(
-                        CommandOptionType::String,
-                        "delay",
-                        "Delay before firing (e.g. 30m, 2h, 1d)",
-                    )
-                    .required(true),
-                ),
+                .add_option(CreateCommandOption::new(
+                    CommandOptionType::String,
+                    "targets",
+                    "Users/roles to mention (e.g. @user1 @role1)",
+                ).required(true))
+                .add_option(CreateCommandOption::new(
+                    CommandOptionType::String,
+                    "message",
+                    "Reminder message",
+                ).required(true))
+                .add_option(CreateCommandOption::new(
+                    CommandOptionType::String,
+                    "delay",
+                    "Delay before firing (e.g. 30m, 2h, 1d)",
+                ).required(true)),
+            CreateCommand::new("auth")
+                .description("Authenticate the backend agent (device flow)"),
+            CreateCommand::new("usage")
+                .description("Show backend account usage and billing information"),
             CreateCommand::new("export-thread")
                 .description("Download this thread as a text file")
                 .add_option(CreateCommandOption::new(
@@ -1487,6 +1550,12 @@ impl EventHandler for Handler {
             Interaction::Command(cmd) if cmd.data.name == "export-thread" => {
                 self.handle_export_thread_command(&ctx, &cmd).await;
             }
+            Interaction::Command(cmd) if cmd.data.name == "auth" => {
+                self.handle_auth_command(&ctx, &cmd).await;
+            }
+            Interaction::Command(cmd) if cmd.data.name == "usage" => {
+                self.handle_usage_command(&ctx, &cmd).await;
+            }
             Interaction::Component(comp) if comp.data.custom_id.starts_with("acp_config_") => {
                 self.handle_config_select(&ctx, &comp).await;
             }
@@ -1527,9 +1596,12 @@ impl Handler {
             .skip(page * SELECT_MENU_PAGE_SIZE)
             .take(SELECT_MENU_PAGE_SIZE)
             .map(|o| {
-                let mut item = CreateSelectMenuOption::new(&o.name, &o.value);
+                let mut item = CreateSelectMenuOption::new(
+                    truncate_for_discord(&o.name, SELECT_OPTION_TEXT_MAX),
+                    &o.value,
+                );
                 if let Some(desc) = &o.description {
-                    item = item.description(desc);
+                    item = item.description(truncate_for_discord(desc, SELECT_OPTION_TEXT_MAX));
                 }
                 if o.value == opt.current_value {
                     item = item.default_selection(true);
@@ -1650,6 +1722,354 @@ impl Handler {
 
         if let Err(e) = cmd.create_response(&ctx.http, response).await {
             tracing::error!(error = %e, category, "failed to respond to slash command");
+        }
+    }
+
+    async fn handle_auth_command(
+        &self,
+        ctx: &Context,
+        cmd: &serenity::model::application::CommandInteraction,
+    ) {
+        // Reject bot users — consistent with other slash-command handlers (e.g. /remind).
+        if cmd.user.bot {
+            let response = CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content("🤖 Bots cannot use `/auth`.")
+                    .ephemeral(true),
+            );
+            let _ = cmd.create_response(&ctx.http, response).await;
+            return;
+        }
+
+        // Access control — only allowed users can trigger auth.
+        if is_denied_user(
+            false,
+            self.allow_all_users,
+            &self.allowed_users,
+            cmd.user.id.get(),
+        ) {
+            let response = CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content("🚫 You are not allowed to use this bot.")
+                    .ephemeral(true),
+            );
+            let _ = cmd.create_response(&ctx.http, response).await;
+            return;
+        }
+
+        // DM-only — auth codes are sensitive; reject if not in a DM channel.
+        if cmd.guild_id.is_some() {
+            let response = CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content("🔒 `/auth` is only available in DMs for security. Please DM me and run `/auth` there.")
+                    .ephemeral(true),
+            );
+            let _ = cmd.create_response(&ctx.http, response).await;
+            return;
+        }
+
+        // Single-flight guard — prevent concurrent /auth invocations.
+        static AUTH_IN_PROGRESS: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        if AUTH_IN_PROGRESS.swap(true, std::sync::atomic::Ordering::Acquire) {
+            let response = CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content("⚠️ Authentication already in progress. Please wait for it to complete.")
+                    .ephemeral(true),
+            );
+            let _ = cmd.create_response(&ctx.http, response).await;
+            return;
+        }
+
+        let auth_cmd = match std::env::var("OPENAB_AGENT_AUTH_COMMAND") {
+            Ok(val) if !val.is_empty() => val,
+            _ => {
+                AUTH_IN_PROGRESS.store(false, std::sync::atomic::Ordering::Release);
+                let response = CreateInteractionResponse::Message(
+                    CreateInteractionResponseMessage::new()
+                        .content("⚠️ No auth command configured (`OPENAB_AGENT_AUTH_COMMAND` not set).")
+                        .ephemeral(true),
+                );
+                let _ = cmd.create_response(&ctx.http, response).await;
+                return;
+            }
+        };
+
+        // Acknowledge with a deferred ephemeral response so we have time to run the command.
+        let defer = CreateInteractionResponse::Defer(
+            CreateInteractionResponseMessage::new().ephemeral(true),
+        );
+        if let Err(e) = cmd.create_response(&ctx.http, defer).await {
+            AUTH_IN_PROGRESS.store(false, std::sync::atomic::Ordering::Release);
+            tracing::error!(error = %e, "failed to defer /auth response");
+            return;
+        }
+
+        let http = ctx.http.clone();
+        let token = cmd.token.clone();
+        let user_id = cmd.user.id.get();
+
+        tokio::spawn(async move {
+            use tokio::io::AsyncBufReadExt;
+            use tokio::process::Command as TokioCommand;
+            use std::sync::Arc;
+
+            // Drop guard ensures AUTH_IN_PROGRESS is cleared even on panic.
+            struct AuthGuard;
+            impl Drop for AuthGuard {
+                fn drop(&mut self) {
+                    AUTH_IN_PROGRESS.store(false, std::sync::atomic::Ordering::Release);
+                }
+            }
+            let _guard = AuthGuard;
+
+            info!(user_id, "/auth: starting auth command");
+
+            let child = TokioCommand::new("sh")
+                .arg("-c")
+                .arg(&auth_cmd)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn();
+
+            let mut child = match child {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::error!(error = %e, "/auth: failed to spawn auth command");
+                    let _ = http.create_followup_message(
+                        &token,
+                        &CreateInteractionResponseFollowup::new()
+                            .content(format!("❌ Failed to start auth command: {e}"))
+                            .ephemeral(true),
+                        Vec::new(),
+                    ).await;
+                    return;
+                }
+            };
+
+            let stdout = child.stdout.take();
+            let stderr = child.stderr.take();
+
+            let lines = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+            let url_found = Arc::new(tokio::sync::Notify::new());
+
+            // Spawn background drain tasks — they run to EOF, keeping pipes open.
+            let lines_out = lines.clone();
+            let url_found_out = url_found.clone();
+            let stdout_task = tokio::spawn(async move {
+                if let Some(stdout) = stdout {
+                    let mut reader = tokio::io::BufReader::new(stdout).lines();
+                    while let Ok(Some(line)) = reader.next_line().await {
+                        let has_url = line.contains("http://") || line.contains("https://");
+                        lines_out.lock().unwrap_or_else(|e| e.into_inner()).push(line);
+                        if has_url {
+                            url_found_out.notify_one();
+                        }
+                    }
+                }
+            });
+
+            let lines_err = lines.clone();
+            let url_found_err = url_found.clone();
+            let stderr_task = tokio::spawn(async move {
+                if let Some(stderr) = stderr {
+                    let mut reader = tokio::io::BufReader::new(stderr).lines();
+                    while let Ok(Some(line)) = reader.next_line().await {
+                        let has_url = line.contains("http://") || line.contains("https://");
+                        lines_err.lock().unwrap_or_else(|e| e.into_inner()).push(line);
+                        if has_url {
+                            url_found_err.notify_one();
+                        }
+                    }
+                }
+            });
+
+            // Wait for a URL to appear, the command to exit early, or a 30s timeout.
+            let mut early_exit: Option<std::io::Result<std::process::ExitStatus>> = None;
+            tokio::select! {
+                _ = url_found.notified() => {
+                    info!("/auth: URL detected in output");
+                    // Brief sleep to let trailing lines (code/instructions) be captured.
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                }
+                res = child.wait() => {
+                    // The auth command exited before printing a URL — fail fast
+                    // instead of waiting out the full collection window.
+                    warn!("/auth: auth command exited before a URL was detected");
+                    early_exit = Some(res);
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+                    warn!("/auth: 30s URL-collection window expired without detecting URL");
+                }
+            }
+
+            // Handle an early exit (the command terminated during the URL window).
+            if let Some(res) = early_exit {
+                let _ = tokio::join!(stdout_task, stderr_task);
+                let collected = strip_ansi_codes(
+                    &lines
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .join("\n"),
+                );
+                let detail = if collected.trim().is_empty() {
+                    String::new()
+                } else {
+                    let snippet: String = collected.chars().take(500).collect();
+                    format!("\n```\n{snippet}\n```")
+                };
+                let content = match res {
+                    Ok(status) if status.success() => {
+                        format!(
+                            "⚠️ Auth command exited (status 0) before a login URL was detected. Run `/auth` again to retry.{detail}"
+                        )
+                    }
+                    Ok(status) => {
+                        format!(
+                            "❌ Auth command exited early ({status}) before producing a login URL.{detail}"
+                        )
+                    }
+                    Err(e) => format!("❌ Error waiting for auth command: {e}"),
+                };
+                let _ = http.create_followup_message(
+                    &token,
+                    &CreateInteractionResponseFollowup::new()
+                        .content(content)
+                        .ephemeral(true),
+                    Vec::new(),
+                ).await;
+                return;
+            }
+
+            let collected_lines = lines.lock().unwrap_or_else(|e| e.into_inner()).clone();
+
+            if collected_lines.is_empty() {
+                warn!("/auth: no output captured, killing child process");
+                let _ = child.kill().await;
+                let _ = tokio::join!(stdout_task, stderr_task);
+                let _ = http.create_followup_message(
+                    &token,
+                    &CreateInteractionResponseFollowup::new()
+                        .content("⚠️ Auth command produced no output within 30 seconds. Verify `OPENAB_AGENT_AUTH_COMMAND` is set and prints a login URL to stdout/stderr.")
+                        .ephemeral(true),
+                    Vec::new(),
+                ).await;
+                return;
+            }
+
+            // Send the captured output as plain text (no code block) so URLs are
+            // clickable in Discord.
+            let output = strip_ansi_codes(&collected_lines.join("\n"));
+            let output = ensure_url_separation(&output);
+            let prefix = "🔐 **Agent Authentication**\n\n";
+            let suffix = "\n\nFollow the instructions above. Waiting for authorization...";
+            // Discord enforces the 2000-char limit in UTF-16 code units; budget and
+            // truncate by UTF-16 units rather than Unicode scalar values. See
+            // `truncate_to_utf16_budget` for the testable implementation.
+            let truncated = truncate_to_utf16_budget(&output, prefix, suffix, 2000);
+            let msg = format!("{prefix}{truncated}{suffix}");
+            let _ = http.create_followup_message(
+                &token,
+                &CreateInteractionResponseFollowup::new()
+                    .content(msg)
+                    .ephemeral(true),
+                Vec::new(),
+            ).await;
+
+            // Wait for the process to complete (user authorizes in browser).
+            // Use 14min (not 15) to leave headroom for the Discord interaction token TTL.
+            let timeout = std::time::Duration::from_secs(14 * 60);
+            match tokio::time::timeout(timeout, child.wait()).await {
+                Ok(Ok(status)) if status.success() => {
+                    info!("/auth: authentication successful");
+                    let _ = http.create_followup_message(
+                        &token,
+                        &CreateInteractionResponseFollowup::new()
+                            .content("✅ Authentication successful!")
+                            .ephemeral(true),
+                        Vec::new(),
+                    ).await;
+                }
+                Ok(Ok(status)) => {
+                    warn!(%status, "/auth: authentication failed");
+                    let _ = http.create_followup_message(
+                        &token,
+                        &CreateInteractionResponseFollowup::new()
+                            .content(format!("❌ Authentication failed (exit code: {}).", status))
+                            .ephemeral(true),
+                        Vec::new(),
+                    ).await;
+                }
+                Ok(Err(e)) => {
+                    tracing::error!(error = %e, "/auth: error waiting for auth process");
+                    let _ = http.create_followup_message(
+                        &token,
+                        &CreateInteractionResponseFollowup::new()
+                            .content(format!("❌ Auth process error: {e}"))
+                            .ephemeral(true),
+                        Vec::new(),
+                    ).await;
+                }
+                Err(_) => {
+                    warn!("/auth: timed out waiting for authorization");
+                    let _ = child.kill().await;
+                    let _ = http.create_followup_message(
+                        &token,
+                        &CreateInteractionResponseFollowup::new()
+                            .content("⏰ Authentication timed out. Run `/auth` again to retry.")
+                            .ephemeral(true),
+                        Vec::new(),
+                    ).await;
+                }
+            }
+
+            // Let background drain tasks complete.
+            let _ = tokio::join!(stdout_task, stderr_task);
+        });
+    }
+
+    async fn handle_usage_command(
+        &self,
+        ctx: &Context,
+        cmd: &serenity::model::application::CommandInteraction,
+    ) {
+        let thread_key = format!("discord:{}", cmd.channel_id.get());
+
+        if !self.router.pool().has_active_session(&thread_key).await {
+            let response = CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content("⚠️ No active session. Start a conversation first by @mentioning the bot.")
+                    .ephemeral(true),
+            );
+            if let Err(e) = cmd.create_response(&ctx.http, response).await {
+                tracing::error!(error = %e, "failed to respond to /usage command");
+            }
+            return;
+        }
+
+        // The ACP round-trip can exceed Discord's 3-second interaction
+        // deadline — acknowledge with a deferred ephemeral response first.
+        let defer =
+            CreateInteractionResponse::Defer(CreateInteractionResponseMessage::new().ephemeral(true));
+        if let Err(e) = cmd.create_response(&ctx.http, defer).await {
+            tracing::error!(error = %e, "failed to defer /usage response");
+            return;
+        }
+
+        let followup = match self.router.pool().get_usage(&thread_key).await {
+            Ok(report) => {
+                let (content, embed) = build_usage_reply(&report);
+                CreateInteractionResponseFollowup::new()
+                    .content(content)
+                    .embed(embed)
+                    .ephemeral(true)
+            }
+            Err(e) => CreateInteractionResponseFollowup::new()
+                .content(format!("⚠️ {e}"))
+                .ephemeral(true),
+        };
+        if let Err(e) = cmd.create_followup(&ctx.http, followup).await {
+            tracing::error!(error = %e, "failed to send /usage followup");
         }
     }
 
@@ -2190,6 +2610,75 @@ impl Handler {
 
 // --- Discord-specific helpers ---
 
+/// Render the body lines of a usage report (everything except the plan title
+/// and billing-cycle footer). Returns the text and whether any breakdown is
+/// over its plan limit.
+fn format_usage_body(report: &UsageReport) -> (String, bool) {
+    let mut lines: Vec<String> = Vec::new();
+    let mut over_limit = false;
+
+    for b in &report.breakdowns {
+        match b.limit {
+            Some(limit) => {
+                let pct = b.percentage.unwrap_or_else(|| {
+                    if limit > 0.0 {
+                        (b.used / limit * 100.0).round() as u64
+                    } else {
+                        0
+                    }
+                });
+                if pct > 100 {
+                    over_limit = true;
+                }
+                // 10-slot progress bar, clamped at 100%.
+                let filled = (pct.min(100) as usize) / 10;
+                let bar: String = "█".repeat(filled) + &"░".repeat(10 - filled);
+                lines.push(format!(
+                    "{}: {:.2} / {:.0} `{}` {}%{}",
+                    b.display_name,
+                    b.used,
+                    limit,
+                    bar,
+                    pct,
+                    if pct > 100 { " ⚠️" } else { "" }
+                ));
+            }
+            // No per-user cap (e.g. pooled enterprise credits).
+            None => lines.push(format!("{}: {:.2} used", b.display_name, b.used)),
+        }
+        if let Some(charges) = b.overage_charges {
+            if charges > 0.0 {
+                lines.push(format!(
+                    "Overage charges: {:.2} {}",
+                    charges,
+                    b.currency.as_deref().unwrap_or("USD")
+                ));
+            }
+        }
+    }
+
+    (lines.join("\n"), over_limit)
+}
+
+/// Build the /usage reply as full-size message content plus a minimal
+/// color-strip embed. Discord renders embed descriptions at a smaller font
+/// than message content, so the report body lives in `content` (normal font)
+/// while the embed carries only the at-a-glance color signal (green within
+/// the plan limit, red when any breakdown is over) and the billing-cycle
+/// footer.
+fn build_usage_reply(report: &UsageReport) -> (String, CreateEmbed) {
+    let (body, over_limit) = format_usage_body(report);
+    let content = format!("📊 **Usage — {}**\n{}", report.plan_name, body);
+    let mut embed =
+        CreateEmbed::new().colour(if over_limit { 0xE74C3C } else { 0x2ECC71 });
+    if let Some(reset) = &report.billing_cycle_reset {
+        embed = embed.footer(CreateEmbedFooter::new(format!(
+            "Billing cycle resets {reset}"
+        )));
+    }
+    (content, embed)
+}
+
 fn discord_msg_ref(msg: &Message) -> MessageRef {
     MessageRef {
         channel: ChannelRef {
@@ -2717,16 +3206,6 @@ fn is_denied_user(
     !is_bot && !allow_all_users && !allowed_users.contains(&user_id)
 }
 
-/// Whether the shared L3 identity gate (`AdapterRouter::gate_incoming`) should run
-/// for this sender. Bots bypass L3 — mirroring [`is_denied_user`]'s `!is_bot`
-/// bypass — because bot admission is a separate concern (`allow_bot_messages` +
-/// `trusted_bot_ids`), and L3 (`allowed_users`) is a human-identity allowlist.
-/// Running L3 on bots would wrongly deny mode-admitted/trusted bots when
-/// `allow_all_users=false` (multi-agent). See PR #1270 review.
-fn l3_gate_applies(is_bot: bool) -> bool {
-    !is_bot
-}
-
 /// Returns `true` if a bot message should bypass the `allow_bot_messages` mode check.
 /// A trusted bot that @mentions this bot is treated the same as a human @mention —
 /// it can pull the bot into a thread regardless of the `allow_bot_messages` setting.
@@ -2825,10 +3304,292 @@ fn turn_limit_warning_present(messages: &[(bool, &str)]) -> bool {
         .any(|(is_bot, content)| *is_bot && content.contains(BOT_TURN_LIMIT_WARNING_PREFIX))
 }
 
+/// Strip ANSI escape sequences (color codes, cursor movement, etc.) from text.
+/// Auth CLIs like `codex` emit these for terminal styling, but they render as
+/// garbage in Discord messages.
+fn strip_ansi_codes(s: &str) -> String {
+    static ANSI_RE: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\([A-Z]").unwrap());
+    ANSI_RE.replace_all(s, "").into_owned()
+}
+
+/// Ensure URLs are not glued to preceding text after ANSI stripping.
+/// Discord's markdown parser collapses list-continuation whitespace when a Link
+/// node is adjacent to a Text node, causing `accounthttps://...` rendering.
+/// This inserts a newline before any URL that immediately follows a non-whitespace char.
+fn ensure_url_separation(s: &str) -> String {
+    static URL_RE: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r"(?P<prev>\S)(?P<url>https?://)").unwrap());
+    URL_RE.replace_all(s, "${prev}\n${url}").into_owned()
+}
+
+/// Truncate `body` so that, prefixed by `prefix` and suffixed by `suffix`, the
+/// whole message fits within `limit` measured in **UTF-16 code units** — which
+/// is how Discord enforces its 2000-character message cap. Truncation only ever
+/// happens on a `char` boundary, so a multi-byte scalar (e.g. an emoji that
+/// encodes as a surrogate pair) is never split. Returns the truncated `body`
+/// (without prefix/suffix).
+///
+/// Extracted from `handle_auth_command` so the boundary arithmetic — which is
+/// easy to get wrong by conflating Unicode scalar count with UTF-16 code units —
+/// can be unit-tested in isolation.
+fn truncate_to_utf16_budget(body: &str, prefix: &str, suffix: &str, limit: usize) -> String {
+    let budget = limit
+        .saturating_sub(prefix.encode_utf16().count())
+        .saturating_sub(suffix.encode_utf16().count());
+    let mut truncated = String::new();
+    let mut used = 0usize;
+    for ch in body.chars() {
+        let w = ch.len_utf16();
+        if used + w > budget {
+            break;
+        }
+        used += w;
+        truncated.push(ch);
+    }
+    truncated
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bot_turns::{TurnResult, BOT_TURN_LIMIT_WARNING_PREFIX, HARD_BOT_TURN_LIMIT};
+    use crate::bot_turns::{TurnResult, HARD_BOT_TURN_LIMIT, BOT_TURN_LIMIT_WARNING_PREFIX};
+
+    // --- truncate_for_discord (select menu option 100-char cap) ---
+
+    #[test]
+    fn truncate_for_discord_short_string_unchanged() {
+        assert_eq!(truncate_for_discord("auto", 100), "auto");
+    }
+
+    #[test]
+    fn truncate_for_discord_exactly_at_limit_unchanged() {
+        let s = "x".repeat(100);
+        assert_eq!(truncate_for_discord(&s, 100), s);
+    }
+
+    #[test]
+    fn truncate_for_discord_over_limit_truncated_with_ellipsis() {
+        // Real-world case: the claude-fable-5 model description (~140 chars)
+        // broke the /models slash command with Invalid Form Body.
+        let desc = "[Internal] DEVELOPMENT USE CASES ONLY, NOT FOR CUSTOMER DATA, ITAR OR PII. \
+                    Experimental preview of Claude Fable 5 model with 1M context window";
+        let out = truncate_for_discord(desc, 100);
+        assert_eq!(out.chars().count(), 100);
+        assert!(out.ends_with('…'));
+    }
+
+    #[test]
+    fn truncate_for_discord_counts_chars_not_bytes() {
+        // 120 CJK chars = 360 bytes; must not panic on byte boundaries and
+        // must come back at exactly 100 chars.
+        let s = "測".repeat(120);
+        let out = truncate_for_discord(&s, 100);
+        assert_eq!(out.chars().count(), 100);
+        assert!(out.ends_with('…'));
+    }
+
+    // --- format_usage_report tests (/usage slash command) ---
+
+    fn usage_breakdown() -> crate::acp::protocol::UsageBreakdown {
+        crate::acp::protocol::UsageBreakdown {
+            display_name: "Credits".into(),
+            used: 12781.64,
+            limit: Some(10000.0),
+            percentage: Some(127),
+            overage_charges: Some(111.27),
+            currency: Some("USD".into()),
+        }
+    }
+
+    #[test]
+    fn format_usage_over_limit() {
+        let report = UsageReport {
+            plan_name: "KIRO POWER".into(),
+            billing_cycle_reset: Some("2026-08-01".into()),
+            breakdowns: vec![usage_breakdown()],
+        };
+        let (body, over_limit) = format_usage_body(&report);
+        assert!(over_limit);
+        assert!(body.contains("12781.64 / 10000"));
+        assert!(body.contains("127%"));
+        assert!(body.contains("⚠️"));
+        assert!(body.contains("Overage charges: 111.27 USD"));
+    }
+
+    /// The report body must ride in the message content (normal font size),
+    /// not the embed description (rendered smaller by Discord clients). The
+    /// embed only carries the color strip + billing-cycle footer.
+    #[test]
+    fn usage_reply_body_in_content_not_embed() {
+        let report = UsageReport {
+            plan_name: "KIRO POWER".into(),
+            billing_cycle_reset: Some("2026-08-01".into()),
+            breakdowns: vec![usage_breakdown()],
+        };
+        let (content, embed) = build_usage_reply(&report);
+        assert!(content.starts_with("📊 **Usage — KIRO POWER**"));
+        assert!(content.contains("12781.64 / 10000"));
+        assert!(content.contains("Overage charges: 111.27 USD"));
+        let json = serde_json::to_value(&embed).expect("embed serializes");
+        assert!(json.get("description").is_none(), "body must not be in embed");
+        assert!(json.get("title").is_none(), "title must not be in embed");
+        assert_eq!(json["color"], 0xE74C3C, "over limit → red strip");
+        assert_eq!(json["footer"]["text"], "Billing cycle resets 2026-08-01");
+    }
+
+    #[test]
+    fn format_usage_no_limit_shows_consumption_only() {
+        let report = UsageReport {
+            plan_name: "ENTERPRISE".into(),
+            billing_cycle_reset: None,
+            breakdowns: vec![crate::acp::protocol::UsageBreakdown {
+                display_name: "Credits".into(),
+                used: 320.0,
+                limit: None,
+                percentage: None,
+                overage_charges: None,
+                currency: None,
+            }],
+        };
+        let (body, over_limit) = format_usage_body(&report);
+        assert!(!over_limit);
+        assert!(body.contains("Credits: 320.00 used"));
+        assert!(!body.contains('/'));
+        assert!(!body.contains("Overage"));
+    }
+
+    #[test]
+    fn format_usage_under_limit_no_warning() {
+        let report = UsageReport {
+            plan_name: "FREE".into(),
+            billing_cycle_reset: None,
+            breakdowns: vec![crate::acp::protocol::UsageBreakdown {
+                display_name: "Credits".into(),
+                used: 50.0,
+                limit: Some(100.0),
+                percentage: Some(50),
+                overage_charges: Some(0.0),
+                currency: Some("USD".into()),
+            }],
+        };
+        let (body, over_limit) = format_usage_body(&report);
+        assert!(!over_limit);
+        assert!(body.contains("50%"));
+        assert!(!body.contains("⚠️"));
+        assert!(!body.contains("Overage"));
+        // 50% → 5 of 10 bar slots filled.
+        assert!(body.contains("█████░░░░░"));
+    }
+
+    // --- truncate_to_utf16_budget tests (#1185 /auth output relay) ---
+
+    /// Body shorter than the budget is returned unchanged.
+    #[test]
+    fn truncate_utf16_short_body_unchanged() {
+        assert_eq!(truncate_to_utf16_budget("hello", "", "", 2000), "hello");
+    }
+
+    /// prefix + suffix consume the budget; the body gets the remainder.
+    #[test]
+    fn truncate_utf16_respects_prefix_suffix_budget() {
+        // limit 10, prefix "pre" (3) + suffix "su" (2) = 5 → 5 ASCII units left.
+        assert_eq!(truncate_to_utf16_budget("abcdefghij", "pre", "su", 10), "abcde");
+    }
+
+    /// A supplementary-plane scalar counts as TWO UTF-16 code units, not one.
+    #[test]
+    fn truncate_utf16_counts_surrogate_pairs_as_two_units() {
+        // '🔐' (U+1F510) is one scalar but two UTF-16 units.
+        // Budget 5 → two emoji (4 units) fit; a third (→6) does not.
+        let out = truncate_to_utf16_budget("🔐🔐🔐", "", "", 5);
+        assert_eq!(out, "🔐🔐");
+        assert_eq!(out.encode_utf16().count(), 4);
+    }
+
+    /// A scalar is never split: a 2-unit emoji cannot fit a 1-unit budget.
+    #[test]
+    fn truncate_utf16_never_splits_a_scalar() {
+        assert_eq!(truncate_to_utf16_budget("🔐rest", "", "", 1), "");
+    }
+
+    /// When affixes alone exceed the limit, the budget saturates to zero.
+    #[test]
+    fn truncate_utf16_zero_budget_when_affixes_exceed_limit() {
+        assert_eq!(
+            truncate_to_utf16_budget("anything", "longprefix", "longsuffix", 4),
+            ""
+        );
+    }
+
+    /// The assembled message (prefix + body + suffix) never exceeds the limit,
+    /// even for output dense with multi-unit scalars — this is the regression
+    /// guard for the original `chars().count()` (scalar) miscount.
+    #[test]
+    fn truncate_utf16_assembled_total_within_limit() {
+        let prefix = "🔐 **Agent Authentication**\n```\n";
+        let suffix = "\n```\nFollow the instructions above. Waiting for authorization...";
+        let body = "https://example.com/device AB🔐CD\n".repeat(200);
+        let out = truncate_to_utf16_budget(&body, prefix, suffix, 2000);
+        let total = prefix.encode_utf16().count()
+            + out.encode_utf16().count()
+            + suffix.encode_utf16().count();
+        assert!(total <= 2000, "assembled total {total} exceeds 2000");
+    }
+
+    // --- strip_ansi_codes tests ---
+
+    #[test]
+    fn strip_ansi_removes_color_codes() {
+        let input = "\x1b[90mOpenAI\x1b[0m \x1b[94mhttps://auth.openai.com\x1b[0m";
+        assert_eq!(strip_ansi_codes(input), "OpenAI https://auth.openai.com");
+    }
+
+    #[test]
+    fn strip_ansi_passthrough_clean_text() {
+        assert_eq!(strip_ansi_codes("no codes here"), "no codes here");
+    }
+
+    #[test]
+    fn strip_ansi_removes_non_sgr_sequences() {
+        let input = "\x1b[?25lhello\x1b[?25h \x1b(Bworld";
+        assert_eq!(strip_ansi_codes(input), "hello world");
+    }
+
+    // --- ensure_url_separation tests ---
+
+    #[test]
+    fn url_separation_inserts_newline_when_glued() {
+        assert_eq!(
+            ensure_url_separation("accounthttps://auth.openai.com/codex/device"),
+            "account\nhttps://auth.openai.com/codex/device"
+        );
+    }
+
+    #[test]
+    fn url_separation_preserves_existing_space() {
+        assert_eq!(
+            ensure_url_separation("account https://auth.openai.com"),
+            "account https://auth.openai.com"
+        );
+    }
+
+    #[test]
+    fn url_separation_preserves_existing_newline() {
+        assert_eq!(
+            ensure_url_separation("account\nhttps://auth.openai.com"),
+            "account\nhttps://auth.openai.com"
+        );
+    }
+
+    #[test]
+    fn url_separation_handles_http() {
+        assert_eq!(
+            ensure_url_separation("clickhttp://example.com"),
+            "click\nhttp://example.com"
+        );
+    }
 
     // --- resolve_mentions tests ---
 

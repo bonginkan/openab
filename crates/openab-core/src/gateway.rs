@@ -80,10 +80,7 @@ struct EventFilterParams<'a> {
 /// Returns `true` if the event should be skipped (filtered out).
 fn should_skip_event(event: &GatewayEvent, filter: &EventFilterParams) -> bool {
     // Bot filter
-    if event.sender.is_bot
-        && !filter.allow_bot_messages
-        && !filter.trusted_bot_ids.contains(&event.sender.id)
-    {
+    if event.sender.is_bot && !filter.allow_bot_messages && !filter.trusted_bot_ids.contains(&event.sender.id) {
         tracing::info!(sender = %event.sender.id, "gateway: bot not in trusted_bot_ids, skipping");
         return true;
     }
@@ -98,8 +95,7 @@ fn should_skip_event(event: &GatewayEvent, filter: &EventFilterParams) -> bool {
         return true;
     }
     // @mention gating: in groups, only respond if bot is mentioned
-    let is_group =
-        event.channel.channel_type == "group" || event.channel.channel_type == "supergroup";
+    let is_group = event.channel.channel_type == "group" || event.channel.channel_type == "supergroup";
     let in_thread = event.channel.thread_id.is_some();
     if is_group && !in_thread {
         if let Some(bot_name) = filter.bot_username {
@@ -237,6 +233,7 @@ pub struct GatewayAdapter {
     platform_name: &'static str,
     streaming: bool,
     streaming_placeholder: bool,
+    telegram_rich_messages: bool,
 }
 
 impl GatewayAdapter {
@@ -246,6 +243,7 @@ impl GatewayAdapter {
         platform_name: &'static str,
         streaming: bool,
         streaming_placeholder: bool,
+        telegram_rich_messages: bool,
     ) -> Self {
         Self {
             ws_tx,
@@ -253,6 +251,7 @@ impl GatewayAdapter {
             platform_name,
             streaming,
             streaming_placeholder,
+            telegram_rich_messages,
         }
     }
 
@@ -299,21 +298,14 @@ impl GatewayAdapter {
             return Err(e.into());
         }
         let msg_id = if let (Some(rx), Some(ref id)) = (pending_rx, &req_id) {
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(GATEWAY_REPLY_TIMEOUT_SECS),
-                rx,
-            )
-            .await
-            {
+            match tokio::time::timeout(std::time::Duration::from_secs(GATEWAY_REPLY_TIMEOUT_SECS), rx).await {
                 Ok(Ok(resp)) if resp.success => resp.message_id.unwrap_or_else(|| "gw_sent".into()),
                 Ok(Ok(resp)) => {
                     // Gateway explicitly reported failure (success=false). Surface
                     // as Err so dispatch sets ❌ instead of 🆗 over an incomplete
                     // delivery. Examples: Feishu edit cap reached after append-new
                     // fallback also failed; chunked send delivered N/M chunks.
-                    let err_msg = resp
-                        .error
-                        .clone()
+                    let err_msg = resp.error.clone()
                         .unwrap_or_else(|| "gateway reported failure".to_string());
                     tracing::warn!(request_id = %id, error = %err_msg, "gateway replied with failure");
                     return Err(anyhow::anyhow!("gateway reported failure: {err_msg}"));
@@ -520,8 +512,7 @@ impl ChatAdapter for GatewayAdapter {
         content: &str,
         reply_to_message_id: &str,
     ) -> Result<MessageRef> {
-        self.send_gateway_reply(channel, content, Some(reply_to_message_id))
-            .await
+        self.send_gateway_reply(channel, content, Some(reply_to_message_id)).await
     }
 
     async fn create_thread(
@@ -672,14 +663,10 @@ impl ChatAdapter for GatewayAdapter {
             match tokio::time::timeout(
                 std::time::Duration::from_millis(EDIT_RESPONSE_TIMEOUT_MS),
                 rx,
-            )
-            .await
-            {
+            ).await {
                 Ok(Ok(resp)) if resp.success => Ok(()),
                 Ok(Ok(resp)) => {
-                    let err_msg = resp
-                        .error
-                        .clone()
+                    let err_msg = resp.error.clone()
                         .unwrap_or_else(|| "gateway reported edit failure".to_string());
                     tracing::warn!(request_id = %id, error = %err_msg, "edit_message gateway replied failure");
                     Err(anyhow::anyhow!("edit failure: {err_msg}"))
@@ -746,24 +733,32 @@ impl ChatAdapter for GatewayAdapter {
     fn show_streaming_placeholder(&self) -> bool {
         self.streaming_placeholder
     }
+
+    fn renders_native_tables(&self, _platform: &str) -> bool {
+        // Telegram renders markdown tables natively via Rich Messages;
+        // skip the table→code-block pre-pass for that platform only when
+        // Rich Messages is confirmed enabled.
+        self.platform_name == "telegram" && self.telegram_rich_messages
+    }
 }
 
 // --- Run the gateway adapter (connects to gateway WS, routes events to AdapterRouter) ---
 
 /// Resolved gateway configuration passed to the adapter at startup.
+/// Channel/user allowlists are NOT carried here anymore: L2/L3 enforcement for
+/// the WebSocket path moved to the shared per-platform trust registry
+/// (`AdapterRouter::gate_incoming`), seeded in main.rs with precedence
+/// `GATEWAY_*` env < `[gateway]` section < `[<platform>]` section (#1356).
 pub struct GatewayParams {
     pub url: String,
     pub platform: String,
     pub token: Option<String>,
     pub bot_username: Option<String>,
-    pub allow_all_channels: bool,
-    pub allowed_channels: Vec<String>,
-    pub allow_all_users: bool,
-    pub allowed_users: Vec<String>,
     pub allow_bot_messages: bool,
     pub trusted_bot_ids: Vec<String>,
     pub streaming: bool,
     pub streaming_placeholder: bool,
+    pub telegram_rich_messages: bool,
     pub stt: crate::config::SttConfig,
     pub inbound_attachment_content_blocks: bool,
 }
@@ -773,16 +768,13 @@ pub async fn run_gateway_adapter(
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     dispatcher: Arc<crate::dispatch::Dispatcher>,
     router: Arc<crate::adapter::AdapterRouter>,
+    #[cfg(feature = "filestore")] filestore: Option<Arc<crate::filestore::Filestore>>,
 ) -> Result<()> {
     let platform: &'static str = Box::leak(params.platform.into_boxed_str());
 
     // Append auth token as query param if configured
     let gateway_url = params.url;
     let bot_username = params.bot_username;
-    let allow_all_channels = params.allow_all_channels;
-    let allowed_channels: HashSet<String> = params.allowed_channels.into_iter().collect();
-    let allow_all_users = params.allow_all_users;
-    let allowed_users: HashSet<String> = params.allowed_users.into_iter().collect();
     let allow_bot_messages = params.allow_bot_messages;
     let trusted_bot_ids: HashSet<String> = params.trusted_bot_ids.into_iter().collect();
     // Cosmetic streaming edits a placeholder in place. On platforms without an
@@ -799,6 +791,7 @@ pub async fn run_gateway_adapter(
         params.streaming
     };
     let streaming_placeholder = params.streaming_placeholder;
+    let telegram_rich_messages = params.telegram_rich_messages;
     let stt_config = params.stt;
     let inbound_attachment_content_blocks = params.inbound_attachment_content_blocks;
 
@@ -850,16 +843,22 @@ pub async fn run_gateway_adapter(
             platform,
             streaming,
             streaming_placeholder,
+            telegram_rich_messages,
         ));
         let slash_ws_tx = ws_tx.clone(); // for fire-and-forget slash command responses
         let mut tasks: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
 
-        // Hoist filter params outside loop — all fields are loop-invariant
+        // Hoist filter params outside loop — all fields are loop-invariant.
+        // Structural gating (bot filter + @mention) stays in should_skip_event.
+        // L2 (channel) + L3 (identity) are enforced by the shared ingress gate
+        // (`gate_gateway_event`) below — same registry as the unified path —
+        // so channel/user checks are neutered here by passing allow-all.
+        let no_ids: HashSet<String> = HashSet::new();
         let filter = EventFilterParams {
-            allow_all_channels,
-            allowed_channels: &allowed_channels,
-            allow_all_users,
-            allowed_users: &allowed_users,
+            allow_all_channels: true,
+            allowed_channels: &no_ids,
+            allow_all_users: true,
+            allowed_users: &no_ids,
             allow_bot_messages,
             trusted_bot_ids: &trusted_bot_ids,
             bot_username: bot_username.as_deref(),
@@ -886,6 +885,31 @@ pub async fn run_gateway_adapter(
                                 Ok(event) => {
                                     if should_skip_event(&event, &filter) {
                                         continue;
+                                    }
+
+                                    // Shared ingress trust gate (L2 scope + L3
+                                    // identity) — same per-platform registry as
+                                    // the unified path. Placed before slash
+                                    // handling so untrusted senders cannot
+                                    // execute /reset|/cancel|/config. The echo
+                                    // is SPAWNED, never awaited here: streaming
+                                    // send_message waits for a GatewayResponse
+                                    // that only this loop can dispatch, so an
+                                    // inline await would stall all event
+                                    // processing for the reply timeout.
+                                    match gate_gateway_event(&router, &event) {
+                                        GateOutcome::Allow => {}
+                                        GateOutcome::Deny { echo } => {
+                                            if let Some((echo_channel, msg)) = echo {
+                                                let echo_adapter = adapter.clone();
+                                                tasks.spawn(async move {
+                                                    let _ = echo_adapter
+                                                        .send_message(&echo_channel, &msg)
+                                                        .await;
+                                                });
+                                            }
+                                            continue;
+                                        }
                                     }
 
                                     info!(
@@ -948,124 +972,170 @@ pub async fn run_gateway_adapter(
 
                                     // Convert gateway attachments to ContentBlocks when enabled.
                                     let mut extra_blocks = Vec::new();
-                                    if inbound_attachment_content_blocks {
-                                        for att in &event.content.attachments {
-                                                // Rejected/truncated attachment: surface reason to the agent and skip.
-                                                if let Some(ref reason) = att.status {
-                                                    tracing::info!(
-                                                        filename = %att.filename,
-                                                        mime_type = %att.mime_type,
-                                                        size = att.size,
-                                                        reason = %reason,
-                                                        "gateway attachment rejected, forwarding reason to agent"
-                                                    );
-                                                    let size_str = {
-                                                        let n = att.size;
-                                                        if n >= 1024 * 1024 {
-                                                            format!("{:.1} MB", n as f64 / (1024.0 * 1024.0))
-                                                        } else if n >= 1024 {
-                                                            format!("{:.1} KB", n as f64 / 1024.0)
-                                                        } else {
-                                                            format!("{} B", n)
-                                                        }
-                                                    };
-                                                    extra_blocks.push(ContentBlock::Text {
-                                                        text: format!(
-                                                            "[System: attachment \"{}\" ({}, {}) was not delivered — {}]",
-                                                            att.filename, att.mime_type, size_str, reason
-                                                        ),
-                                                    });
-                                                    continue;
-                                                }
-
-                                            // Read bytes: prefer file path (colocate), fallback to base64
-                                            let bytes_result = if let Some(ref path) = att.path {
-                                                tokio::fs::read(path)
-                                                    .await
-                                                    .map_err(|e| e.to_string())
-                                            } else if !att.data.is_empty() {
-                                                use base64::Engine;
-                                                base64::engine::general_purpose::STANDARD
-                                                    .decode(&att.data)
-                                                    .map_err(|e| e.to_string())
-                                            } else {
-                                                Err("no path or data".into())
-                                            };
-
-                                            match att.attachment_type.as_str() {
-                                                "image" => {
-                                                    match bytes_result {
-                                                        Ok(bytes) => {
-                                                            use base64::Engine;
-                                                            let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-                                                            extra_blocks.push(ContentBlock::Image {
-                                                                media_type: att.mime_type.clone(),
-                                                                data: b64,
-                                                            });
-                                                        }
-                                                        Err(e) => {
-                                                            tracing::warn!(filename = %att.filename, error = %e, "gateway image read failed");
-                                                        }
-                                                    }
-                                                }
-                                                "text_file" => {
-                                                    if let Ok(bytes) = bytes_result {
-                                                        let text = String::from_utf8_lossy(&bytes);
-                                                        extra_blocks.push(ContentBlock::Text {
-                                                            text: format!("```{}\n{}\n```", att.filename, text),
-                                                        });
-                                                    }
-                                                }
-                                                "audio" if stt_config.enabled => {
-                                                    match bytes_result {
-                                                        Ok(bytes) => {
-                                                            match crate::stt::transcribe(
-                                                                &crate::media::HTTP_CLIENT,
-                                                                &stt_config,
-                                                                bytes,
-                                                                att.filename.clone(),
-                                                                &att.mime_type,
-                                                            )
-                                                            .await
-                                                            {
-                                                                Some(transcript) => {
-                                                                    extra_blocks.push(ContentBlock::Text {
-                                                                        text: format!("[Voice message transcript]: {transcript}"),
-                                                                    });
-                                                                }
-                                                                None => {
-                                                                    tracing::warn!(filename = %att.filename, "gateway audio STT failed");
-                                                                    extra_blocks.push(ContentBlock::Text {
-                                                                        text: format!(
-                                                                            "[Voice message — transcription failed for {}]",
-                                                                            att.filename
-                                                                        ),
-                                                                    });
-                                                                }
-                                                            }
-                                                        }
-                                                        Err(e) => {
-                                                            tracing::warn!(filename = %att.filename, error = %e, "gateway audio read failed");
-                                                            extra_blocks.push(ContentBlock::Text {
-                                                                text: format!(
-                                                                    "[Voice message — read failed for {}]",
-                                                                    att.filename
-                                                                ),
-                                                            });
-                                                        }
-                                                    }
-                                                }
-                                                "audio" => {
-                                                    tracing::debug!(filename = %att.filename, "audio attachment skipped — STT not enabled");
-                                                }
-                                                _ => {}
-                                            }
-                                        }
-                                    } else if !event.content.attachments.is_empty() {
+                                    if !inbound_attachment_content_blocks
+                                        && !event.content.attachments.is_empty()
+                                    {
                                         tracing::debug!(
                                             attachments = event.content.attachments.len(),
                                             "inbound attachment ContentBlocks disabled; not forwarding gateway attachments to ACP"
                                         );
+                                    }
+                                    let enabled_attachments: &[_] = if inbound_attachment_content_blocks {
+                                        &event.content.attachments
+                                    } else {
+                                        &[]
+                                    };
+                                    for att in enabled_attachments {
+                                        // Rejected/truncated attachment: surface reason to the agent and skip.
+                                        if let Some(ref reason) = att.status {
+                                            tracing::info!(
+                                                filename = %att.filename,
+                                                mime_type = %att.mime_type,
+                                                size = att.size,
+                                                reason = %reason,
+                                                "gateway attachment rejected, forwarding reason to agent"
+                                            );
+                                            let size_str = {
+                                                let n = att.size;
+                                                if n >= 1024 * 1024 {
+                                                    format!("{:.1} MB", n as f64 / (1024.0 * 1024.0))
+                                                } else if n >= 1024 {
+                                                    format!("{:.1} KB", n as f64 / 1024.0)
+                                                } else {
+                                                    format!("{} B", n)
+                                                }
+                                            };
+                                            extra_blocks.push(ContentBlock::Text {
+                                                text: format!(
+                                                    "[System: attachment \"{}\" ({}, {}) was not delivered — {}]",
+                                                    att.filename, att.mime_type, size_str, reason
+                                                ),
+                                            });
+                                            continue;
+                                        }
+
+                                        // Read bytes: prefer file path (colocate), fallback to base64
+                                        let bytes_result = if let Some(ref path) = att.path {
+                                            tokio::fs::read(path).await.map_err(|e| e.to_string())
+                                        } else if !att.data.is_empty() {
+                                            use base64::Engine;
+                                            base64::engine::general_purpose::STANDARD
+                                                .decode(&att.data)
+                                                .map_err(|e| e.to_string())
+                                        } else {
+                                            tracing::warn!(
+                                                filename = %att.filename,
+                                                mime = %att.mime_type,
+                                                "gateway: attachment has no path or data, skipping"
+                                            );
+                                            Err("no path or data".into())
+                                        };
+
+                                        match att.attachment_type.as_str() {
+                                            "image" => {
+                                                match bytes_result {
+                                                    Ok(bytes) => {
+                                                        use base64::Engine;
+                                                        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                                                        extra_blocks.push(ContentBlock::Image {
+                                                            media_type: att.mime_type.clone(),
+                                                            data: b64,
+                                                        });
+                                                    }
+                                                    Err(e) => {
+                                                        tracing::warn!(filename = %att.filename, error = %e, "gateway image read failed");
+                                                    }
+                                                }
+                                            }
+                                            "text_file" => {
+                                                if let Ok(bytes) = bytes_result {
+                                                    let safe_filename: String = att.filename
+                                                        .chars()
+                                                        .filter(|c| !c.is_control())
+                                                        .take(200)
+                                                        .collect();
+                                                    let size = bytes.len() as u64;
+                                                    if size <= crate::media::TEXT_INLINE_LIMIT {
+                                                        let text = String::from_utf8_lossy(&bytes);
+                                                        extra_blocks.push(ContentBlock::Text {
+                                                            text: format!("[File: {safe_filename}]\n```\n{text}\n```"),
+                                                        });
+                                                    } else {
+                                                        // Large file — upload to filestore if available
+                                                        #[cfg(feature = "filestore")]
+                                                        if let Some(ref fs) = filestore {
+                                                            if let Some((block, _)) = crate::media::upload_bytes_to_filestore_public(&att.filename, &bytes, fs).await {
+                                                                extra_blocks.push(block);
+                                                            } else {
+                                                                // Upload refused (size cap) — emit degraded hint, don't inline oversized body
+                                                                let size_kb = bytes.len() / 1024;
+                                                                tracing::warn!(filename = %att.filename, size = bytes.len(), "filestore upload refused; emitting degraded hint");
+                                                                extra_blocks.push(ContentBlock::Text {
+                                                                    text: format!(
+                                                                        "[File: {safe_filename}]\nThis file ({size_kb} KB) exceeds the configured upload limit and could not be stored."
+                                                                    ),
+                                                                });
+                                                            }
+                                                        } else {
+                                                            // No filestore configured — fall back to inline (original behavior)
+                                                            let text = String::from_utf8_lossy(&bytes);
+                                                            extra_blocks.push(ContentBlock::Text {
+                                                                text: format!("[File: {safe_filename}]\n```\n{text}\n```"),
+                                                            });
+                                                        }
+                                                        #[cfg(not(feature = "filestore"))]
+                                                        {
+                                                            // Feature not compiled — inline as before
+                                                            let text = String::from_utf8_lossy(&bytes);
+                                                            extra_blocks.push(ContentBlock::Text {
+                                                                text: format!("[File: {safe_filename}]\n```\n{text}\n```"),
+                                                            });
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            "audio" if stt_config.enabled => {
+                                                match bytes_result {
+                                                    Ok(bytes) => {
+                                                        match crate::stt::transcribe(
+                                                            &crate::media::HTTP_CLIENT,
+                                                            &stt_config,
+                                                            bytes,
+                                                            att.filename.clone(),
+                                                            &att.mime_type,
+                                                        ).await {
+                                                            Some(transcript) => {
+                                                                extra_blocks.push(ContentBlock::Text {
+                                                                    text: format!("[Voice message transcript]: {transcript}"),
+                                                                });
+                                                            }
+                                                            None => {
+                                                                tracing::warn!(filename = %att.filename, "gateway audio STT failed");
+                                                                extra_blocks.push(ContentBlock::Text {
+                                                                    text: format!(
+                                                                        "[Voice message — transcription failed for {}]",
+                                                                        att.filename
+                                                                    ),
+                                                                });
+                                                            }
+                                                        }
+                                                    }
+                                                    Err(e) => {
+                                                        tracing::warn!(filename = %att.filename, error = %e, "gateway audio read failed");
+                                                        extra_blocks.push(ContentBlock::Text {
+                                                            text: format!(
+                                                                "[Voice message — read failed for {}]",
+                                                                att.filename
+                                                            ),
+                                                        });
+                                                    }
+                                                }
+                                            }
+                                            "audio" => {
+                                                tracing::debug!(filename = %att.filename, "audio attachment skipped — STT not enabled");
+                                            }
+                                            _ => {}
+                                        }
                                     }
 
                                     // Slash command interception for gateway platforms
@@ -1195,14 +1265,12 @@ pub struct GatewayEventContext {
     pub adapter: Arc<dyn ChatAdapter>,
     pub dispatcher: Arc<crate::dispatch::Dispatcher>,
     pub router: Arc<crate::adapter::AdapterRouter>,
-    pub allow_all_channels: bool,
-    pub allowed_channels: HashSet<String>,
-    pub allow_all_users: bool,
-    pub allowed_users: HashSet<String>,
     pub allow_bot_messages: bool,
     pub trusted_bot_ids: HashSet<String>,
     pub bot_username: Option<String>,
     pub stt_config: crate::config::SttConfig,
+    #[cfg(feature = "filestore")]
+    pub filestore: Option<Arc<crate::filestore::Filestore>>,
 }
 
 /// Process a single gateway event JSON string and submit to the dispatcher.
@@ -1233,6 +1301,83 @@ fn echo_allowed(key: &str) -> bool {
     }
 }
 
+/// Outcome of the shared ingress trust gate. `Deny { echo }` carries the
+/// throttled request-access echo payload (channel + message) when the deny is
+/// an identity deny and the per-sender throttle admits it; the CALLER decides
+/// how to deliver it. Delivery must NOT be awaited inline inside the WS event
+/// loop: `GatewayAdapter::send_message` (streaming mode) waits for a
+/// `GatewayResponse` that is dispatched by that same loop — awaiting there
+/// would stall all event processing for the reply timeout. The WS path spawns
+/// the echo; the unified path (axum/bridge task) awaits it directly.
+enum GateOutcome {
+    Allow,
+    Deny { echo: Option<(ChannelRef, String)> },
+}
+
+/// Shared ingress trust gate for gateway events — used by BOTH the standalone
+/// WebSocket path (`run_gateway_adapter`) and the unified path
+/// (`process_gateway_event`), so L2 (channel scope) and L3 (identity) are
+/// enforced by the same per-platform registry regardless of deployment mode
+/// (#1356 Phase 1c prerequisite).
+///
+/// On `DenyIdentity`, returns the throttled request-access echo payload; on
+/// `DenyScope` (and any future variant), denies silently — scope is not a
+/// security boundary, so no echo.
+///
+/// Phase 1: `is_dm = false` preserves today's behavior where gateway DMs are
+/// evaluated against the channel allowlist like any other channel (the
+/// `allow_dm` surface semantics arrive with the per-platform trust flip).
+/// TODO(phase-2): derive is_dm from the event/ChannelRef carrier so the
+/// `allow_dm` L2 surface can be enforced and tested for gateway platforms.
+fn gate_gateway_event(router: &crate::adapter::AdapterRouter, event: &GatewayEvent) -> GateOutcome {
+    let decision =
+        router.gate_incoming(&event.platform, &event.channel.id, false, &event.sender.id);
+    match decision {
+        crate::trust::Decision::Allow => GateOutcome::Allow,
+        crate::trust::Decision::DenyIdentity => {
+            // L3 identity deny → echo the sender their ID so they can request
+            // access (throttled to avoid amplification). Bots never reach here
+            // (should_skip_event handles bot admission; L3 is human-only).
+            tracing::info!(
+                platform = %event.platform,
+                sender = %event.sender.id,
+                channel = %event.channel.id,
+                "gateway event denied (identity); echoing request-access"
+            );
+            let throttle_key = format!("{}:{}", event.platform, event.sender.id);
+            let echo = if echo_allowed(&throttle_key) {
+                let echo_channel = ChannelRef {
+                    platform: event.platform.clone(),
+                    channel_id: event.channel.id.clone(),
+                    thread_id: event.channel.thread_id.clone(),
+                    parent_id: None,
+                    origin_event_id: Some(event.event_id.clone()),
+                };
+                let msg = format!(
+                    "⚠️ You are not on this bot's trusted list.\nYour ID: {}\nAsk the admin to add it to allowed_users.",
+                    event.sender.id
+                );
+                Some((echo_channel, msg))
+            } else {
+                None
+            };
+            GateOutcome::Deny { echo }
+        }
+        // DenyScope (and any future variant) → silent drop (scope is not a
+        // security boundary; no request-access echo).
+        _ => {
+            tracing::info!(
+                platform = %event.platform,
+                sender = %event.sender.id,
+                channel = %event.channel.id,
+                ?decision,
+                "gateway event denied (scope); silent"
+            );
+            GateOutcome::Deny { echo: None }
+        }
+    }
+}
+
 pub async fn process_gateway_event(
     event_json: &str,
     ctx: &GatewayEventContext,
@@ -1259,53 +1404,14 @@ pub async fn process_gateway_event(
     }
 
     // Shared ingress trust gate (L2 scope + L3 identity), keyed by platform.
-    // Phase 1: `is_dm = false` preserves today's behavior where gateway DMs are
-    // evaluated against the channel allowlist like any other channel (the
-    // `allow_dm` surface semantics arrive with the per-platform trust flip).
-    // TODO(phase-2): derive is_dm from the event/ChannelRef carrier so the
-    // `allow_dm` L2 surface can be enforced and tested for gateway platforms.
-    let decision =
-        ctx.router
-            .gate_incoming(&event.platform, &event.channel.id, false, &event.sender.id);
-    match decision {
-        crate::trust::Decision::Allow => {}
-        crate::trust::Decision::DenyIdentity => {
-            // L3 identity deny → echo the sender their ID so they can request
-            // access (throttled to avoid amplification). Bots never reach here
-            // (should_skip_event handles bot admission; L3 is human-only).
-            tracing::info!(
-                platform = %event.platform,
-                sender = %event.sender.id,
-                channel = %event.channel.id,
-                "gateway event denied (identity); echoing request-access"
-            );
-            let throttle_key = format!("{}:{}", event.platform, event.sender.id);
-            if echo_allowed(&throttle_key) {
-                let echo_channel = ChannelRef {
-                    platform: event.platform.clone(),
-                    channel_id: event.channel.id.clone(),
-                    thread_id: event.channel.thread_id.clone(),
-                    parent_id: None,
-                    origin_event_id: Some(event.event_id.clone()),
-                };
-                let echo = format!(
-                    "⚠️ You are not on this bot's trusted list.\nYour ID: {}\nAsk the admin to add it to allowed_users.",
-                    event.sender.id
-                );
-                let _ = ctx.adapter.send_message(&echo_channel, &echo).await;
+    // Awaiting echo delivery here is safe: this runs on the axum/bridge task,
+    // not inside the WS event loop.
+    match gate_gateway_event(&ctx.router, &event) {
+        GateOutcome::Allow => {}
+        GateOutcome::Deny { echo } => {
+            if let Some((echo_channel, msg)) = echo {
+                let _ = ctx.adapter.send_message(&echo_channel, &msg).await;
             }
-            return Ok(false);
-        }
-        // DenyScope (and any future variant) → silent drop (scope is not a
-        // security boundary; no request-access echo).
-        _ => {
-            tracing::info!(
-                platform = %event.platform,
-                sender = %event.sender.id,
-                channel = %event.channel.id,
-                ?decision,
-                "gateway event denied (scope); silent"
-            );
             return Ok(false);
         }
     }
@@ -1339,11 +1445,7 @@ pub async fn process_gateway_event(
         } else {
             event.timestamp.clone()
         }),
-        message_id: if event.message_id.is_empty() {
-            None
-        } else {
-            Some(event.message_id.clone())
-        },
+        message_id: if event.message_id.is_empty() { None } else { Some(event.message_id.clone()) },
         receiver_id: None,
     };
     let sender_json = serde_json::to_string(&sender_ctx).unwrap_or_default();
@@ -1384,62 +1486,102 @@ pub async fn process_gateway_event(
         };
 
         match att.attachment_type.as_str() {
-            "image" => match bytes_result {
-                Ok(bytes) => {
-                    use base64::Engine;
-                    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-                    extra_blocks.push(ContentBlock::Image {
-                        media_type: att.mime_type.clone(),
-                        data: b64,
-                    });
-                }
-                Err(e) => {
-                    tracing::warn!(filename = %att.filename, error = %e, "gateway image read failed");
-                }
-            },
-            "text_file" => match bytes_result {
-                Ok(bytes) => {
-                    let text = String::from_utf8_lossy(&bytes);
-                    extra_blocks.push(ContentBlock::Text {
-                        text: format!("```{}\n{}\n```", att.filename, text),
-                    });
-                }
-                Err(e) => {
-                    tracing::warn!(filename = %att.filename, error = %e, "gateway text_file read failed");
-                }
-            },
-            "audio" if ctx.stt_config.enabled => match bytes_result {
-                Ok(bytes) => {
-                    match crate::stt::transcribe(
-                        &crate::media::HTTP_CLIENT,
-                        &ctx.stt_config,
-                        bytes,
-                        att.filename.clone(),
-                        &att.mime_type,
-                    )
-                    .await
-                    {
-                        Some(transcript) => {
-                            extra_blocks.push(ContentBlock::Text {
-                                text: format!("[Voice message transcript]: {transcript}"),
-                            });
-                        }
-                        None => {
-                            extra_blocks.push(ContentBlock::Text {
-                                text: format!(
-                                    "[Voice message — transcription failed for {}]",
-                                    att.filename
-                                ),
-                            });
-                        }
+            "image" => {
+                match bytes_result {
+                    Ok(bytes) => {
+                        use base64::Engine;
+                        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                        extra_blocks.push(ContentBlock::Image {
+                            media_type: att.mime_type.clone(),
+                            data: b64,
+                        });
+                    }
+                    Err(e) => {
+                        tracing::warn!(filename = %att.filename, error = %e, "gateway image read failed");
                     }
                 }
-                Err(_) => {
-                    extra_blocks.push(ContentBlock::Text {
-                        text: format!("[Voice message — read failed for {}]", att.filename),
-                    });
+            }
+            "text_file" => {
+                match bytes_result {
+                    Ok(bytes) => {
+                        let safe_filename: String = att.filename
+                            .chars()
+                            .filter(|c| !c.is_control())
+                            .take(200)
+                            .collect();
+                        let size = bytes.len() as u64;
+                        if size <= crate::media::TEXT_INLINE_LIMIT {
+                            let text = String::from_utf8_lossy(&bytes);
+                            extra_blocks.push(ContentBlock::Text {
+                                text: format!("[File: {safe_filename}]\n```\n{text}\n```"),
+                            });
+                        } else {
+                            // Large file — upload to filestore if available
+                            #[cfg(feature = "filestore")]
+                            if let Some(ref fs) = ctx.filestore {
+                                if let Some((block, _)) = crate::media::upload_bytes_to_filestore_public(&att.filename, &bytes, fs).await {
+                                    extra_blocks.push(block);
+                                } else {
+                                    // Upload refused (size cap) — emit degraded hint, don't inline oversized body
+                                    let size_kb = bytes.len() / 1024;
+                                    tracing::warn!(filename = %att.filename, size = bytes.len(), "filestore upload refused; emitting degraded hint");
+                                    extra_blocks.push(ContentBlock::Text {
+                                        text: format!(
+                                            "[File: {safe_filename}]\nThis file ({size_kb} KB) exceeds the configured upload limit and could not be stored."
+                                        ),
+                                    });
+                                }
+                            } else {
+                                // No filestore configured — fall back to inline (original behavior)
+                                let text = String::from_utf8_lossy(&bytes);
+                                extra_blocks.push(ContentBlock::Text {
+                                    text: format!("[File: {safe_filename}]\n```\n{text}\n```"),
+                                });
+                            }
+                            #[cfg(not(feature = "filestore"))]
+                            {
+                                // Feature not compiled — inline as before
+                                let text = String::from_utf8_lossy(&bytes);
+                                extra_blocks.push(ContentBlock::Text {
+                                    text: format!("[File: {safe_filename}]\n```\n{text}\n```"),
+                                });
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(filename = %att.filename, error = %e, "gateway text_file read failed");
+                    }
                 }
-            },
+            }
+            "audio" if ctx.stt_config.enabled => {
+                match bytes_result {
+                    Ok(bytes) => {
+                        match crate::stt::transcribe(
+                            &crate::media::HTTP_CLIENT,
+                            &ctx.stt_config,
+                            bytes,
+                            att.filename.clone(),
+                            &att.mime_type,
+                        ).await {
+                            Some(transcript) => {
+                                extra_blocks.push(ContentBlock::Text {
+                                    text: format!("[Voice message transcript]: {transcript}"),
+                                });
+                            }
+                            None => {
+                                extra_blocks.push(ContentBlock::Text {
+                                    text: format!("[Voice message — transcription failed for {}]", att.filename),
+                                });
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        extra_blocks.push(ContentBlock::Text {
+                            text: format!("[Voice message — read failed for {}]", att.filename),
+                        });
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -1448,38 +1590,20 @@ pub async fn process_gateway_event(
     let prompt = event.content.text.clone();
     let trimmed = prompt.trim();
     if trimmed == "/reset" {
-        let thread_id_str = event
-            .channel
-            .thread_id
-            .as_deref()
-            .unwrap_or(&event.channel.id);
+        let thread_id_str = event.channel.thread_id.as_deref().unwrap_or(&event.channel.id);
         let thread_key = format!("{}:{}", event.platform, thread_id_str);
-        let dropped = ctx
-            .dispatcher
-            .cancel_buffered_thread(event.platform.as_str(), thread_id_str);
+        let dropped = ctx.dispatcher.cancel_buffered_thread(event.platform.as_str(), thread_id_str);
         let msg = match (ctx.router.pool().reset_session(&thread_key).await, dropped) {
             (Ok(()), 0) => "🔄 Session reset. Start a new conversation!".to_string(),
-            (Ok(()), n) => format!(
-                "🔄 Session reset. Dropped {n} buffered message(s). Start a new conversation!"
-            ),
+            (Ok(()), n) => format!("🔄 Session reset. Dropped {n} buffered message(s). Start a new conversation!"),
             (Err(_), 0) => "⚠️ No active session to reset.".to_string(),
-            (Err(_), n) => {
-                format!("🔄 Dropped {n} buffered message(s). No active session to reset.")
-            }
+            (Err(_), n) => format!("🔄 Dropped {n} buffered message(s). No active session to reset."),
         };
         let _ = ctx.adapter.send_message(&channel, &msg).await;
         return Ok(false);
     }
     if trimmed == "/cancel" {
-        let thread_key = format!(
-            "{}:{}",
-            event.platform,
-            event
-                .channel
-                .thread_id
-                .as_deref()
-                .unwrap_or(&event.channel.id)
-        );
+        let thread_key = format!("{}:{}", event.platform, event.channel.thread_id.as_deref().unwrap_or(&event.channel.id));
         let msg = match ctx.router.pool().cancel_session(&thread_key).await {
             Ok(()) => "🛑 Cancel signal sent.".to_string(),
             Err(e) => format!("⚠️ {e}"),
@@ -1488,15 +1612,7 @@ pub async fn process_gateway_event(
         return Ok(false);
     }
     {
-        let thread_key = format!(
-            "{}:{}",
-            event.platform,
-            event
-                .channel
-                .thread_id
-                .as_deref()
-                .unwrap_or(&event.channel.id)
-        );
+        let thread_key = format!("{}:{}", event.platform, event.channel.thread_id.as_deref().unwrap_or(&event.channel.id));
         if let Some(msg) = handle_config_command(trimmed, &ctx.router, &thread_key).await {
             let _ = ctx.adapter.send_message(&channel, &msg).await;
             return Ok(false);
@@ -1510,26 +1626,32 @@ pub async fn process_gateway_event(
     let sender_id = event.sender.id.clone();
 
     tokio::spawn(async move {
-        let thread_channel =
-            if event.channel.channel_type == "supergroup" && channel.thread_id.is_none() {
-                let title = crate::format::shorten_thread_name(&prompt);
-                match adapter.create_thread(&channel, &trigger_msg, &title).await {
-                    Ok(tc) => tc,
-                    Err(e) => {
-                        tracing::warn!("create_thread failed, replying in channel: {e}");
-                        channel.clone()
-                    }
+        let thread_channel = if event.channel.channel_type == "supergroup"
+            && channel.thread_id.is_none()
+        {
+            let title = crate::format::shorten_thread_name(&prompt);
+            match adapter.create_thread(&channel, &trigger_msg, &title).await {
+                Ok(tc) => tc,
+                Err(e) => {
+                    tracing::warn!("create_thread failed, replying in channel: {e}");
+                    channel.clone()
                 }
-            } else {
-                channel.clone()
-            };
+            }
+        } else {
+            channel.clone()
+        };
 
         let thread_id = thread_channel
             .thread_id
             .as_deref()
             .unwrap_or(&thread_channel.channel_id);
-        let thread_key = dispatcher.key(&thread_channel.platform, thread_id, &sender_id);
-        let estimated_tokens = crate::dispatch::estimate_tokens(&prompt, &extra_blocks);
+        let thread_key = dispatcher.key(
+            &thread_channel.platform,
+            thread_id,
+            &sender_id,
+        );
+        let estimated_tokens =
+            crate::dispatch::estimate_tokens(&prompt, &extra_blocks);
         let buf_msg = crate::dispatch::BufferedMessage {
             sender_json,
             sender_name,
@@ -1592,6 +1714,63 @@ mod tests {
     }
 
     #[test]
+    fn ws_path_filter_is_structural_only() {
+        // The WS path's hoisted filter neuters channel/user checks (allow-all)
+        // because L2/L3 moved to the shared trust registry (#1356 Phase 1c
+        // prerequisite). This pins the two properties that combination relies
+        // on: unknown channels/users PASS the structural filter (the gate
+        // decides), while bot admission and @mention gating still apply.
+        let no_ids: HashSet<String> = HashSet::new();
+        let trusted: HashSet<String> = ["good-bot".to_string()].into_iter().collect();
+        let filter = EventFilterParams {
+            allow_all_channels: true,
+            allowed_channels: &no_ids,
+            allow_all_users: true,
+            allowed_users: &no_ids,
+            allow_bot_messages: false,
+            trusted_bot_ids: &trusted,
+            bot_username: Some("mybot"),
+        };
+
+        // Unknown human in unknown channel: structural filter passes it through.
+        let ev = make_event(
+            false,
+            "stranger",
+            "unlisted-channel",
+            "private",
+            None,
+            vec!["mybot"],
+        );
+        assert!(!should_skip_event(&ev, &filter));
+
+        // Untrusted bot still skipped (structural, stays on this path).
+        let ev = make_event(
+            true,
+            "evil-bot",
+            "unlisted-channel",
+            "private",
+            None,
+            vec![],
+        );
+        assert!(should_skip_event(&ev, &filter));
+
+        // Trusted bot admitted.
+        let ev = make_event(
+            true,
+            "good-bot",
+            "unlisted-channel",
+            "private",
+            None,
+            vec![],
+        );
+        assert!(!should_skip_event(&ev, &filter));
+
+        // Group without @mention still skipped (structural, stays on this path).
+        let ev = make_event(false, "stranger", "group-1", "group", None, vec![]);
+        assert!(should_skip_event(&ev, &filter));
+    }
+
+    #[test]
     fn echo_allowed_throttles_repeat_within_window() {
         // Unique key so we don't collide with other tests touching the global map.
         let key = "test-platform:test-sender-echo-throttle";
@@ -1600,14 +1779,7 @@ mod tests {
         assert!(!echo_allowed(key), "still throttled within the window");
     }
 
-    fn make_event(
-        is_bot: bool,
-        sender_id: &str,
-        channel_id: &str,
-        channel_type: &str,
-        thread_id: Option<&str>,
-        mentions: Vec<&str>,
-    ) -> GatewayEvent {
+    fn make_event(is_bot: bool, sender_id: &str, channel_id: &str, channel_type: &str, thread_id: Option<&str>, mentions: Vec<&str>) -> GatewayEvent {
         serde_json::from_value(serde_json::json!({
             "schema": "openab.gateway.event.v1",
             "event_id": "evt1",
@@ -1618,15 +1790,10 @@ mod tests {
             "content": { "type": "text", "text": "hello" },
             "mentions": mentions,
             "message_id": "msg1"
-        }))
-        .unwrap()
+        })).unwrap()
     }
 
-    fn default_filter<'a>(
-        allowed_channels: &'a HashSet<String>,
-        allowed_users: &'a HashSet<String>,
-        trusted_bot_ids: &'a HashSet<String>,
-    ) -> EventFilterParams<'a> {
+    fn default_filter<'a>(allowed_channels: &'a HashSet<String>, allowed_users: &'a HashSet<String>, trusted_bot_ids: &'a HashSet<String>) -> EventFilterParams<'a> {
         EventFilterParams {
             allow_all_channels: true,
             allowed_channels,

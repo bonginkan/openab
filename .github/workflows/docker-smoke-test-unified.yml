@@ -84,3 +84,41 @@ jobs:
 
       - name: Verify agent CLI exists
         run: docker run --rm --entrypoint which openab-unified-${{ matrix.target.name }}:test ${{ matrix.target.agent }}
+
+      - name: Verify Codex runtime versions
+        if: matrix.target.name == 'codex'
+        run: |
+          # Expected versions come from the Dockerfile ARG defaults (single
+          # source of truth) so a version bump only touches the Dockerfiles.
+          CODEX_ACP_VERSION=$(awk -F= '$1 == "ARG CODEX_ACP_VERSION" {print $2; exit}' Dockerfile.unified)
+          CODEX_VERSION=$(awk -F= '$1 == "ARG CODEX_VERSION" {print $2; exit}' Dockerfile.unified)
+          test -n "$CODEX_ACP_VERSION" && test -n "$CODEX_VERSION"
+          docker run --rm --entrypoint codex-acp openab-unified-codex:test --version \
+            | grep -F "@agentclientprotocol/codex-acp ${CODEX_ACP_VERSION}"
+          docker run --rm --entrypoint codex openab-unified-codex:test --version \
+            | grep -F "codex-cli ${CODEX_VERSION}"
+
+      - name: Verify Codex agent command is a single token
+        if: matrix.target.name == 'codex'
+        run: |
+          # Regression guard: OPENAB_AGENT_COMMAND must stay a plain binary.
+          # Packing env-var prefixes (e.g. "/usr/bin/env K=V codex-acp") breaks
+          # configs that override [agent].args only — OAB keeps token 1 as the
+          # command and replaces the rest, yielding "/usr/bin/env <user args>".
+          docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' openab-unified-codex:test \
+            | grep -Fx 'OPENAB_AGENT_COMMAND=codex-acp'
+
+      - name: Verify Codex ACP handshake
+        if: matrix.target.name == 'codex'
+        run: |
+          INIT='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{},"clientInfo":{"name":"ci-test","version":"0.0.1"}}}'
+          CID=$(docker run -d -i --entrypoint codex-acp openab-unified-codex:test)
+          echo "$INIT" | docker attach --no-stdin=false "$CID" &
+          sleep 5
+          RESPONSE=$(docker logs "$CID" 2>/dev/null | grep -m1 '^{' || true)
+          docker rm -f "$CID" >/dev/null 2>&1
+
+          echo "Response: $RESPONSE"
+          echo "$RESPONSE" | jq -e \
+            '.result.agentInfo.name == "@agentclientprotocol/codex-acp"' \
+            >/dev/null

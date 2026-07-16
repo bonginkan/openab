@@ -102,6 +102,30 @@ platform = "line"
 
 > **Tip:** To find a LINE user ID, check the gateway logs — the sender ID is logged for each incoming message. By default all users and channels are allowed. Setting `allowed_users` or `allowed_channels` automatically restricts access to only those listed.
 
+### User Trust (`[line]` section)
+
+> **Trust resolution:** the `[line]` section's trust settings apply in **both** deployment modes. Broker-side enforcement goes through the shared per-platform trust registry with precedence `GATEWAY_*` env < `[gateway]` section < `[line]` section — in the standalone-gateway mode, the broker's WebSocket path consults the same registry, so a `[line]` section overrides `[gateway].allow_all_users` / `allowed_users` for this platform.
+
+Identity trust defaults to **deny-all** (identity-trust-none ADR): unknown senders are rejected until explicitly admitted. Configure trust with a first-class `[line]` section:
+
+```toml
+[line]
+allowed_users = ["U1234567890abcdef0123456789abcdef"]  # LINE user IDs (U…, 33 chars)
+# allow_all_users = true   # explicit opt-in only — any user can drive the agent
+```
+
+Each field falls back to its `LINE_*` env var when unset. Since #1376 the section also carries the channel credentials (`channel_secret`, `channel_access_token`) and `webhook_path` — config-first, env as fallback:
+
+```toml
+[line]
+channel_secret       = "${LINE_CHANNEL_SECRET}"
+channel_access_token = "${LINE_CHANNEL_ACCESS_TOKEN}"
+```
+
+This replaces the uniform `GATEWAY_ALLOW_ALL_USERS` / `GATEWAY_ALLOWED_USERS` env vars for LINE:
+
+> ⚠️ **Deprecated:** driving LINE trust through `GATEWAY_ALLOW_ALL_USERS` / `GATEWAY_ALLOWED_USERS` still works but logs a startup warning; it will become a startup error in a later phase. Migrate to `[line]` (or `LINE_*` env vars).
+
 ## 6. Add the Bot as Friend
 
 In the LINE Developers Console → **Messaging API** tab → scan the QR code with your LINE app, or search for the bot by its LINE ID.
@@ -138,8 +162,11 @@ In the LINE Developers Console → **Messaging API** tab → scan the QR code wi
 
 | Variable | Required | Description |
 |---|---|---|
-| `LINE_CHANNEL_SECRET` | Yes | Channel secret for webhook signature validation |
-| `LINE_CHANNEL_ACCESS_TOKEN` | Yes | Channel access token for Reply/Push Message API and LINE-hosted image/audio downloads |
+| `LINE_CHANNEL_SECRET` | Yes* | Channel secret for webhook signature validation. *Fallback for `[line].channel_secret` — config wins |
+| `LINE_CHANNEL_ACCESS_TOKEN` | Yes* | Channel access token for Reply/Push Message API and LINE-hosted image/audio downloads. *Fallback for `[line].channel_access_token` — config wins |
+| `LINE_WEBHOOK_PATH` | No | Webhook mount path. Fallback for `[line].webhook_path` (default `/webhook/line`) |
+| `LINE_ALLOW_ALL_USERS` | No | `true` = any user may interact. Fallback for `[line].allow_all_users`; default deny-all |
+| `LINE_ALLOWED_USERS` | No | Comma-separated LINE user IDs. Fallback for `[line].allowed_users` |
 
 ## Troubleshooting
 

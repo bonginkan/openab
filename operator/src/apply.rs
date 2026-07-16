@@ -13,7 +13,7 @@ use std::path::Path;
 /// task uses ECS-injected secrets (or pulls from a private registry) — ECS
 /// rejects the request with "you must also specify a value for
 /// 'executionRoleArn'" otherwise.
-async fn load_bootstrap_state(config: &aws_config::SdkConfig) -> Option<BootstrapState> {
+pub(crate) async fn load_bootstrap_state(config: &aws_config::SdkConfig) -> Option<BootstrapState> {
     let bucket = if let Some(b) = crate::config::OabConfig::load().ok().and_then(|c| c.bucket()) {
         b
     } else {
@@ -182,6 +182,14 @@ async fn apply_ecs(
         };
     let generation = current_gen + 1;
 
+    // Resolve cluster from config (same source as `get` and `delete` commands).
+    // ~/.oabctl/config.toml defaults.cluster; falls back to "oab".
+    // Propagate config load errors (same behavior as get/delete) — silently
+    // defaulting to "oab" on a malformed config could target the wrong cluster.
+    let oab_cfg = crate::config::OabConfig::load()
+        .context("failed to load ~/.oabctl/config.toml (run `oabctl bootstrap` first)")?;
+    let cluster = &oab_cfg.defaults.cluster;
+
     // Look up the ECS service's current registry ARN(s) up front so both the
     // ingress-removal teardown below and the update/create logic further down
     // can use the *exact* registry rather than falling back to a name-only
@@ -189,7 +197,7 @@ async fn apply_ecs(
     // an account and reuse the same namespace/name).
     let describe_resp = ecs
         .describe_services()
-        .cluster("oab")
+        .cluster(cluster.as_str())
         .services(&service_name)
         .send()
         .await;
@@ -268,11 +276,8 @@ async fn apply_ecs(
         secrets.push(Secret::builder().name(name).value_from(value_from).build().unwrap());
     }
 
-    // 4. Register task definition. Resolve bootstrap state once up front — it
-    // supplies both the CloudWatch log group (for logConfiguration below) and
-    // the execution role ARN (further down), neither of which the manifest
-    // can or should specify directly (bootstrap owns these, not the manifest —
-    // see operator/README.md's "Resources Created" section).
+    // Load bootstrap state — supplies CloudWatch log group, execution role
+    // ARN, task role ARN, and region fallback.
     let bootstrap_state = load_bootstrap_state(config).await;
 
     // Resolve effective region: prefer SDK config, fall back to bootstrap
@@ -354,7 +359,17 @@ async fn apply_ecs(
     // IMDS, which doesn't exist on Fargate, and fails with a generic
     // "dispatch failure". This was previously never set at all.
     let execution_role_arn = bootstrap_state.as_ref().map(|s| s.resources.execution_role_arn.clone());
-    let task_role_arn = bootstrap_state.as_ref().map(|s| s.resources.task_role_arn.clone());
+    // Manifest task_role_arn takes precedence over bootstrap shared role.
+    // Filter empty strings so a blank value falls through to bootstrap.
+    let task_role_arn = resolve_task_role_arn(
+        &ecs_rt.task_role_arn,
+        bootstrap_state.as_ref().map(|s| s.resources.task_role_arn.as_str()),
+    );
+    match (&task_role_arn, ecs_rt.task_role_arn.as_deref().filter(|s| !s.is_empty())) {
+        (Some(arn), Some(_)) => eprintln!("  ℹ taskRoleArn: {arn} (from manifest)"),
+        (Some(arn), None) => eprintln!("  ℹ taskRoleArn: {arn} (from bootstrap)"),
+        (None, _) => eprintln!("  ⚠ no taskRoleArn resolved — task will have no IAM role"),
+    }
 
     let mut register_req = ecs
         .register_task_definition()
@@ -465,9 +480,10 @@ async fn apply_ecs(
 
         let mut update_req = ecs
             .update_service()
-            .cluster("oab")
+            .cluster(cluster.as_str())
             .service(&service_name)
             .task_definition(&task_def_arn)
+            .enable_execute_command(true)
             .network_configuration(network_config);
 
         if let Some(cm) = &cloud_map {
@@ -518,10 +534,11 @@ async fn apply_ecs(
 
         let mut create_req = ecs
             .create_service()
-            .cluster("oab")
+            .cluster(cluster.as_str())
             .service_name(&service_name)
             .task_definition(&task_def_arn)
             .desired_count(1)
+            .enable_execute_command(true)
             .capacity_provider_strategy(cap_strategy)
             .network_configuration(network_config);
 
@@ -543,14 +560,15 @@ async fn apply_ecs(
         // Match on the typed error code (InvalidParameterException) rather than
         // raw message text to be resilient to SDK/API wording changes.
         use aws_sdk_ecs::error::ProvideErrorMetadata;
-        let mut last_err = None;
-        for attempt in 0..12 {
+        const DRAIN_RETRY_ATTEMPTS: u32 = 12;
+        const DRAIN_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+        for attempt in 0..DRAIN_RETRY_ATTEMPTS {
             match create_req.clone().send().await {
                 Ok(_) => {
                     if attempt > 0 {
                         eprintln!(" ok");
                     }
-                    last_err = None;
                     break;
                 }
                 Err(e) => {
@@ -559,28 +577,27 @@ async fn apply_ecs(
                             .unwrap_or_default()
                             .to_lowercase()
                             .contains("draining");
-                    if is_draining {
+                    let is_last = attempt == DRAIN_RETRY_ATTEMPTS - 1;
+                    if is_draining && !is_last {
                         if attempt == 0 {
                             eprint!("  ⏳ Service still draining, retrying...");
                         } else {
                             eprint!(".");
                         }
-                        last_err = Some(e);
-                        if attempt < 11 {
-                            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                        }
+                        tokio::time::sleep(DRAIN_RETRY_INTERVAL).await;
                     } else {
                         if attempt > 0 {
                             eprintln!(" failed");
                         }
-                        return Err(e).context("failed to create ECS service");
+                        let ctx = if is_last && is_draining {
+                            "failed to create ECS service after retries (service still draining)"
+                        } else {
+                            "failed to create ECS service"
+                        };
+                        return Err(e).context(ctx);
                     }
                 }
             }
-        }
-        if let Some(e) = last_err {
-            eprintln!(" timed out");
-            return Err(anyhow::anyhow!(e)).context("failed to create ECS service after retries");
         }
         println!(
             "  ✓ {} created ({}, {}cpu/{}mem{})",
@@ -632,7 +649,7 @@ async fn apply_ecs(
 
     if wait {
         eprintln!("  ⏳ Waiting for {} to stabilize...", m.metadata.name);
-        wait_for_stable(ecs, "oab", &service_name).await?;
+        wait_for_stable(ecs, cluster, &service_name).await?;
         eprintln!("  ✓ {} is stable", m.metadata.name);
     }
 
@@ -707,4 +724,86 @@ async fn wait_for_stable(ecs: &aws_sdk_ecs::Client, cluster: &str, service: &str
         }
     }
     anyhow::bail!("timed out waiting for service to stabilize (5 min)")
+}
+
+/// Resolve the effective task role ARN.
+///
+/// Resolution order:
+/// 1. Manifest `taskRoleArn` (if present and non-empty) → use it
+/// 2. Bootstrap shared task role → fallback
+/// 3. Neither → `None`
+fn resolve_task_role_arn(
+    manifest_role: &Option<String>,
+    bootstrap_role: Option<&str>,
+) -> Option<String> {
+    manifest_role
+        .clone()
+        .filter(|s| !s.is_empty())
+        .or_else(|| bootstrap_role.map(|s| s.to_owned()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn task_role_manifest_wins_over_bootstrap() {
+        let manifest = Some("arn:aws:iam::111:role/manifest-role".to_string());
+        let bootstrap = Some("arn:aws:iam::111:role/bootstrap-role");
+        let result = resolve_task_role_arn(&manifest, bootstrap);
+        assert_eq!(
+            result.as_deref(),
+            Some("arn:aws:iam::111:role/manifest-role")
+        );
+    }
+
+    #[test]
+    fn task_role_falls_back_to_bootstrap() {
+        let manifest: Option<String> = None;
+        let bootstrap = Some("arn:aws:iam::111:role/bootstrap-role");
+        let result = resolve_task_role_arn(&manifest, bootstrap);
+        assert_eq!(
+            result.as_deref(),
+            Some("arn:aws:iam::111:role/bootstrap-role")
+        );
+    }
+
+    #[test]
+    fn task_role_manifest_only_no_bootstrap() {
+        let manifest = Some("arn:aws:iam::111:role/manifest-role".to_string());
+        let bootstrap: Option<&str> = None;
+        let result = resolve_task_role_arn(&manifest, bootstrap);
+        assert_eq!(
+            result.as_deref(),
+            Some("arn:aws:iam::111:role/manifest-role")
+        );
+    }
+
+    #[test]
+    fn task_role_none_when_both_absent() {
+        let manifest: Option<String> = None;
+        let bootstrap: Option<&str> = None;
+        let result = resolve_task_role_arn(&manifest, bootstrap);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn task_role_empty_string_falls_through_to_bootstrap() {
+        let manifest = Some("".to_string());
+        let bootstrap = Some("arn:aws:iam::111:role/bootstrap-role");
+        let result = resolve_task_role_arn(&manifest, bootstrap);
+        assert_eq!(
+            result.as_deref(),
+            Some("arn:aws:iam::111:role/bootstrap-role"),
+            "empty string in manifest should not override bootstrap"
+        );
+    }
+
+    #[test]
+    fn task_role_empty_string_no_bootstrap_returns_none() {
+        let manifest = Some("".to_string());
+        let bootstrap: Option<&str> = None;
+        let result = resolve_task_role_arn(&manifest, bootstrap);
+        assert_eq!(result, None);
+    }
 }
