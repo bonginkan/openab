@@ -39,7 +39,6 @@ max_files = 10
 [pool]
 max_sessions = 10
 session_ttl_hours = 24
-prompt_hard_timeout_secs = 0
 liveness_check_secs = 30
 
 [markdown]

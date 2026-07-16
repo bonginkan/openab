@@ -484,18 +484,9 @@ pub struct PoolConfig {
     pub max_sessions: usize,
     #[serde(default = "default_ttl_hours")]
     pub session_ttl_hours: u64,
-    /// Optional hard ceiling for a single prompt (#732). Set to 0 to disable.
-    /// Once exceeded, the broker abandons the in-flight request, sends
-    /// `session/cancel` to the agent, and clears the pending entry so late
-    /// responses cannot leak into the next prompt's subscriber.
-    ///
-    /// Precision: checked every `liveness_check_secs`, so actual cutoff is
-    /// ±`liveness_check_secs` from this value.
-    #[serde(default = "default_prompt_hard_timeout_secs")]
-    pub prompt_hard_timeout_secs: u64,
     /// Polling cadence (seconds) for the recv-loop liveness check (#732).
-    /// Lower = faster reaction to a dead agent / hard ceiling at the cost of
-    /// more wakeups while the agent is streaming normally.
+    /// Lower = faster reaction to a dead agent at the cost of more wakeups
+    /// while the agent is streaming normally.
     #[serde(default = "default_liveness_check_secs")]
     pub liveness_check_secs: u64,
 }
@@ -635,9 +626,6 @@ fn default_max_sessions() -> usize {
 fn default_ttl_hours() -> u64 {
     4
 }
-pub(crate) fn default_prompt_hard_timeout_secs() -> u64 {
-    0
-}
 pub(crate) fn default_liveness_check_secs() -> u64 {
     30
 }
@@ -688,7 +676,6 @@ impl Default for PoolConfig {
         Self {
             max_sessions: default_max_sessions(),
             session_ttl_hours: default_ttl_hours(),
-            prompt_hard_timeout_secs: default_prompt_hard_timeout_secs(),
             liveness_check_secs: default_liveness_check_secs(),
         }
     }
@@ -868,7 +855,6 @@ command = "echo"
         ));
         assert_eq!(cfg.agent.command, "echo");
         assert_eq!(cfg.pool.max_sessions, 10);
-        assert_eq!(cfg.pool.prompt_hard_timeout_secs, 0);
         assert!(cfg.reactions.enabled);
         assert!(!cfg.attachments.enabled);
         assert_eq!(cfg.attachments.max_bytes, 10 * 1024 * 1024);
@@ -914,22 +900,6 @@ command = "echo"
             discord.allow_all_guilds,
             &discord.allowed_guilds
         ));
-    }
-
-    #[test]
-    fn parse_pool_prompt_hard_timeout_zero() {
-        let toml = r#"
-[discord]
-bot_token = "test-token"
-
-[agent]
-command = "echo"
-
-[pool]
-prompt_hard_timeout_secs = 0
-"#;
-        let cfg = parse_config(toml, "test").unwrap();
-        assert_eq!(cfg.pool.prompt_hard_timeout_secs, 0);
     }
 
     #[test]
