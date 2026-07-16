@@ -583,8 +583,6 @@ pub async fn run_slack_adapter(
                                                 let allowed_channels = allowed_channels.clone();
                                                 let allowed_users = allowed_users.clone();
                                                 let stt_config = stt_config.clone();
-                                                let inbound_attachment_content_blocks =
-                                                    inbound_attachment_content_blocks;
                                                 let dispatcher = dispatcher.clone();
                                                 tokio::spawn(async move {
                                                     handle_message(
@@ -815,8 +813,6 @@ pub async fn run_slack_adapter(
                                                 let allowed_channels = allowed_channels.clone();
                                                 let allowed_users = allowed_users.clone();
                                                 let stt_config = stt_config.clone();
-                                                let inbound_attachment_content_blocks =
-                                                    inbound_attachment_content_blocks;
                                                 let dispatcher = dispatcher.clone();
                                                 tokio::spawn(async move {
                                                     handle_message(
