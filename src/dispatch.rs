@@ -1274,7 +1274,6 @@ mod tests {
             pool,
             crate::config::ReactionsConfig::default(),
             crate::markdown::TableMode::Off,
-            crate::config::default_prompt_hard_timeout_secs(),
             crate::config::default_liveness_check_secs(),
             crate::config::AttachmentsConfig::default(),
             "/tmp".into(),

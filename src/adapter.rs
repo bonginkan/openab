@@ -5,7 +5,6 @@ use std::collections::HashMap;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::sync::Mutex;
 use tracing::{error, warn};
 
@@ -899,7 +898,6 @@ pub struct AdapterRouter {
     pool: Arc<SessionPool>,
     reactions_config: ReactionsConfig,
     table_mode: TableMode,
-    prompt_hard_timeout: Option<Duration>,
     /// Polling cadence for the recv-loop liveness check (#732).
     liveness_check_interval: std::time::Duration,
     /// Session keys with an accepted mid-turn steer awaiting its first post-steer
@@ -908,10 +906,6 @@ pub struct AdapterRouter {
     /// (below the user's steer message) headed by the steer content.
     pending_steer_separators: Arc<Mutex<HashMap<String, String>>>,
     outbound_attachments: OutboundAttachments,
-}
-
-fn prompt_hard_timeout_from_secs(secs: u64) -> Option<Duration> {
-    (secs > 0).then(|| Duration::from_secs(secs))
 }
 
 struct StreamingPostInner {
@@ -1031,26 +1025,14 @@ impl AdapterRouter {
         pool: Arc<SessionPool>,
         reactions_config: ReactionsConfig,
         table_mode: TableMode,
-        prompt_hard_timeout_secs: u64,
         liveness_check_secs: u64,
         attachments_config: AttachmentsConfig,
         agent_working_dir: String,
     ) -> Self {
-        let prompt_hard_timeout = prompt_hard_timeout_from_secs(prompt_hard_timeout_secs);
-        if prompt_hard_timeout.is_some() && liveness_check_secs >= prompt_hard_timeout_secs {
-            warn!(
-                liveness_check_secs,
-                prompt_hard_timeout_secs,
-                "pool.liveness_check_secs >= pool.prompt_hard_timeout_secs; \
-                 the hard ceiling will only fire after the next liveness tick \
-                 and may be effectively bypassed. Lower liveness_check_secs."
-            );
-        }
         Self {
             pool,
             reactions_config,
             table_mode,
-            prompt_hard_timeout,
             liveness_check_interval: std::time::Duration::from_secs(liveness_check_secs),
             pending_steer_separators: Arc::new(Mutex::new(HashMap::new())),
             outbound_attachments: OutboundAttachments::new(attachments_config, agent_working_dir),
@@ -1256,7 +1238,6 @@ impl AdapterRouter {
         }
         let table_mode = self.table_mode;
         let tool_display = self.reactions_config.tool_display;
-        let prompt_hard_timeout = self.prompt_hard_timeout;
         let liveness_check_interval = self.liveness_check_interval;
         let pending_steer_separators = self.pending_steer_separators.clone();
         let thread_key_for_separator = thread_key.to_string();
@@ -1337,16 +1318,6 @@ impl AdapterRouter {
                                     response_error = Some("Agent process died".into());
                                     conn.abandon_request(request_id).await;
                                     break;
-                                }
-                                if let Some(prompt_hard_timeout) = prompt_hard_timeout {
-                                    if prompt_start.elapsed() > prompt_hard_timeout {
-                                        response_error = Some(format!(
-                                            "Agent exceeded hard timeout ({}s)",
-                                            prompt_hard_timeout.as_secs(),
-                                        ));
-                                        conn.abandon_request(request_id).await;
-                                        break;
-                                    }
                                 }
                                 continue;
                             }
@@ -2165,15 +2136,6 @@ mod tests {
         let adapter = TestAdapter;
         // Verify the method is callable and returns the declared value
         assert!(!adapter.use_streaming(false));
-    }
-
-    #[test]
-    fn prompt_hard_timeout_zero_is_disabled() {
-        assert_eq!(prompt_hard_timeout_from_secs(0), None);
-        assert_eq!(
-            prompt_hard_timeout_from_secs(1),
-            Some(std::time::Duration::from_secs(1))
-        );
     }
 
     #[test]
