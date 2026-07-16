@@ -736,6 +736,7 @@ pub async fn run_slack_adapter(
     allow_user_messages: AllowUsers,
     max_bot_turns: u32,
     stt_config: SttConfig,
+    inbound_attachment_content_blocks: bool,
     mut shutdown_rx: watch::Receiver<bool>,
     dispatcher: Arc<crate::dispatch::Dispatcher>,
 ) -> Result<()> {
@@ -846,6 +847,8 @@ pub async fn run_slack_adapter(
                                                 let allowed_channels = allowed_channels.clone();
                                                 let allowed_users = allowed_users.clone();
                                                 let stt_config = stt_config.clone();
+                                                let inbound_attachment_content_blocks =
+                                                    inbound_attachment_content_blocks;
                                                 let dispatcher = dispatcher.clone();
                                                 let team_id = envelope["payload"]["team_id"]
                                                     .as_str()
@@ -862,6 +865,7 @@ pub async fn run_slack_adapter(
                                                         &allowed_channels,
                                                         &allowed_users,
                                                         &stt_config,
+                                                        inbound_attachment_content_blocks,
                                                         &dispatcher,
                                                     )
                                                     .await;
@@ -1097,6 +1101,8 @@ pub async fn run_slack_adapter(
                                                 let allowed_channels = allowed_channels.clone();
                                                 let allowed_users = allowed_users.clone();
                                                 let stt_config = stt_config.clone();
+                                                let inbound_attachment_content_blocks =
+                                                    inbound_attachment_content_blocks;
                                                 let dispatcher = dispatcher.clone();
                                                 tokio::spawn(async move {
                                                     handle_message(
@@ -1109,6 +1115,7 @@ pub async fn run_slack_adapter(
                                                         &allowed_channels,
                                                         &allowed_users,
                                                         &stt_config,
+                                                        inbound_attachment_content_blocks,
                                                         &dispatcher,
                                                     )
                                                     .await;
@@ -1201,6 +1208,7 @@ async fn handle_message(
     allowed_channels: &HashSet<String>,
     allowed_users: &HashSet<String>,
     stt_config: &SttConfig,
+    inbound_attachment_content_blocks: bool,
     dispatcher: &Arc<crate::dispatch::Dispatcher>,
 ) {
     let channel_id = match event["channel"].as_str() {
@@ -1270,7 +1278,7 @@ async fn handle_message(
     let files = event["files"].as_array();
     let has_files = files.is_some_and(|f| !f.is_empty());
 
-    if prompt.is_empty() && !has_files {
+    if prompt.is_empty() && (!has_files || !inbound_attachment_content_blocks) {
         return;
     }
 
@@ -1285,147 +1293,154 @@ async fn handle_message(
     let mut text_file_count: u32 = 0;
     let mut failed_image_files: Vec<String> = Vec::new();
 
-    if let Some(files) = files {
-        for file in files {
-            let mimetype_raw = file["mimetype"].as_str().unwrap_or("");
-            let mimetype = strip_mime_params(mimetype_raw);
-            let filename = file["name"].as_str().unwrap_or("file");
-            let size = file["size"].as_u64().unwrap_or(0);
-            // Slack private files require Bearer token to download
-            let url = slack_file_download_url(file);
+    if inbound_attachment_content_blocks {
+        if let Some(files) = files {
+            for file in files {
+                let mimetype_raw = file["mimetype"].as_str().unwrap_or("");
+                let mimetype = strip_mime_params(mimetype_raw);
+                let filename = file["name"].as_str().unwrap_or("file");
+                let size = file["size"].as_u64().unwrap_or(0);
+                // Slack private files require Bearer token to download
+                let url = slack_file_download_url(file);
 
-            if url.is_empty() {
-                continue;
-            }
+                if url.is_empty() {
+                    continue;
+                }
 
-            if media::is_audio_mime(mimetype) {
-                if stt_config.enabled {
-                    match media::download_and_transcribe(
-                        url,
-                        filename,
-                        mimetype,
-                        size,
-                        stt_config,
-                        Some(bot_token),
-                    )
-                    .await
-                    {
-                        Some(transcript) => {
-                            debug!(
-                                filename,
-                                chars = transcript.len(),
-                                "voice transcript injected"
-                            );
-                            extra_blocks.insert(
-                                0,
-                                ContentBlock::Text {
-                                    text: format!("[Voice message transcript]: {transcript}"),
-                                },
-                            );
-                            echo_entries.push(crate::stt::EchoEntry::Success(transcript));
+                if media::is_audio_mime(mimetype) {
+                    if stt_config.enabled {
+                        match media::download_and_transcribe(
+                            url,
+                            filename,
+                            mimetype,
+                            size,
+                            stt_config,
+                            Some(bot_token),
+                        )
+                        .await
+                        {
+                            Some(transcript) => {
+                                debug!(
+                                    filename,
+                                    chars = transcript.len(),
+                                    "voice transcript injected"
+                                );
+                                extra_blocks.insert(
+                                    0,
+                                    ContentBlock::Text {
+                                        text: format!("[Voice message transcript]: {transcript}"),
+                                    },
+                                );
+                                echo_entries.push(crate::stt::EchoEntry::Success(transcript));
+                            }
+                            None => {
+                                warn!(filename, "STT failed for voice attachment");
+                                echo_entries.push(crate::stt::EchoEntry::Failed);
+                            }
                         }
-                        None => {
-                            warn!(filename, "STT failed for voice attachment");
-                            echo_entries.push(crate::stt::EchoEntry::Failed);
-                        }
+                    } else {
+                        debug!(filename, "skipping audio attachment (STT disabled)");
+                        let msg_ref = MessageRef {
+                            channel: ChannelRef {
+                                platform: "slack".into(),
+                                channel_id: channel_id.clone(),
+                                thread_id: thread_ts.clone(),
+                                parent_id: None,
+                                origin_event_id: None,
+                            },
+                            message_id: ts.clone(),
+                        };
+                        let _ = adapter.add_reaction(&msg_ref, "🎤").await;
                     }
-                } else {
-                    debug!(filename, "skipping audio attachment (STT disabled)");
-                    let msg_ref = MessageRef {
-                        channel: ChannelRef {
-                            platform: "slack".into(),
-                            channel_id: channel_id.clone(),
-                            thread_id: thread_ts.clone(),
-                            parent_id: None,
-                            origin_event_id: None,
-                        },
-                        message_id: ts.clone(),
-                    };
-                    let _ = adapter.add_reaction(&msg_ref, "🎤").await;
-                }
-            } else if media::is_text_file(filename, Some(mimetype)) {
-                if text_file_count >= TEXT_FILE_COUNT_CAP {
-                    debug!(
-                        filename,
-                        count = text_file_count,
-                        "text file count cap reached, skipping"
-                    );
-                    continue;
-                }
-                // Pre-check with Slack-reported size as a fast path when the
-                // field is populated. Slack can report `size == 0` for
-                // externally-backed files, so this is advisory only — the
-                // authoritative cap check happens after download using
-                // `actual_bytes`.
-                if size > 0 && text_file_bytes + size > TEXT_TOTAL_CAP {
-                    debug!(
-                        filename,
-                        total = text_file_bytes,
-                        "text attachments total exceeds 1MB cap, skipping remaining"
-                    );
-                    continue;
-                }
-                if let Some((block, actual_bytes)) =
-                    media::download_and_read_text_file(url, filename, size, Some(bot_token)).await
-                {
-                    if text_file_bytes + actual_bytes > TEXT_TOTAL_CAP {
+                } else if media::is_text_file(filename, Some(mimetype)) {
+                    if text_file_count >= TEXT_FILE_COUNT_CAP {
                         debug!(
+                            filename,
+                            count = text_file_count,
+                            "text file count cap reached, skipping"
+                        );
+                        continue;
+                    }
+                    // Pre-check with Slack-reported size as a fast path when the
+                    // field is populated. Slack can report `size == 0` for
+                    // externally-backed files, so this is advisory only — the
+                    // authoritative cap check happens after download using
+                    // `actual_bytes`.
+                    if size > 0 && text_file_bytes + size > TEXT_TOTAL_CAP {
+                        debug!(
+                            filename,
+                            total = text_file_bytes,
+                            "text attachments total exceeds 1MB cap, skipping remaining"
+                        );
+                        continue;
+                    }
+                    if let Some((block, actual_bytes)) =
+                        media::download_and_read_text_file(url, filename, size, Some(bot_token))
+                            .await
+                    {
+                        if text_file_bytes + actual_bytes > TEXT_TOTAL_CAP {
+                            debug!(
                             filename,
                             running = text_file_bytes,
                             actual = actual_bytes,
                             "text attachments total exceeds 1MB cap after download, dropping file",
                         );
-                        continue;
-                    }
-                    text_file_bytes += actual_bytes;
-                    text_file_count += 1;
-                    debug!(filename, "adding text file attachment");
-                    extra_blocks.push(block);
-                }
-            } else {
-                match media::download_and_encode_image(
-                    url,
-                    Some(mimetype),
-                    filename,
-                    size,
-                    Some(bot_token),
-                )
-                .await
-                {
-                    Ok(block) => {
-                        debug!(filename, "adding image attachment");
+                            continue;
+                        }
+                        text_file_bytes += actual_bytes;
+                        text_file_count += 1;
+                        debug!(filename, "adding text file attachment");
                         extra_blocks.push(block);
                     }
-                    Err(media::MediaFetchError::NotAnImage) => {}
-                    Err(media::MediaFetchError::SizeExceeded { actual, limit }) => {
-                        warn!(filename, actual, limit, "image exceeds size limit");
-                        failed_image_files.push(filename.to_string());
-                    }
-                    Err(
-                        media::MediaFetchError::UnsupportedResponseType { .. }
-                        | media::MediaFetchError::InvalidImageBody { .. },
-                    ) => {
-                        warn!(
+                } else {
+                    match media::download_and_encode_image(
+                        url,
+                        Some(mimetype),
+                        filename,
+                        size,
+                        Some(bot_token),
+                    )
+                    .await
+                    {
+                        Ok(block) => {
+                            debug!(filename, "adding image attachment");
+                            extra_blocks.push(block);
+                        }
+                        Err(media::MediaFetchError::NotAnImage) => {}
+                        Err(media::MediaFetchError::SizeExceeded { actual, limit }) => {
+                            warn!(filename, actual, limit, "image exceeds size limit");
+                            failed_image_files.push(filename.to_string());
+                        }
+                        Err(
+                            media::MediaFetchError::UnsupportedResponseType { .. }
+                            | media::MediaFetchError::InvalidImageBody { .. },
+                        ) => {
+                            warn!(
                             filename,
                             "image validation failed; server may have returned non-image content"
                         );
-                        failed_image_files.push(filename.to_string());
-                    }
-                    Err(media::MediaFetchError::ProcessingFailed(ref e)) => {
-                        warn!(filename, error = %e, "image post-processing failed");
-                        failed_image_files.push(filename.to_string());
-                    }
-                    Err(media::MediaFetchError::HttpStatus(status)) if status.is_client_error() => {
-                        warn!(filename, %status, "image download denied");
-                        failed_image_files.push(filename.to_string());
-                    }
-                    Err(e) => {
-                        warn!(filename, error = %e, "image download failed");
-                        failed_image_files.push(filename.to_string());
+                            failed_image_files.push(filename.to_string());
+                        }
+                        Err(media::MediaFetchError::ProcessingFailed(ref e)) => {
+                            warn!(filename, error = %e, "image post-processing failed");
+                            failed_image_files.push(filename.to_string());
+                        }
+                        Err(media::MediaFetchError::HttpStatus(status))
+                            if status.is_client_error() =>
+                        {
+                            warn!(filename, %status, "image download denied");
+                            failed_image_files.push(filename.to_string());
+                        }
+                        Err(e) => {
+                            warn!(filename, error = %e, "image download failed");
+                            failed_image_files.push(filename.to_string());
+                        }
                     }
                 }
             }
         }
+    } else if has_files {
+        debug!("inbound attachment ContentBlocks disabled; not forwarding Slack files to ACP");
     }
 
     // Notify user if any images couldn't be processed.

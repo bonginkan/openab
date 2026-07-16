@@ -265,6 +265,7 @@ async fn main() -> anyhow::Result<()> {
     // `cfg` fields are moved into the per-adapter setup below.
     let immediate_steer = cfg.steering.immediate_steer;
     let agent_working_dir = cfg.agent.working_dir.clone();
+    let inbound_attachment_content_blocks = cfg.inbound_attachments.content_blocks;
 
     let pool = Arc::new(acp::SessionPool::new(
         cfg.agent,
@@ -562,6 +563,7 @@ async fn main() -> anyhow::Result<()> {
                 slack_cfg.allow_user_messages,
                 max_bot_turns,
                 stt,
+                inbound_attachment_content_blocks,
                 slack_shutdown_rx,
                 slack_dispatcher,
             )
@@ -616,6 +618,7 @@ async fn main() -> anyhow::Result<()> {
             streaming: gw_cfg.streaming,
             streaming_placeholder: gw_cfg.streaming_placeholder,
             stt: cfg.stt.clone(),
+            inbound_attachment_content_blocks,
         };
         let gw_router = router.clone();
         Some(tokio::spawn(async move {
@@ -1017,6 +1020,7 @@ async fn main() -> anyhow::Result<()> {
             allowed_channels,
             allowed_users,
             stt_config: cfg.stt.clone(),
+            inbound_attachment_content_blocks,
             adapter: std::sync::OnceLock::new(),
             allow_bot_messages: discord_cfg.allow_bot_messages,
             trusted_bot_ids,
