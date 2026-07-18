@@ -33,7 +33,6 @@ allowed_dirs = [
   "/Users/thepioneer/Documents/GitHub",
   "/Users/thepioneer/.codex/generated_images",
 ]
-max_bytes = 10485760
 max_files = 10
 
 [pool]

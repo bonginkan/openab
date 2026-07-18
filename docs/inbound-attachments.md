@@ -8,7 +8,7 @@ How OAB handles images, audio, and files sent by users across all platforms.
 User sends media (photo/voice/file)
   → Platform webhook delivers to Gateway
   → Gateway downloads via platform API (auth stays in Gateway)
-  → Image: resize ≤1200px, JPEG compress (GIF passthrough ≤5MB)
+  → Image: resize ≤1200px, JPEG compress (GIF passthrough)
   → Store to ~/.openab/media/inbound/<uuid>
   → WS event includes file path in attachments[].path
   → Core reads from disk (zero encoding overhead)
@@ -34,7 +34,7 @@ User sends media (photo/voice/file)
 
 1. Gateway downloads from platform API
 2. `resize_and_compress()` — longest side ≤1200px, JPEG quality 75
-3. GIFs ≤5MB passed through unchanged (preserves animation)
+3. GIFs passed through unchanged (preserves animation)
 4. Stored to `~/.openab/media/inbound/<uuid>`
 5. Core reads bytes → `ContentBlock::Image` → sent to LLM
 

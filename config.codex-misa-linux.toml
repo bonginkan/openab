@@ -50,7 +50,6 @@ allowed_dirs = [
 ]
 auto_stage_generated_images = true
 auto_stage_dir = "/home/thep/Documents/GitHub/openab/images"
-max_bytes = 10485760
 max_files = 10
 
 [pool]
