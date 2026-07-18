@@ -10,22 +10,13 @@ pub enum MediaKind {
 
 pub const IMAGE_MAX_DIMENSION_PX: u32 = 1200;
 pub const IMAGE_JPEG_QUALITY: u8 = 75;
-pub const IMAGE_MAX_DOWNLOAD: u64 = 10 * 1024 * 1024; // 10 MB
-pub const FILE_MAX_DOWNLOAD: u64 = 20 * 1024 * 1024; // 20 MB (same as store cap)
-pub const AUDIO_MAX_DOWNLOAD: u64 = 20 * 1024 * 1024; // 20 MB
-pub const GIF_MAX_SIZE: usize = 5 * 1024 * 1024; // 5 MB — prevents base64 bloat exceeding LLM payload limits
 
 /// Resize image so longest side <= 1200px, then encode as JPEG.
-/// GIFs under 5MB are passed through unchanged to preserve animation.
+/// GIFs are passed through unchanged to preserve animation.
 pub fn resize_and_compress(raw: &[u8]) -> Result<(Vec<u8>, String), image::ImageError> {
     let reader = ImageReader::new(Cursor::new(raw)).with_guessed_format()?;
     let format = reader.format();
     if format == Some(image::ImageFormat::Gif) {
-        if raw.len() > GIF_MAX_SIZE {
-            return Err(image::ImageError::Limits(
-                image::error::LimitError::from_kind(image::error::LimitErrorKind::DimensionError),
-            ));
-        }
         return Ok((raw.to_vec(), "image/gif".to_string()));
     }
     let img = reader.decode()?;
@@ -82,11 +73,13 @@ mod tests {
     }
 
     #[test]
-    fn gif_over_limit_returns_error() {
+    fn large_gif_passes_through() {
         let mut data = b"GIF89a\x01\x00\x01\x00\x80\x00\x00\xff\xff\xff\x00\x00\x00".to_vec();
-        data.resize(GIF_MAX_SIZE + 1, 0);
+        data.resize(5 * 1024 * 1024 + 1, 0);
         let result = resize_and_compress(&data);
-        assert!(result.is_err());
+        let (output, mime) = result.expect("large GIF should not be rejected by byte size");
+        assert_eq!(mime, "image/gif");
+        assert_eq!(output, data);
     }
 
     #[test]

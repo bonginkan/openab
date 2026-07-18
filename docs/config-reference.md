@@ -132,7 +132,6 @@ Outbound file/image attachments from the agent back to the user.
 | `allowed_dirs` | string[] | `[]` | Directories OpenAB may read outbound files from. Empty means only `[agent].working_dir`. |
 | `auto_stage_generated_images` | bool | `false` | Move generated images from known Codex/OpenAB staging locations into an allowed directory before upload. Only applies to `attach_image`. |
 | `auto_stage_dir` | string? | unset | Destination directory for auto-staged generated images. Must resolve inside `allowed_dirs`; when unset, the first allowed directory is used. |
-| `max_bytes` | u64 | `10485760` | Maximum bytes per outbound file. Default is 10 MiB. |
 | `max_files` | usize | `10` | Maximum outbound files per ACP response. |
 
 `attach_image` validates PNG, JPEG, GIF, and WebP. `attach_file` accepts other
@@ -148,7 +147,6 @@ enabled = true
 allowed_dirs = ["/home/node", "/home/node/.codex/generated_images"]
 auto_stage_generated_images = true
 auto_stage_dir = "/home/node/out"
-max_bytes = 10485760
 max_files = 10
 ```
 

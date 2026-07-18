@@ -769,9 +769,7 @@ impl EventHandler for Handler {
         let mut extra_blocks = Vec::new();
         let mut echo_entries: Vec<crate::stt::EchoEntry> = Vec::new();
         let mut failed_image_files: Vec<String> = Vec::new();
-        let mut text_file_bytes: u64 = 0;
         let mut text_file_count: u32 = 0;
-        const TEXT_TOTAL_CAP: u64 = 1024 * 1024; // 1 MB total for all text file attachments
         const TEXT_FILE_COUNT_CAP: u32 = 5;
 
         if self.inbound_attachment_content_blocks {
@@ -818,13 +816,7 @@ impl EventHandler for Handler {
                         tracing::warn!(filename = %attachment.filename, count = text_file_count, "text file count cap reached, skipping");
                         continue;
                     }
-                    // Pre-check with Discord-reported size (fast path, avoids unnecessary download).
-                    // Running total uses actual downloaded bytes for accurate accounting.
-                    if text_file_bytes + u64::from(attachment.size) > TEXT_TOTAL_CAP {
-                        tracing::warn!(filename = %attachment.filename, total = text_file_bytes, "text attachments total exceeds 1MB cap, skipping remaining");
-                        continue;
-                    }
-                    if let Some((block, actual_bytes)) = media::download_and_read_text_file(
+                    if let Some((block, _)) = media::download_and_read_text_file(
                         &attachment.url,
                         &attachment.filename,
                         u64::from(attachment.size),
@@ -832,7 +824,6 @@ impl EventHandler for Handler {
                     )
                     .await
                     {
-                        text_file_bytes += actual_bytes;
                         text_file_count += 1;
                         debug!(filename = %attachment.filename, "adding text file attachment");
                         extra_blocks.push(block);

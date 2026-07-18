@@ -163,7 +163,6 @@ data:
     {{- if ($cfg.attachments).autoStageDir }}
     auto_stage_dir = {{ ($cfg.attachments).autoStageDir | quote }}
     {{- end }}
-    max_bytes = {{ ($cfg.attachments).maxBytes | default 10485760 | int }}
     max_files = {{ ($cfg.attachments).maxFiles | default 10 | int }}
     {{- end }}
 

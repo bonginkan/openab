@@ -61,15 +61,11 @@ OpenAB can create the ACP image block, but downstream coding agents and selected
 
 Binary files (zip, pdf, exe, docx), video, and stickers are **silently skipped**. The agent does not receive any notification that a file was sent.
 
-## Size Limits
+## File Sizes
 
-| Type | Max Size | Enforced By |
-|------|----------|-------------|
-| Images | 10 MB | Gateway (pre-download Content-Length + post-download bytes) |
-| Audio | 20 MB | Gateway |
-| Text files | 20 MB | Gateway (same as store cap) |
-| GIF passthrough | 5 MB | `resize_and_compress()` |
-| Store (defense-in-depth) | 20 MB | `store_media()` |
+OpenAB does not reject inbound attachments based on byte size. Source platforms,
+HTTP intermediaries, STT providers, and the selected model may still enforce their
+own request or payload limits.
 
 ## Storage (Colocate Mode)
 
@@ -84,7 +80,7 @@ Media is stored at `~/.openab/media/inbound/<uuid>`:
 
 - **Path traversal**: Impossible — filenames are UUID only, never user-supplied
 - **Token leakage**: Platform auth tokens (Telegram bot token, LINE access token, Feishu tenant token) stay in Gateway, never reach Core or agent
-- **Disk exhaustion**: TTL eviction + size limits prevent unbounded growth
+- **Disk exhaustion**: TTL eviction limits how long downloaded media remains on disk
 - **No executable content**: Files are raw data, never executed
 
 ### Future: HTTP Proxy Mode

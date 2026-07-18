@@ -524,7 +524,6 @@ struct OutboundAttachments {
     auto_stage_generated_images: bool,
     auto_stage_dir: Option<PathBuf>,
     agent_working_dir: PathBuf,
-    max_bytes: u64,
     max_files: usize,
 }
 
@@ -557,7 +556,6 @@ impl OutboundAttachments {
             auto_stage_generated_images: config.auto_stage_generated_images,
             auto_stage_dir: config.auto_stage_dir.map(PathBuf::from),
             agent_working_dir,
-            max_bytes: config.max_bytes,
             max_files: config.max_files,
         }
     }
@@ -635,20 +633,8 @@ impl OutboundAttachments {
 
         let metadata = tokio::fs::metadata(&canonical).await?;
         anyhow::ensure!(metadata.is_file(), "path is not a regular file");
-        anyhow::ensure!(
-            metadata.len() <= self.max_bytes,
-            "file is {} bytes, over the {} byte limit",
-            metadata.len(),
-            self.max_bytes
-        );
 
         let data = tokio::fs::read(&canonical).await?;
-        anyhow::ensure!(
-            data.len() as u64 <= self.max_bytes,
-            "file is {} bytes, over the {} byte limit",
-            data.len(),
-            self.max_bytes
-        );
         if matches!(kind, OutboundAttachmentKind::Image) {
             ensure_supported_image(&data)?;
         }
@@ -688,20 +674,8 @@ impl OutboundAttachments {
 
         let metadata = tokio::fs::metadata(canonical_file).await?;
         anyhow::ensure!(metadata.is_file(), "path is not a regular file");
-        anyhow::ensure!(
-            metadata.len() <= self.max_bytes,
-            "file is {} bytes, over the {} byte limit",
-            metadata.len(),
-            self.max_bytes
-        );
 
         let data = tokio::fs::read(canonical_file).await?;
-        anyhow::ensure!(
-            data.len() as u64 <= self.max_bytes,
-            "file is {} bytes, over the {} byte limit",
-            data.len(),
-            self.max_bytes
-        );
         ensure_supported_image(&data)?;
 
         let stage_dir = self.resolve_auto_stage_dir().await?;
@@ -1923,10 +1897,7 @@ fn is_inside_inline_code_span(text: &str) -> bool {
 }
 
 fn is_sentence_terminal(ch: char) -> bool {
-    matches!(
-        ch,
-        '.' | '!' | '?' | ':' | ';' | '。' | '！' | '？' | '：' | '；'
-    )
+    ch == '。'
 }
 
 fn is_text_start(ch: char) -> bool {
@@ -2293,10 +2264,23 @@ mod tests {
     }
 
     #[test]
-    fn append_text_chunk_separates_after_closed_inline_code() {
+    fn append_text_chunk_does_not_separate_after_ascii_period() {
         let mut text = "Use `foo`.".to_string();
         append_text_chunk(&mut text, "Next step.", false);
-        assert_eq!(text, "Use `foo`.\nNext step.");
+        assert_eq!(text, "Use `foo`.Next step.");
+    }
+
+    #[test]
+    fn append_text_chunk_only_separates_after_japanese_full_stop() {
+        for terminal in ['.', '!', '?', ':', ';', '！', '？', '：', '；'] {
+            let mut text = format!("first{terminal}");
+            append_text_chunk(&mut text, "second", false);
+            assert_eq!(text, format!("first{terminal}second"));
+        }
+
+        let mut text = "first。".to_string();
+        append_text_chunk(&mut text, "second", false);
+        assert_eq!(text, "first。\nsecond");
     }
 
     #[test]
@@ -2444,7 +2428,6 @@ mod tests {
             allowed_dirs: vec![dir.path().to_string_lossy().to_string()],
             auto_stage_generated_images: false,
             auto_stage_dir: None,
-            max_bytes: 1024 * 1024,
             max_files: 10,
         };
         let outbound = OutboundAttachments::new(cfg, dir.path().to_string_lossy().to_string());
@@ -2469,7 +2452,6 @@ mod tests {
             allowed_dirs: vec![dir.path().to_string_lossy().to_string()],
             auto_stage_generated_images: false,
             auto_stage_dir: None,
-            max_bytes: 1024 * 1024,
             max_files: 10,
         };
         let outbound = OutboundAttachments::new(cfg, dir.path().to_string_lossy().to_string());
@@ -2485,6 +2467,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn outbound_attachments_do_not_apply_a_byte_size_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("large-report.bin");
+        let data = vec![0x5a; 10 * 1024 * 1024 + 1];
+        std::fs::write(&file_path, &data).unwrap();
+        let cfg = AttachmentsConfig {
+            enabled: true,
+            allowed_dirs: vec![dir.path().to_string_lossy().to_string()],
+            auto_stage_generated_images: false,
+            auto_stage_dir: None,
+            max_files: 10,
+        };
+        let outbound = OutboundAttachments::new(cfg, dir.path().to_string_lossy().to_string());
+
+        let (files, warnings) = outbound
+            .load_attachments(&[], &[file_path.to_string_lossy().to_string()])
+            .await;
+
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].data.len(), data.len());
+    }
+
+    #[tokio::test]
     async fn outbound_attachments_rejects_non_image_for_attach_image() {
         let dir = tempfile::tempdir().unwrap();
         let file_path = dir.path().join("delivery-note.docx");
@@ -2494,7 +2500,6 @@ mod tests {
             allowed_dirs: vec![dir.path().to_string_lossy().to_string()],
             auto_stage_generated_images: false,
             auto_stage_dir: None,
-            max_bytes: 1024 * 1024,
             max_files: 10,
         };
         let outbound = OutboundAttachments::new(cfg, dir.path().to_string_lossy().to_string());
@@ -2519,7 +2524,6 @@ mod tests {
             allowed_dirs: vec![allowed.path().to_string_lossy().to_string()],
             auto_stage_generated_images: false,
             auto_stage_dir: None,
-            max_bytes: 1024 * 1024,
             max_files: 10,
         };
         let outbound = OutboundAttachments::new(cfg, allowed.path().to_string_lossy().to_string());
@@ -2546,7 +2550,6 @@ mod tests {
             allowed_dirs: vec![allowed.path().to_string_lossy().to_string()],
             auto_stage_generated_images: true,
             auto_stage_dir: Some(allowed.path().to_string_lossy().to_string()),
-            max_bytes: 1024 * 1024,
             max_files: 10,
         };
         let outbound = OutboundAttachments::new(cfg, allowed.path().to_string_lossy().to_string());
@@ -2573,7 +2576,6 @@ mod tests {
             allowed_dirs: vec![allowed.path().to_string_lossy().to_string()],
             auto_stage_generated_images: true,
             auto_stage_dir: Some(allowed.path().to_string_lossy().to_string()),
-            max_bytes: 1024 * 1024,
             max_files: 10,
         };
         let outbound = OutboundAttachments::new(cfg, allowed.path().to_string_lossy().to_string());
@@ -2597,7 +2599,6 @@ mod tests {
             allowed_dirs: Vec::new(),
             auto_stage_generated_images: false,
             auto_stage_dir: None,
-            max_bytes: 1024 * 1024,
             max_files: 10,
         };
         let outbound = OutboundAttachments::new(cfg, dir.path().to_string_lossy().to_string());
@@ -2619,7 +2620,6 @@ mod tests {
             allowed_dirs: vec![dir.path().to_string_lossy().to_string()],
             auto_stage_generated_images: false,
             auto_stage_dir: None,
-            max_bytes: 1024 * 1024,
             max_files: 10,
         };
         let outbound = OutboundAttachments::new(cfg, dir.path().to_string_lossy().to_string());
