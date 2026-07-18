@@ -955,14 +955,11 @@ async fn handle_message(
         return;
     }
 
-    // Caps mirror Discord's text-file attachment flow (PR #291) so both
-    // adapters apply the same limits: 5 files or 1 MB of text per message.
-    const TEXT_TOTAL_CAP: u64 = 1024 * 1024;
+    // Match Discord's attachment-count guard while allowing files of any size.
     const TEXT_FILE_COUNT_CAP: u32 = 5;
 
     let mut extra_blocks = Vec::new();
     let mut echo_entries: Vec<crate::stt::EchoEntry> = Vec::new();
-    let mut text_file_bytes: u64 = 0;
     let mut text_file_count: u32 = 0;
     let mut failed_image_files: Vec<String> = Vec::new();
 
@@ -1034,33 +1031,10 @@ async fn handle_message(
                         );
                         continue;
                     }
-                    // Pre-check with Slack-reported size as a fast path when the
-                    // field is populated. Slack can report `size == 0` for
-                    // externally-backed files, so this is advisory only — the
-                    // authoritative cap check happens after download using
-                    // `actual_bytes`.
-                    if size > 0 && text_file_bytes + size > TEXT_TOTAL_CAP {
-                        debug!(
-                            filename,
-                            total = text_file_bytes,
-                            "text attachments total exceeds 1MB cap, skipping remaining"
-                        );
-                        continue;
-                    }
-                    if let Some((block, actual_bytes)) =
+                    if let Some((block, _)) =
                         media::download_and_read_text_file(url, filename, size, Some(bot_token))
                             .await
                     {
-                        if text_file_bytes + actual_bytes > TEXT_TOTAL_CAP {
-                            debug!(
-                            filename,
-                            running = text_file_bytes,
-                            actual = actual_bytes,
-                            "text attachments total exceeds 1MB cap after download, dropping file",
-                        );
-                            continue;
-                        }
-                        text_file_bytes += actual_bytes;
                         text_file_count += 1;
                         debug!(filename, "adding text file attachment");
                         extra_blocks.push(block);
@@ -1080,10 +1054,6 @@ async fn handle_message(
                             extra_blocks.push(block);
                         }
                         Err(media::MediaFetchError::NotAnImage) => {}
-                        Err(media::MediaFetchError::SizeExceeded { actual, limit }) => {
-                            warn!(filename, actual, limit, "image exceeds size limit");
-                            failed_image_files.push(filename.to_string());
-                        }
                         Err(
                             media::MediaFetchError::UnsupportedResponseType { .. }
                             | media::MediaFetchError::InvalidImageBody { .. },
@@ -1133,8 +1103,7 @@ async fn handle_message(
         let msg = format!(
             ":warning: I couldn't process the file(s) you shared (`{file_list}`). \
              This can happen when the bot lacks the `files:read` OAuth scope, \
-             the file format isn't supported (PNG/JPEG/GIF/WebP only), \
-             or the file is too large."
+             or the file format isn't supported (PNG/JPEG/GIF/WebP only)."
         );
         if let Err(e) = adapter.send_message(&warn_channel, &msg).await {
             warn!(error = %e, "failed to send image validation warning to user");

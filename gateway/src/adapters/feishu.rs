@@ -1373,9 +1373,6 @@ pub enum MediaRef {
 
 const IMAGE_MAX_DIMENSION_PX: u32 = 1200;
 const IMAGE_JPEG_QUALITY: u8 = 75;
-const IMAGE_MAX_DOWNLOAD: u64 = 10 * 1024 * 1024; // 10 MB
-const FILE_MAX_DOWNLOAD: u64 = 512 * 1024; // 512 KB
-
 /// Resize image so longest side <= 1200px, then encode as JPEG.
 /// GIFs are passed through unchanged to preserve animation.
 fn resize_and_compress(raw: &[u8]) -> Result<(Vec<u8>, String), image::ImageError> {
@@ -1427,21 +1424,7 @@ pub async fn download_feishu_image(
         tracing::warn!(image_key, status = %resp.status(), "feishu image download failed");
         return None;
     }
-    // Early gate: reject oversized downloads before buffering the full body
-    if let Some(cl) = resp.headers().get(reqwest::header::CONTENT_LENGTH) {
-        if let Ok(size) = cl.to_str().unwrap_or("0").parse::<u64>() {
-            if size > IMAGE_MAX_DOWNLOAD {
-                tracing::warn!(image_key, size, "feishu image Content-Length exceeds 10MB limit, skipping download");
-                return None;
-            }
-        }
-    }
     let bytes = resp.bytes().await.ok()?;
-    // Fallback check (Content-Length may be absent or misreported)
-    if bytes.len() as u64 > IMAGE_MAX_DOWNLOAD {
-        tracing::warn!(image_key, size = bytes.len(), "feishu image exceeds 10MB limit");
-        return None;
-    }
     let (compressed, mime) = match resize_and_compress(&bytes) {
         Ok(v) => v,
         Err(e) => {
@@ -1496,21 +1479,7 @@ pub async fn download_feishu_file(
         tracing::warn!(file_name, status = %resp.status(), "feishu file download failed");
         return None;
     }
-    // Early gate: reject oversized downloads before buffering the full body
-    if let Some(cl) = resp.headers().get(reqwest::header::CONTENT_LENGTH) {
-        if let Ok(size) = cl.to_str().unwrap_or("0").parse::<u64>() {
-            if size > FILE_MAX_DOWNLOAD {
-                tracing::warn!(file_name, size, "feishu file Content-Length exceeds 512KB limit, skipping download");
-                return None;
-            }
-        }
-    }
     let bytes = resp.bytes().await.ok()?;
-    // Fallback check (Content-Length may be absent or misreported)
-    if bytes.len() as u64 > FILE_MAX_DOWNLOAD {
-        tracing::warn!(file_name, size = bytes.len(), "feishu file exceeds 512KB limit");
-        return None;
-    }
     let path = crate::store::store_media(&bytes).await?;
     Some(crate::schema::Attachment {
         attachment_type: "text_file".into(),
@@ -1521,8 +1490,6 @@ pub async fn download_feishu_file(
         path: Some(path),
     })
 }
-
-const AUDIO_MAX_DOWNLOAD: u64 = 25 * 1024 * 1024; // 25 MB (Whisper API limit)
 
 /// Download a Feishu audio message by message_id + file_key → base64 Attachment.
 pub async fn download_feishu_audio(
@@ -1554,19 +1521,7 @@ pub async fn download_feishu_audio(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("audio/ogg")
         .to_string();
-    if let Some(cl) = resp.headers().get(reqwest::header::CONTENT_LENGTH) {
-        if let Ok(size) = cl.to_str().unwrap_or("0").parse::<u64>() {
-            if size > AUDIO_MAX_DOWNLOAD {
-                tracing::warn!(file_key, size, "feishu audio exceeds 25MB limit");
-                return None;
-            }
-        }
-    }
     let bytes = resp.bytes().await.ok()?;
-    if bytes.len() as u64 > AUDIO_MAX_DOWNLOAD {
-        tracing::warn!(file_key, size = bytes.len(), "feishu audio exceeds 25MB limit");
-        return None;
-    }
     tracing::debug!(file_key, size = bytes.len(), "feishu audio downloaded");
     let path = crate::store::store_media(&bytes).await?;
     Some(crate::schema::Attachment {

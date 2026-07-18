@@ -108,7 +108,7 @@ allowed_dirs = ["/home/node", "/home/node/.codex/generated_images"]
 **Behavior**:
 - Supported output platforms: Discord.
 - Supported formats: PNG, JPEG, GIF, WebP.
-- Files are read by OpenAB, validated as images, capped by `attachments.max_bytes`, then uploaded as Discord message attachments.
+- Files are read by OpenAB, validated as images, then uploaded as Discord message attachments. OpenAB does not impose a byte-size cap; the destination platform may still reject files above its own upload limit.
 - Multiple `attach_image` directives are allowed; `attachments.max_files` caps files per response.
 - Unlike other directives, `attach_image` can be emitted either in the initial directive header or later in the response outside code blocks.
 - Directives are stripped from visible text.
@@ -139,7 +139,7 @@ allowed_dirs = ["/home/node", "/home/node/reports"]
 **Behavior**:
 - Supported output platforms: Discord.
 - Intended for non-image files such as DOCX, PDF, CSV, ZIP, logs, and reports.
-- Files are read by OpenAB, capped by `attachments.max_bytes`, then uploaded as Discord message attachments.
+- Files are read by OpenAB and uploaded as Discord message attachments. OpenAB does not impose a byte-size cap; the destination platform may still reject files above its own upload limit.
 - Multiple `attach_file` directives are allowed; `attachments.max_files` caps total image/file attachments per response.
 - Like `attach_image`, `attach_file` can be emitted either in the initial directive header or later in the response outside code blocks.
 - Directives are stripped from visible text.

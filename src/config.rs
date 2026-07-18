@@ -224,10 +224,6 @@ pub struct AttachmentsConfig {
     /// inside `allowed_dirs`. Empty means the first allowed directory.
     #[serde(default)]
     pub auto_stage_dir: Option<String>,
-    /// Max bytes per outbound file. Default matches Discord's default app file
-    /// upload limit.
-    #[serde(default = "default_attachment_max_bytes")]
-    pub max_bytes: u64,
     /// Max outbound files per ACP response.
     #[serde(default = "default_attachment_max_files")]
     pub max_files: usize,
@@ -260,7 +256,6 @@ impl Default for AttachmentsConfig {
             allowed_dirs: Vec::new(),
             auto_stage_generated_images: false,
             auto_stage_dir: None,
-            max_bytes: default_attachment_max_bytes(),
             max_files: default_attachment_max_files(),
         }
     }
@@ -286,9 +281,6 @@ fn default_stt_base_url() -> String {
 }
 fn default_echo_transcript() -> bool {
     false
-}
-fn default_attachment_max_bytes() -> u64 {
-    10 * 1024 * 1024
 }
 fn default_attachment_max_files() -> usize {
     10
@@ -818,10 +810,6 @@ fn parse_config(raw: &str, source: &str) -> anyhow::Result<Config> {
         "pool.liveness_check_secs must be > 0 (zero would spin the recv loop)"
     );
     anyhow::ensure!(
-        config.attachments.max_bytes > 0,
-        "attachments.max_bytes must be > 0"
-    );
-    anyhow::ensure!(
         config.attachments.max_files > 0,
         "attachments.max_files must be > 0"
     );
@@ -857,7 +845,6 @@ command = "echo"
         assert_eq!(cfg.pool.max_sessions, 10);
         assert!(cfg.reactions.enabled);
         assert!(!cfg.attachments.enabled);
-        assert_eq!(cfg.attachments.max_bytes, 10 * 1024 * 1024);
         assert_eq!(cfg.attachments.max_files, 10);
     }
 
@@ -1184,7 +1171,6 @@ enabled = true
 allowed_dirs = ["/workspace/out", "/tmp/openab-images"]
 auto_stage_generated_images = true
 auto_stage_dir = "/workspace/out"
-max_bytes = 1024
 max_files = 2
 "#;
         let cfg = parse_config(toml, "test").unwrap();
@@ -1198,7 +1184,6 @@ max_files = 2
             cfg.attachments.auto_stage_dir.as_deref(),
             Some("/workspace/out")
         );
-        assert_eq!(cfg.attachments.max_bytes, 1024);
         assert_eq!(cfg.attachments.max_files, 2);
     }
 
@@ -1232,19 +1217,7 @@ content_blocks = false
     }
 
     #[test]
-    fn attachments_rejects_zero_limits() {
-        let toml = r#"
-[discord]
-bot_token = "t"
-
-[agent]
-command = "echo"
-
-[attachments]
-max_bytes = 0
-"#;
-        assert!(parse_config(toml, "test").is_err());
-
+    fn attachments_rejects_zero_file_count() {
         let toml = r#"
 [discord]
 bot_token = "t"

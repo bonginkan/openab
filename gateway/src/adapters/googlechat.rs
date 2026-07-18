@@ -14,16 +14,11 @@ const GOOGLE_CHAT_MESSAGE_LIMIT: usize = 4096;
 
 const IMAGE_MAX_DIMENSION_PX: u32 = 1200;
 const IMAGE_JPEG_QUALITY: u8 = 75;
-const IMAGE_MAX_DOWNLOAD: u64 = 10 * 1024 * 1024; // 10 MB
-const FILE_MAX_DOWNLOAD: u64 = 512 * 1024; // 512 KB
-const AUDIO_MAX_DOWNLOAD: u64 = 25 * 1024 * 1024; // 25 MB
 /// Per-request timeout for Google Chat Media API downloads. Prevents a hung
 /// connection from blocking the spawned download task indefinitely.
 const MEDIA_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 /// Cap on text file attachments per message (matches Discord/Slack).
 const TEXT_FILE_COUNT_CAP: usize = 5;
-/// Cap on aggregate text file bytes per message (matches Discord/Slack 1 MB).
-const TEXT_TOTAL_CAP: u64 = 1024 * 1024;
 
 // --- Google Chat types ---
 //
@@ -583,7 +578,6 @@ pub async fn webhook(
         let result = std::panic::AssertUnwindSafe(async {
         let mut downloaded: Vec<crate::schema::Attachment> = Vec::new();
         let mut text_file_count: usize = 0;
-        let mut text_file_bytes: u64 = 0;
         if let Some(ref adapter) = state.google_chat {
             if let Some(token) = adapter.get_token().await {
                 for media_ref in &media_refs {
@@ -611,19 +605,16 @@ pub async fn webhook(
                                 warn!(content_name = %content_name, cap = TEXT_FILE_COUNT_CAP, "googlechat text file count cap reached, skipping");
                                 continue;
                             }
-                            let remaining = TEXT_TOTAL_CAP.saturating_sub(text_file_bytes);
                             let att = download_googlechat_file(
                                 &adapter.client,
                                 &token,
                                 &adapter.api_base,
                                 resource_name,
                                 content_name,
-                                remaining,
                             )
                             .await;
                             let Some(att) = att else { continue };
                             text_file_count += 1;
-                            text_file_bytes += att.size;
                             Some(att)
                         }
                         GoogleChatMediaRef::Audio {
@@ -1255,19 +1246,7 @@ pub async fn download_googlechat_image(
         warn!(content_name, status = %resp.status(), "googlechat image download failed");
         return None;
     }
-    if let Some(cl) = resp.headers().get(reqwest::header::CONTENT_LENGTH) {
-        if let Ok(size) = cl.to_str().unwrap_or("0").parse::<u64>() {
-            if size > IMAGE_MAX_DOWNLOAD {
-                warn!(content_name, size, "googlechat image Content-Length exceeds 10MB limit");
-                return None;
-            }
-        }
-    }
     let bytes = resp.bytes().await.ok()?;
-    if bytes.len() as u64 > IMAGE_MAX_DOWNLOAD {
-        warn!(content_name, size = bytes.len(), "googlechat image exceeds 10MB limit");
-        return None;
-    }
     let (compressed, mime) = match resize_and_compress(&bytes) {
         Ok(v) => v,
         Err(e) => {
@@ -1294,14 +1273,12 @@ pub async fn download_googlechat_file(
     api_base: &str,
     resource_name: &str,
     content_name: &str,
-    remaining_budget: u64,
 ) -> Option<crate::schema::Attachment> {
     let ext = content_name.rsplit('.').next().unwrap_or("").to_lowercase();
     if !TEXT_EXTS.contains(&ext.as_str()) {
         tracing::debug!(content_name, "skipping non-text googlechat file attachment");
         return None;
     }
-    let max_size = FILE_MAX_DOWNLOAD.min(remaining_budget);
     let url = media_url(api_base, resource_name);
     let resp = match client.get(&url).bearer_auth(token).timeout(MEDIA_REQUEST_TIMEOUT).send().await {
         Ok(r) => r,
@@ -1314,19 +1291,7 @@ pub async fn download_googlechat_file(
         warn!(content_name, status = %resp.status(), "googlechat file download failed");
         return None;
     }
-    if let Some(cl) = resp.headers().get(reqwest::header::CONTENT_LENGTH) {
-        if let Ok(size) = cl.to_str().unwrap_or("0").parse::<u64>() {
-            if size > max_size {
-                warn!(content_name, size, limit = max_size, "googlechat file Content-Length exceeds limit");
-                return None;
-            }
-        }
-    }
     let bytes = resp.bytes().await.ok()?;
-    if bytes.len() as u64 > max_size {
-        warn!(content_name, size = bytes.len(), limit = max_size, "googlechat file exceeds size limit");
-        return None;
-    }
     let path = crate::store::store_media(&bytes).await?;
     Some(crate::schema::Attachment {
         attachment_type: "text_file".into(),
@@ -1360,19 +1325,7 @@ pub async fn download_googlechat_audio(
         warn!(content_name, status = %resp.status(), "googlechat audio download failed");
         return None;
     }
-    if let Some(cl) = resp.headers().get(reqwest::header::CONTENT_LENGTH) {
-        if let Ok(size) = cl.to_str().unwrap_or("0").parse::<u64>() {
-            if size > AUDIO_MAX_DOWNLOAD {
-                warn!(content_name, size, "googlechat audio Content-Length exceeds 25MB limit");
-                return None;
-            }
-        }
-    }
     let bytes = resp.bytes().await.ok()?;
-    if bytes.len() as u64 > AUDIO_MAX_DOWNLOAD {
-        warn!(content_name, size = bytes.len(), "googlechat audio exceeds 25MB limit");
-        return None;
-    }
     let path = crate::store::store_media(&bytes).await?;
     Some(crate::schema::Attachment {
         attachment_type: "audio".into(),
@@ -2346,7 +2299,6 @@ mod tests {
             "https://unused", // not called for non-text
             "AATT",
             "binary.exe",
-            TEXT_TOTAL_CAP,
         )
         .await;
         assert!(result.is_none(), "non-text extensions must be skipped");
@@ -2373,7 +2325,6 @@ mod tests {
             &mock_server.uri(),
             "AATT",
             "notes.txt",
-            TEXT_TOTAL_CAP,
         )
         .await;
         let att = result.expect("expected successful download");
@@ -2413,18 +2364,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn download_googlechat_image_rejects_oversized_content_length() {
+    async fn download_googlechat_image_accepts_body_over_previous_limit() {
         use wiremock::{Mock, MockServer, ResponseTemplate};
         use wiremock::matchers::{method, path_regex};
 
         let mock_server = MockServer::start().await;
+        let mut gif = b"GIF89a\x01\x00\x01\x00\x80\x00\x00\xff\xff\xff\x00\x00\x00!\xf9\x04\x00\x00\x00\x00\x00,\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02D\x01\x00;".to_vec();
+        gif.resize(10 * 1024 * 1024 + 1, 0);
         Mock::given(method("GET"))
             .and(path_regex("/media/.*"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .insert_header("content-length", "20000000") // 20 MB > 10 MB limit
-                    .set_body_bytes(vec![0u8; 100]),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(gif.clone()))
             .mount(&mock_server)
             .await;
 
@@ -2434,10 +2383,11 @@ mod tests {
             "fake-token",
             &mock_server.uri(),
             "AATT",
-            "huge.png",
+            "large.gif",
         )
         .await;
-        assert!(result.is_none(), "oversized image must be rejected");
+        let attachment = result.expect("byte size alone must not reject the image");
+        assert_eq!(attachment.size, gif.len() as u64);
     }
 
     #[test]

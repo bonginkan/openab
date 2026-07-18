@@ -1,4 +1,4 @@
-use crate::media::{resize_and_compress, MediaKind, AUDIO_MAX_DOWNLOAD, FILE_MAX_DOWNLOAD, IMAGE_MAX_DOWNLOAD};
+use crate::media::{resize_and_compress, MediaKind};
 use crate::schema::*;
 use crate::store;
 use axum::extract::State;
@@ -363,20 +363,6 @@ async fn download_telegram_media(
         return None;
     }
 
-    let max_size = match kind {
-        MediaKind::Image => IMAGE_MAX_DOWNLOAD,
-        MediaKind::Audio => AUDIO_MAX_DOWNLOAD,
-    };
-
-    if let Some(cl) = resp.headers().get(reqwest::header::CONTENT_LENGTH) {
-        if let Ok(size) = cl.to_str().unwrap_or("0").parse::<u64>() {
-            if size > max_size {
-                warn!(file_id, size, kind = ?kind, "Telegram media Content-Length exceeds limit");
-                return None;
-            }
-        }
-    }
-
     let default_mime = match kind {
         MediaKind::Image => "image/jpeg",
         MediaKind::Audio => "audio/ogg",
@@ -389,10 +375,6 @@ async fn download_telegram_media(
         .to_string();
 
     let bytes = resp.bytes().await.ok()?;
-    if bytes.len() as u64 > max_size {
-        warn!(file_id, size = bytes.len(), kind = ?kind, "Telegram media exceeds limit");
-        return None;
-    }
 
     let (data_bytes, mime) = match kind {
         MediaKind::Image => match resize_and_compress(&bytes) {
@@ -450,20 +432,7 @@ async fn download_telegram_document(
         return None;
     }
 
-    if let Some(cl) = resp.headers().get(reqwest::header::CONTENT_LENGTH) {
-        if let Ok(size) = cl.to_str().unwrap_or("0").parse::<u64>() {
-            if size > FILE_MAX_DOWNLOAD {
-                warn!(file_id, size, "Telegram document Content-Length exceeds limit");
-                return None;
-            }
-        }
-    }
-
     let bytes = resp.bytes().await.ok()?;
-    if bytes.len() as u64 > FILE_MAX_DOWNLOAD {
-        warn!(file_id, size = bytes.len(), "Telegram document exceeds limit");
-        return None;
-    }
 
     // Validate UTF-8 — reject binary files
     if String::from_utf8(bytes.to_vec()).is_err() {

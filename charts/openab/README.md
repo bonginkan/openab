@@ -39,7 +39,6 @@ Each agent lives under `agents.<name>`.
 | `attachments.allowedDirs` | Directories OpenAB may read outbound images from. Empty = `workingDir` only. | `[]` |
 | `attachments.autoStageGeneratedImages` | Move generated images from known staging folders into `autoStageDir` before upload. | `false` |
 | `attachments.autoStageDir` | Destination for auto-staged generated images. Must be inside `allowedDirs`. | `""` |
-| `attachments.maxBytes` | Maximum bytes per outbound image. | `10485760` |
 | `attachments.maxFiles` | Maximum outbound images per response. | `10` |
 | `env` | Inline environment variables passed to the agent process. | `{}` |
 | `envFrom` | Additional environment sources from existing Secrets or ConfigMaps. | `[]` |
