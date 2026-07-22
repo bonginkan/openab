@@ -71,6 +71,60 @@ Slack adapter using Socket Mode. Requires both a Bot User OAuth Token and an App
 
 ---
 
+## Adapter context recovery
+
+Discord and Slack can attach a bounded, API-recovered context window to each
+incoming `SenderContext`. The feature is opt-in and leaves the incoming prompt
+text unchanged. Platform credentials remain inside OpenAB and are never added
+to the agent subprocess environment.
+
+Use the same keys under `[discord.context_recovery]` or
+`[slack.context_recovery]`:
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | bool | `false` | Recover bounded reply, thread, current-window, and explicit message-link context. |
+| `history_limit` | usize | `12` | Maximum current-channel/thread neighbors emitted for one event (`1..=50`). Slack may read a larger bounded page to locate the current reply. |
+| `link_limit` | usize | `4` | Maximum explicit Discord message links or Slack permalinks followed from the incoming message (`0..=10`). |
+| `link_neighbors` | usize | `2` | Maximum neighbors on each side of an explicit linked message (`0..=10`). |
+| `max_message_chars` | usize | `2000` | Per-message character cap (`64..=16000`). |
+| `max_total_chars` | usize | `12000` | Total recovered-content character cap. Must be at least `max_message_chars` and at most `64000`. |
+| `settle_delay_ms` | u64 | `250` | Bounded delay before recovery so immediately split continuation posts can arrive (`0..=2000`). |
+
+```toml
+[discord.context_recovery]
+enabled = true
+history_limit = 12
+link_limit = 4
+link_neighbors = 2
+max_message_chars = 2000
+max_total_chars = 12000
+settle_delay_ms = 250
+
+[slack.context_recovery]
+enabled = true
+history_limit = 12
+link_limit = 4
+link_neighbors = 2
+max_message_chars = 2000
+max_total_chars = 12000
+settle_delay_ms = 250
+```
+
+OpenAB re-applies the adapter channel allowlist before following any explicit
+message link. Discord links must stay in the current guild (DM links must stay
+in the current DM), and Slack permalinks must match the authenticated
+workspace. When an API call is denied, truncated, or unavailable,
+`recovered_context.incomplete` is true and `failures` contains only a sanitized
+reason code and platform message reference. API error bodies and credentials
+are not forwarded.
+
+Slack channel recovery uses the corresponding history scope. Public/private
+channels use `channels:history` / `groups:history`; recovery in DMs or MPIMs
+also requires `im:history` / `mpim:history` respectively.
+
+---
+
 ## `[gateway]`
 
 Custom Gateway adapter for platforms like Telegram, LINE, Feishu/Lark, and Google Chat. Connects to the gateway via WebSocket.
@@ -464,7 +518,9 @@ Key mapping (`values.yaml` → `config.toml`):
 | `agents.<name>.discord.messageProcessingMode` | `[discord] message_processing_mode` |
 | `agents.<name>.discord.maxBufferedMessages` | `[discord] max_buffered_messages` |
 | `agents.<name>.discord.maxBatchTokens` | `[discord] max_batch_tokens` |
+| `agents.<name>.discord.contextRecovery.*` | `[discord.context_recovery] *` (camelCase to snake_case) |
 | `agents.<name>.slack.*` | `[slack] *` (same pattern) |
+| `agents.<name>.slack.contextRecovery.*` | `[slack.context_recovery] *` (camelCase to snake_case) |
 | `agents.<name>.pool.maxSessions` | `[pool] max_sessions` |
 | `agents.<name>.pool.sessionTtlHours` | `[pool] session_ttl_hours` |
 | `agents.<name>.reactions.enabled` | `[reactions] enabled` |

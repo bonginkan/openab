@@ -431,6 +431,11 @@ pub struct SenderContext {
     /// Enables agents to identify themselves when multiple agents share the same backend.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub receiver_id: Option<String>,
+    /// Bounded platform context recovered by the adapter. Platform credentials
+    /// remain inside OpenAB; downstream agents receive only normalized messages
+    /// and sanitized failure reasons.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recovered_context: Option<crate::context_recovery::RecoveredContext>,
 }
 
 // --- ChatAdapter trait ---

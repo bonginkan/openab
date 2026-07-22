@@ -91,6 +91,67 @@ pub struct Config {
     pub steering: SteeringConfig,
 }
 
+/// Bounded, adapter-mediated context recovery for Discord and Slack.
+///
+/// Disabled by default to preserve existing prompt size and API behavior. When
+/// enabled, adapters fetch a small current-message window plus explicit reply
+/// and message-link targets without exposing platform credentials to the agent.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ContextRecoveryConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_context_history_limit")]
+    pub history_limit: usize,
+    #[serde(default = "default_context_link_limit")]
+    pub link_limit: usize,
+    #[serde(default = "default_context_link_neighbors")]
+    pub link_neighbors: usize,
+    #[serde(default = "default_context_message_chars")]
+    pub max_message_chars: usize,
+    #[serde(default = "default_context_total_chars")]
+    pub max_total_chars: usize,
+    #[serde(default = "default_context_settle_delay_ms")]
+    pub settle_delay_ms: u64,
+}
+
+fn default_context_history_limit() -> usize {
+    12
+}
+
+fn default_context_link_limit() -> usize {
+    4
+}
+
+fn default_context_link_neighbors() -> usize {
+    2
+}
+
+fn default_context_message_chars() -> usize {
+    2_000
+}
+
+fn default_context_total_chars() -> usize {
+    12_000
+}
+
+fn default_context_settle_delay_ms() -> u64 {
+    250
+}
+
+impl Default for ContextRecoveryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            history_limit: default_context_history_limit(),
+            link_limit: default_context_link_limit(),
+            link_neighbors: default_context_link_neighbors(),
+            max_message_chars: default_context_message_chars(),
+            max_total_chars: default_context_total_chars(),
+            settle_delay_ms: default_context_settle_delay_ms(),
+        }
+    }
+}
+
 /// Mid-turn steering controls.
 ///
 /// When `immediate_steer` is off the dispatcher preserves invariant I2
@@ -337,6 +398,8 @@ pub struct DiscordConfig {
     /// Batched mode only: soft token cap for greedy drain. Default: 24000.
     #[serde(default = "default_max_batch_tokens")]
     pub max_batch_tokens: usize,
+    #[serde(default)]
+    pub context_recovery: ContextRecoveryConfig,
 }
 
 fn default_max_bot_turns() -> u32 {
@@ -416,6 +479,8 @@ pub struct SlackConfig {
     /// Batched mode only: soft token cap for greedy drain. Default: 24000.
     #[serde(default = "default_max_batch_tokens")]
     pub max_batch_tokens: usize,
+    #[serde(default)]
+    pub context_recovery: ContextRecoveryConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -813,6 +878,45 @@ fn parse_config(raw: &str, source: &str) -> anyhow::Result<Config> {
         config.attachments.max_files > 0,
         "attachments.max_files must be > 0"
     );
+    for (platform, recovery) in [
+        (
+            "discord",
+            config.discord.as_ref().map(|cfg| &cfg.context_recovery),
+        ),
+        (
+            "slack",
+            config.slack.as_ref().map(|cfg| &cfg.context_recovery),
+        ),
+    ] {
+        let Some(recovery) = recovery else {
+            continue;
+        };
+        anyhow::ensure!(
+            (1..=50).contains(&recovery.history_limit),
+            "{platform}.context_recovery.history_limit must be between 1 and 50"
+        );
+        anyhow::ensure!(
+            recovery.link_limit <= 10,
+            "{platform}.context_recovery.link_limit must be <= 10"
+        );
+        anyhow::ensure!(
+            recovery.link_neighbors <= 10,
+            "{platform}.context_recovery.link_neighbors must be <= 10"
+        );
+        anyhow::ensure!(
+            (64..=16_000).contains(&recovery.max_message_chars),
+            "{platform}.context_recovery.max_message_chars must be between 64 and 16000"
+        );
+        anyhow::ensure!(
+            recovery.max_total_chars >= recovery.max_message_chars
+                && recovery.max_total_chars <= 64_000,
+            "{platform}.context_recovery.max_total_chars must be >= max_message_chars and <= 64000"
+        );
+        anyhow::ensure!(
+            recovery.settle_delay_ms <= 2_000,
+            "{platform}.context_recovery.settle_delay_ms must be <= 2000"
+        );
+    }
 
     Ok(config)
 }
@@ -846,6 +950,56 @@ command = "echo"
         assert!(cfg.reactions.enabled);
         assert!(!cfg.attachments.enabled);
         assert_eq!(cfg.attachments.max_files, 10);
+        assert!(!discord.context_recovery.enabled);
+        assert_eq!(discord.context_recovery.history_limit, 12);
+        assert_eq!(discord.context_recovery.max_total_chars, 12_000);
+    }
+
+    #[test]
+    fn parse_context_recovery_config() {
+        let toml = r#"
+[discord]
+bot_token = "test-token"
+
+[discord.context_recovery]
+enabled = true
+history_limit = 20
+link_limit = 5
+link_neighbors = 3
+max_message_chars = 4096
+max_total_chars = 16384
+settle_delay_ms = 500
+
+[agent]
+command = "echo"
+"#;
+        let cfg = parse_config(toml, "test").unwrap();
+        let recovery = cfg.discord.unwrap().context_recovery;
+        assert!(recovery.enabled);
+        assert_eq!(recovery.history_limit, 20);
+        assert_eq!(recovery.link_limit, 5);
+        assert_eq!(recovery.link_neighbors, 3);
+        assert_eq!(recovery.max_message_chars, 4096);
+        assert_eq!(recovery.max_total_chars, 16384);
+        assert_eq!(recovery.settle_delay_ms, 500);
+    }
+
+    #[test]
+    fn reject_context_recovery_total_budget_below_message_budget() {
+        let toml = r#"
+[discord]
+bot_token = "test-token"
+
+[discord.context_recovery]
+enabled = true
+max_message_chars = 4096
+max_total_chars = 2048
+
+[agent]
+command = "echo"
+"#;
+        let error = parse_config(toml, "test").unwrap_err().to_string();
+        assert!(error.contains("max_total_chars must be >= max_message_chars"));
     }
 
     #[test]

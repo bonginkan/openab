@@ -42,6 +42,8 @@ Socket Mode uses a persistent WebSocket connection — no public URL or ingress 
 | `chat:write` | Send and edit messages |
 | `channels:history` | Read public channel messages (for thread context) |
 | `groups:history` | Read private channel messages (for thread context) |
+| `im:history` | Read DM history (only needed for DM context recovery) |
+| `mpim:history` | Read group-DM history (only needed for MPIM context recovery) |
 | `channels:read` | List public channels |
 | `groups:read` | List private channels |
 | `reactions:write` | Add/remove emoji reactions |
@@ -68,6 +70,9 @@ bot_token = "${SLACK_BOT_TOKEN}"
 app_token = "${SLACK_APP_TOKEN}"
 allowed_channels = []                # empty = allow all channels
 # allowed_users = ["U0123456789"]    # empty = allow all users
+
+[slack.context_recovery]
+enabled = true                       # bounded history, thread-root, and permalink recovery
 ```
 
 Set the environment variables:

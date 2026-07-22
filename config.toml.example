@@ -22,6 +22,15 @@ allowed_channels = ["1234567890"]       # ↑ omitted + non-empty list → auto-
 # allow_dm = false                     # true = respond to Discord DMs; false (default) = ignore DMs
                                        # allowed_users still applies in DMs
 
+# [discord.context_recovery]
+# enabled = false                      # opt in to bounded API-mediated context recovery
+# history_limit = 12                   # current channel/thread neighbors (1..=50)
+# link_limit = 4                       # explicit message links to follow (0..=10)
+# link_neighbors = 2                   # neighbors on each side of a linked message
+# max_message_chars = 2000             # per recovered message
+# max_total_chars = 12000              # total recovered content
+# settle_delay_ms = 250                # allows immediately split continuation posts to arrive
+
 # [slack]
 # bot_token = "${SLACK_BOT_TOKEN}"     # Bot User OAuth Token (xoxb-...)
 # app_token = "${SLACK_APP_TOKEN}"     # App-Level Token (xapp-...) for Socket Mode
@@ -37,6 +46,15 @@ allowed_channels = ["1234567890"]       # ↑ omitted + non-empty list → auto-
                                         # "multibot-mentions" = like "involved", but require @mention
                                         #   once another bot has posted in the thread
 # max_bot_turns = 100                  # soft cap on consecutive bot turns per thread (human msg resets)
+
+# [slack.context_recovery]
+# enabled = false                      # uses channel history scopes; credentials stay inside OpenAB
+# history_limit = 12
+# link_limit = 4
+# link_neighbors = 2
+# max_message_chars = 2000
+# max_total_chars = 12000
+# settle_delay_ms = 250
 
 # [gateway]
 # url = "ws://openab-gateway:8080/ws"  # WebSocket URL of the custom gateway

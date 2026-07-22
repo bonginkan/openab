@@ -2,6 +2,7 @@ mod acp;
 mod adapter;
 mod bot_turns;
 mod config;
+mod context_recovery;
 mod cron;
 mod discord;
 mod dispatch;
@@ -287,6 +288,7 @@ async fn main() -> anyhow::Result<()> {
                 slack_cfg.allow_user_messages,
                 max_bot_turns,
                 stt,
+                slack_cfg.context_recovery,
                 inbound_attachment_content_blocks,
                 slack_shutdown_rx,
                 slack_dispatcher,
@@ -491,6 +493,7 @@ async fn main() -> anyhow::Result<()> {
             allowed_channels,
             allowed_users,
             stt_config: cfg.stt.clone(),
+            context_recovery: discord_cfg.context_recovery.clone(),
             inbound_attachment_content_blocks,
             adapter: std::sync::OnceLock::new(),
             allow_bot_messages: discord_cfg.allow_bot_messages,
