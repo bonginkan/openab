@@ -34,6 +34,31 @@ codes instead of silently claiming complete context. See
 
 ---
 
+## Ingress routing audit
+
+OpenAB emits one metadata-only `openab::ingress_audit` event for every inbound
+Discord message and Slack `message` or `app_mention` event. Its structured
+fields use schema `openab.ingress-audit.v1` and include platform,
+event/channel/thread/scope identifiers, source timestamp, sender ID and bot
+flag, event kind, content character count, attachment count, and the terminal
+routing decision.
+
+Message content, prompts, attachment bytes, credentials, and tokens are never
+included. An early return that has not been assigned a known policy decision is
+recorded as `unclassified_drop`, so a newly introduced silent path is visible
+instead of disappearing from the audit trail. Dispatch failures are distinct
+from policy denials and normal duplicate suppression.
+
+The record reports observable routing effects only. For example,
+`sender_is_bot: true` with `bot_policy_denied` or `bot_untrusted` can be reviewed
+as an agent-access restriction, but OpenAB does not infer motive, classify
+people or viewpoints, or apply sanctions from message content. Existing log
+access and retention controls remain authoritative. The default
+`openab=info` filter includes these events; deployments that override
+`RUST_LOG` must retain `openab::ingress_audit=info` to preserve the trail.
+
+---
+
 ## 0. Human → Bot in DM
 
 Users can interact with the bot privately via direct message. DMs are **opt-in** — disabled by default to prevent unexpected resource usage.
