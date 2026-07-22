@@ -140,6 +140,7 @@ allowed_dirs = ["/home/node", "/home/node/reports"]
 - Supported output platforms: Discord and Slack.
 - Intended for non-image files such as DOCX, PDF, CSV, ZIP, logs, and reports.
 - Files are read by OpenAB and uploaded as platform message attachments. OpenAB does not impose a byte-size cap; the destination platform may still reject files above its own upload limit.
+- Slack uploads require the app's bot token to include `files:write`; reinstall the Slack app after changing bot token scopes.
 - Multiple `attach_file` directives are allowed; `attachments.max_files` caps total image/file attachments per response.
 - Like `attach_image`, `attach_file` can be emitted either in the initial directive header or later in the response outside code blocks.
 - Directives are stripped from visible text.

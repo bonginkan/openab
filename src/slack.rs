@@ -140,8 +140,27 @@ impl SlackAdapter {
 
         let json: serde_json::Value = resp.json().await?;
         if json["ok"].as_bool() != Some(true) {
-            let err = json["error"].as_str().unwrap_or("unknown error");
-            return Err(anyhow!("Slack API {method}: {err}"));
+            return Err(anyhow!(slack_api_error_message(method, &json)));
+        }
+        Ok(json)
+    }
+
+    async fn api_post_form(
+        &self,
+        method: &str,
+        form: &[(&str, String)],
+    ) -> Result<serde_json::Value> {
+        let resp = self
+            .client
+            .post(format!("{SLACK_API}/{method}"))
+            .header("Authorization", format!("Bearer {}", self.bot_token))
+            .form(form)
+            .send()
+            .await?;
+
+        let json: serde_json::Value = resp.json().await?;
+        if json["ok"].as_bool() != Some(true) {
+            return Err(anyhow!(slack_api_error_message(method, &json)));
         }
         Ok(json)
     }
@@ -159,8 +178,7 @@ impl SlackAdapter {
 
         let json: serde_json::Value = resp.json().await?;
         if json["ok"].as_bool() != Some(true) {
-            let err = json["error"].as_str().unwrap_or("unknown error");
-            return Err(anyhow!("Slack API {method}: {err}"));
+            return Err(anyhow!(slack_api_error_message(method, &json)));
         }
         Ok(json)
     }
@@ -348,13 +366,11 @@ impl SlackAdapter {
         filename: &str,
         length: usize,
     ) -> Result<(String, String)> {
+        let length = length.to_string();
         let resp = self
-            .api_post(
+            .api_post_form(
                 "files.getUploadURLExternal",
-                serde_json::json!({
-                    "filename": filename,
-                    "length": length,
-                }),
+                &[("filename", filename.to_string()), ("length", length)],
             )
             .await?;
         let upload_url = resp["upload_url"]
@@ -1399,6 +1415,47 @@ fn bot_id_matches_trusted(
         || resolved_user_id.is_some_and(|uid| trusted_bot_ids.contains(uid))
 }
 
+fn slack_api_error_message(method: &str, json: &serde_json::Value) -> String {
+    let err = json["error"].as_str().unwrap_or("unknown error");
+    let mut message = format!("Slack API {method}: {err}");
+
+    let needed = json["needed"].as_str().filter(|s| !s.is_empty());
+    let provided = json["provided"].as_str().filter(|s| !s.is_empty());
+    let response_messages = json["response_metadata"]["messages"]
+        .as_array()
+        .into_iter()
+        .flat_map(|messages| messages.iter().filter_map(|message| message.as_str()))
+        .filter(|message| !message.is_empty())
+        .collect::<Vec<_>>();
+    let mut details = Vec::new();
+    if let Some(needed) = needed {
+        details.push(format!("needed: {needed}"));
+    }
+    if let Some(provided) = provided {
+        details.push(format!("provided: {provided}"));
+    }
+    if !response_messages.is_empty() {
+        details.push(format!("messages: {}", response_messages.join("; ")));
+    }
+    if !details.is_empty() {
+        message.push_str(" (");
+        message.push_str(&details.join("; "));
+        message.push(')');
+    }
+
+    if err == "missing_scope"
+        && slack_scope_list_contains(needed.unwrap_or_default(), "files:write")
+    {
+        message.push_str("; add files:write to Slack Bot Token Scopes and reinstall the app");
+    }
+
+    message
+}
+
+fn slack_scope_list_contains(scopes: &str, target: &str) -> bool {
+    scopes.split(',').any(|scope| scope.trim() == target)
+}
+
 fn slack_upload_thread_ts<'a>(
     channel_thread_ts: Option<&'a str>,
     reply_to_message_id: Option<&'a str>,
@@ -1827,6 +1884,56 @@ mod tests {
     fn trusted_bot_ids_rejects_empty_event_bot_id() {
         let trusted = HashSet::from(["".to_string()]);
         assert!(!bot_id_matches_trusted(&trusted, "", None));
+    }
+
+    // --- Slack API error formatting tests ---
+
+    #[test]
+    fn api_error_message_includes_scope_details_and_upload_hint() {
+        let json = serde_json::json!({
+            "ok": false,
+            "error": "missing_scope",
+            "needed": "files:write",
+            "provided": "app_mentions:read,chat:write,files:read"
+        });
+
+        let message = slack_api_error_message("files.getUploadURLExternal", &json);
+
+        assert!(message.contains("Slack API files.getUploadURLExternal: missing_scope"));
+        assert!(message.contains("needed: files:write"));
+        assert!(message.contains("provided: app_mentions:read,chat:write,files:read"));
+        assert!(message.contains("add files:write to Slack Bot Token Scopes"));
+        assert!(message.contains("reinstall the app"));
+    }
+
+    #[test]
+    fn api_error_message_handles_missing_error_shape() {
+        let json = serde_json::json!({ "ok": false });
+
+        assert_eq!(
+            slack_api_error_message("chat.postMessage", &json),
+            "Slack API chat.postMessage: unknown error"
+        );
+    }
+
+    #[test]
+    fn api_error_message_includes_response_metadata_messages() {
+        let json = serde_json::json!({
+            "ok": false,
+            "error": "invalid_arguments",
+            "response_metadata": {
+                "messages": [
+                    "[ERROR] missing required field: length",
+                    "[ERROR] missing required field: filename"
+                ]
+            }
+        });
+
+        let message = slack_api_error_message("files.getUploadURLExternal", &json);
+
+        assert!(message.contains("Slack API files.getUploadURLExternal: invalid_arguments"));
+        assert!(message.contains("[ERROR] missing required field: length"));
+        assert!(message.contains("[ERROR] missing required field: filename"));
     }
 
     // --- outbound Slack upload tests ---
