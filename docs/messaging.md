@@ -10,6 +10,30 @@ This document explains the five messaging patterns in OpenAB, each building on t
 
 ---
 
+## Bounded context recovery
+
+When `[discord.context_recovery]` or `[slack.context_recovery]` is enabled,
+OpenAB recovers a bounded context set before dispatching an incoming message:
+
+- nearby messages in the current channel or thread;
+- the native Discord reply target or Slack thread root;
+- explicitly pasted Discord message links or Slack permalinks, plus configured
+  neighbors.
+
+Recovered messages are added to the existing sender envelope under
+`recovered_context` using schema `openab.recovered-context.v1`. Each message
+has one or more relations (`current_window`, `native_reply`, `thread_root`,
+`linked_target`, or `linked_neighbor`). The user's incoming prompt remains
+verbatim.
+
+OpenAB applies guild/workspace and channel allowlists before following links.
+Credentials stay inside the adapter. If recovery is denied, truncated, or
+unavailable, the envelope reports `incomplete: true` with sanitized failure
+codes instead of silently claiming complete context. See
+[Configuration Reference](config-reference.md#adapter-context-recovery).
+
+---
+
 ## 0. Human → Bot in DM
 
 Users can interact with the bot privately via direct message. DMs are **opt-in** — disabled by default to prevent unexpected resource usage.

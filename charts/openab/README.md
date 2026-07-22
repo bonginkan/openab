@@ -27,12 +27,14 @@ Each agent lives under `agents.<name>`.
 | `discord.allowDm` | Whether the Discord bot responds to direct messages. | `false` |
 | `discord.allowBotMessages` | Controls whether bot messages can trigger replies. | `"off"` |
 | `discord.trustedBotIds` | Optional bot ID allowlist when bot-message replies are enabled. | `[]` |
+| `discord.contextRecovery.*` | Bounded Discord reply, history, and explicit message-link recovery. Disabled unless `enabled: true`. | disabled |
 | `slack.enabled` | Enable the Slack adapter for the agent. | `false` |
 | `slack.botToken` | Slack Bot User OAuth token. | `""` |
 | `slack.appToken` | Slack App-Level token for Socket Mode. | `""` |
 | `slack.existingSecret` | Name of a pre-existing K8s Secret containing `slack-bot-token` and `slack-app-token`. When set, `botToken`/`appToken` above are ignored and the chart skips creating those keys. Enables External Secrets Operator / Vault / SealedSecrets workflows. | `""` |
 | `slack.allowedChannels` | Slack channel allowlist. Empty means allow all channels by default. | `[]` |
 | `slack.allowedUsers` | Slack user allowlist. Empty means allow all users by default. | `[]` |
+| `slack.contextRecovery.*` | Bounded Slack thread, history, and explicit permalink recovery. Disabled unless `enabled: true`. | disabled |
 | `nameOverride` | Override this agent's generated resource name. | `""` |
 | `workingDir` | Working directory and HOME inside the container. | `"/home/agent"` |
 | `attachments.enabled` | Enable agent-generated file/image uploads via `[[attach_image:path]]` and `[[attach_file:path]]`. | `false` |

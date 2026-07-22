@@ -1,7 +1,10 @@
 use crate::acp::ContentBlock;
 use crate::adapter::{ChannelRef, ChatAdapter, MessageRef, OutboundAttachment, SenderContext};
 use crate::bot_turns::{BotTurnTracker, TurnAction, TurnSeverity};
-use crate::config::{AllowBots, AllowUsers, SttConfig};
+use crate::config::{AllowBots, AllowUsers, ContextRecoveryConfig, SttConfig};
+use crate::context_recovery::{
+    slack_message_links, ContextCollector, RecoveredContext, RecoveredMessage, SlackMessageLink,
+};
 use crate::media;
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
@@ -14,6 +17,9 @@ use tracing::{debug, error, info, warn};
 
 const SLACK_API: &str = "https://slack.com/api";
 const SLACK_EVENT_DEDUPE_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+// Slack returns at most 100 messages for a time-bounded history query. After-side
+// context is only usable when this complete page reaches the target boundary.
+const SLACK_CONTEXT_AFTER_FETCH_LIMIT: &str = "100";
 
 #[derive(Debug, Clone)]
 struct SlackCompletedUploadFile {
@@ -64,6 +70,7 @@ pub struct SlackAdapter {
     client: reqwest::Client,
     bot_token: String,
     bot_user_id: tokio::sync::OnceCell<String>,
+    workspace_host: tokio::sync::OnceCell<String>,
     user_cache: tokio::sync::Mutex<HashMap<String, (String, tokio::time::Instant)>>,
     /// Cache: Bot ID (B...) → Bot User ID (U...) for trusted_bot_ids matching.
     bot_id_cache: tokio::sync::Mutex<HashMap<String, String>>,
@@ -86,6 +93,7 @@ impl SlackAdapter {
             client: reqwest::Client::new(),
             bot_token,
             bot_user_id: tokio::sync::OnceCell::new(),
+            workspace_host: tokio::sync::OnceCell::new(),
             user_cache: tokio::sync::Mutex::new(HashMap::new()),
             bot_id_cache: tokio::sync::Mutex::new(HashMap::new()),
             participated_threads: tokio::sync::Mutex::new(HashMap::new()),
@@ -127,6 +135,32 @@ impl SlackAdapter {
             .inspect_err(|e| warn!(error = %e, "bot user ID unavailable; mention detection may suppress bot messages under Mentions mode"))
             .ok()
             .map(|s| s.as_str())
+    }
+
+    async fn get_workspace_host(&self) -> Option<&str> {
+        self.workspace_host
+            .get_or_try_init(|| async {
+                let response = self
+                    .api_post("auth.test", serde_json::json!({}))
+                    .await
+                    .map_err(|error| anyhow!("auth.test failed: {error}"))?;
+                let url = response["url"]
+                    .as_str()
+                    .ok_or_else(|| anyhow!("no url in auth.test response"))?;
+                let parsed = reqwest::Url::parse(url)?;
+                let host = parsed
+                    .host_str()
+                    .and_then(|host| host.strip_suffix(".slack.com"))
+                    .filter(|host| !host.is_empty())
+                    .ok_or_else(|| anyhow!("auth.test returned a non-Slack workspace URL"))?;
+                Ok::<String, anyhow::Error>(host.to_ascii_lowercase())
+            })
+            .await
+            .inspect_err(|error| {
+                warn!(error = %error, "Slack workspace identity unavailable for context recovery")
+            })
+            .ok()
+            .map(String::as_str)
     }
 
     async fn api_post(&self, method: &str, body: serde_json::Value) -> Result<serde_json::Value> {
@@ -597,6 +631,7 @@ pub async fn run_slack_adapter(
     allow_user_messages: AllowUsers,
     max_bot_turns: u32,
     stt_config: SttConfig,
+    context_recovery: ContextRecoveryConfig,
     inbound_attachment_content_blocks: bool,
     mut shutdown_rx: watch::Receiver<bool>,
     dispatcher: Arc<crate::dispatch::Dispatcher>,
@@ -708,6 +743,7 @@ pub async fn run_slack_adapter(
                                                 let allowed_channels = allowed_channels.clone();
                                                 let allowed_users = allowed_users.clone();
                                                 let stt_config = stt_config.clone();
+                                                let context_recovery = context_recovery.clone();
                                                 let dispatcher = dispatcher.clone();
                                                 tokio::spawn(async move {
                                                     handle_message(
@@ -719,6 +755,7 @@ pub async fn run_slack_adapter(
                                                         &allowed_channels,
                                                         &allowed_users,
                                                         &stt_config,
+                                                        &context_recovery,
                                                         inbound_attachment_content_blocks,
                                                         &dispatcher,
                                                     )
@@ -938,6 +975,7 @@ pub async fn run_slack_adapter(
                                                 let allowed_channels = allowed_channels.clone();
                                                 let allowed_users = allowed_users.clone();
                                                 let stt_config = stt_config.clone();
+                                                let context_recovery = context_recovery.clone();
                                                 let dispatcher = dispatcher.clone();
                                                 tokio::spawn(async move {
                                                     handle_message(
@@ -949,6 +987,7 @@ pub async fn run_slack_adapter(
                                                         &allowed_channels,
                                                         &allowed_users,
                                                         &stt_config,
+                                                        &context_recovery,
                                                         inbound_attachment_content_blocks,
                                                         &dispatcher,
                                                     )
@@ -1037,6 +1076,504 @@ fn slack_event_dedupe_key(envelope: &serde_json::Value) -> Option<String> {
     ))
 }
 
+fn recovered_slack_message(
+    channel_id: &str,
+    message: &serde_json::Value,
+) -> Option<RecoveredMessage> {
+    let message_ts = message["ts"].as_str()?;
+    let sender_id = message["user"]
+        .as_str()
+        .or_else(|| message["bot_id"].as_str())
+        .map(ToOwned::to_owned);
+    let attachment_count = message["files"].as_array().map_or(0, Vec::len)
+        + message["attachments"].as_array().map_or(0, Vec::len);
+    Some(RecoveredMessage {
+        channel_id: channel_id.to_string(),
+        thread_id: message["thread_ts"].as_str().map(ToOwned::to_owned),
+        message_id: message_ts.to_string(),
+        sender_id,
+        sender_name: None,
+        timestamp: Some(crate::timestamp::slack_ts_to_iso8601(message_ts)),
+        content: message["text"].as_str().unwrap_or_default().to_string(),
+        attachment_count,
+        relations: Vec::new(),
+    })
+}
+
+fn slack_response_messages(response: &serde_json::Value) -> Vec<serde_json::Value> {
+    let mut messages = response["messages"].as_array().cloned().unwrap_or_default();
+    messages.sort_by(|left, right| {
+        left["ts"]
+            .as_str()
+            .unwrap_or_default()
+            .cmp(right["ts"].as_str().unwrap_or_default())
+    });
+    messages
+}
+
+#[allow(clippy::too_many_arguments)]
+fn add_slack_window(
+    collector: &mut ContextCollector<'_>,
+    channel_id: &str,
+    mut messages: Vec<serde_json::Value>,
+    target_ts: &str,
+    before_limit: usize,
+    after_limit: usize,
+    target_relation: Option<&str>,
+    neighbor_relation: &str,
+) -> bool {
+    messages.sort_by(|left, right| {
+        left["ts"]
+            .as_str()
+            .unwrap_or_default()
+            .cmp(right["ts"].as_str().unwrap_or_default())
+    });
+    let target_index = messages
+        .iter()
+        .position(|message| message["ts"].as_str() == Some(target_ts));
+    let insertion_index = target_index.unwrap_or_else(|| {
+        messages
+            .iter()
+            .position(|message| message["ts"].as_str().is_some_and(|ts| ts > target_ts))
+            .unwrap_or(messages.len())
+    });
+    let before_start = insertion_index.saturating_sub(before_limit);
+    for message in &messages[before_start..insertion_index] {
+        if let Some(recovered) = recovered_slack_message(channel_id, message) {
+            collector.add(recovered, neighbor_relation);
+        }
+    }
+
+    if let (Some(index), Some(relation)) = (target_index, target_relation) {
+        if let Some(recovered) = recovered_slack_message(channel_id, &messages[index]) {
+            collector.add(recovered, relation);
+        }
+    }
+
+    let after_start = target_index.map_or(insertion_index, |index| index + 1);
+    let after_end = (after_start + after_limit).min(messages.len());
+    for message in &messages[after_start..after_end] {
+        if let Some(recovered) = recovered_slack_message(channel_id, message) {
+            collector.add(recovered, neighbor_relation);
+        }
+    }
+    target_index.is_some()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn add_complete_slack_after_window(
+    collector: &mut ContextCollector<'_>,
+    channel_id: &str,
+    response: &serde_json::Value,
+    after_limit: usize,
+    neighbor_relation: &str,
+    failure_operation: &str,
+    source_ref: &str,
+) {
+    if after_limit == 0 {
+        return;
+    }
+    if response["has_more"].as_bool() != Some(false) {
+        collector.failure(
+            failure_operation,
+            "window_truncated",
+            Some(source_ref.to_string()),
+        );
+        return;
+    }
+
+    for message in slack_response_messages(response)
+        .into_iter()
+        .take(after_limit)
+    {
+        if let Some(recovered) = recovered_slack_message(channel_id, &message) {
+            collector.add(recovered, neighbor_relation);
+        }
+    }
+}
+
+async fn recover_slack_link(
+    collector: &mut ContextCollector<'_>,
+    adapter: &SlackAdapter,
+    link: &SlackMessageLink,
+    config: &ContextRecoveryConfig,
+) {
+    let source_ref = format!("slack:{}:{}", link.channel_id, link.message_ts);
+    if let Some(thread_ts) = &link.thread_ts {
+        let fetch_limit = config
+            .history_limit
+            .saturating_mul(4)
+            .clamp(50, 200)
+            .to_string();
+        match adapter
+            .api_get(
+                "conversations.replies",
+                &[
+                    ("channel", link.channel_id.as_str()),
+                    ("ts", thread_ts.as_str()),
+                    ("limit", fetch_limit.as_str()),
+                    ("inclusive", "true"),
+                ],
+            )
+            .await
+        {
+            Ok(response) => {
+                let messages = slack_response_messages(&response);
+                let root = messages
+                    .iter()
+                    .find(|message| message["ts"].as_str() == Some(thread_ts.as_str()))
+                    .and_then(|message| recovered_slack_message(&link.channel_id, message));
+                if let Some(root) = root {
+                    collector.add(root, "thread_root");
+                } else {
+                    collector.failure(
+                        "thread_root",
+                        "target_not_found",
+                        Some(format!("slack:{}:{thread_ts}", link.channel_id)),
+                    );
+                }
+                let found = add_slack_window(
+                    collector,
+                    &link.channel_id,
+                    messages,
+                    &link.message_ts,
+                    config.link_neighbors,
+                    config.link_neighbors,
+                    Some("linked_target"),
+                    "linked_neighbor",
+                );
+                let truncated = response["has_more"].as_bool() == Some(true);
+                if !found {
+                    let code = if truncated {
+                        "window_truncated"
+                    } else {
+                        "target_not_found"
+                    };
+                    collector.failure("linked_target", code, Some(source_ref));
+                } else if truncated {
+                    collector.failure("linked_neighbors", "window_truncated", Some(source_ref));
+                }
+            }
+            Err(error) => {
+                debug!(
+                    channel_id = link.channel_id,
+                    message_ts = link.message_ts,
+                    error = %error,
+                    "Slack context recovery could not fetch linked thread"
+                );
+                collector.failure("linked_target", "api_error", Some(source_ref));
+            }
+        }
+        return;
+    }
+
+    match adapter
+        .api_get(
+            "conversations.history",
+            &[
+                ("channel", link.channel_id.as_str()),
+                ("oldest", link.message_ts.as_str()),
+                ("latest", link.message_ts.as_str()),
+                ("inclusive", "true"),
+                ("limit", "1"),
+            ],
+        )
+        .await
+    {
+        Ok(response) => {
+            let found = add_slack_window(
+                collector,
+                &link.channel_id,
+                slack_response_messages(&response),
+                &link.message_ts,
+                0,
+                0,
+                Some("linked_target"),
+                "linked_neighbor",
+            );
+            if !found {
+                collector.failure("linked_target", "target_not_found", Some(source_ref));
+                return;
+            }
+        }
+        Err(error) => {
+            debug!(
+                channel_id = link.channel_id,
+                message_ts = link.message_ts,
+                error = %error,
+                "Slack context recovery could not fetch linked target"
+            );
+            collector.failure("linked_target", "api_error", Some(source_ref));
+            return;
+        }
+    }
+
+    if config.link_neighbors > 0 {
+        let neighbor_limit = config.link_neighbors.to_string();
+        let before_params = [
+            ("channel", link.channel_id.as_str()),
+            ("latest", link.message_ts.as_str()),
+            ("inclusive", "false"),
+            ("limit", neighbor_limit.as_str()),
+        ];
+        match adapter
+            .api_get("conversations.history", &before_params)
+            .await
+        {
+            Ok(response) => {
+                for message in slack_response_messages(&response) {
+                    if let Some(recovered) = recovered_slack_message(&link.channel_id, &message) {
+                        collector.add(recovered, "linked_neighbor");
+                    }
+                }
+            }
+            Err(error) => {
+                debug!(
+                    channel_id = link.channel_id,
+                    message_ts = link.message_ts,
+                    direction = "before",
+                    error = %error,
+                    "Slack context recovery could not fetch linked neighbors"
+                );
+                collector.failure("linked_neighbors", "api_error", Some(source_ref.clone()));
+            }
+        }
+
+        let after_params = [
+            ("channel", link.channel_id.as_str()),
+            ("oldest", link.message_ts.as_str()),
+            ("inclusive", "false"),
+            ("limit", SLACK_CONTEXT_AFTER_FETCH_LIMIT),
+        ];
+        match adapter
+            .api_get("conversations.history", &after_params)
+            .await
+        {
+            Ok(response) => add_complete_slack_after_window(
+                collector,
+                &link.channel_id,
+                &response,
+                config.link_neighbors,
+                "linked_neighbor",
+                "linked_neighbors",
+                &source_ref,
+            ),
+            Err(error) => {
+                debug!(
+                    channel_id = link.channel_id,
+                    message_ts = link.message_ts,
+                    direction = "after",
+                    error = %error,
+                    "Slack context recovery could not fetch linked neighbors"
+                );
+                collector.failure("linked_neighbors", "api_error", Some(source_ref));
+            }
+        }
+    }
+}
+
+async fn recover_slack_context(
+    event: &serde_json::Value,
+    adapter: &SlackAdapter,
+    config: &ContextRecoveryConfig,
+    allow_all_channels: bool,
+    allowed_channels: &HashSet<String>,
+) -> Option<RecoveredContext> {
+    if !config.enabled {
+        return None;
+    }
+    let channel_id = event["channel"].as_str()?;
+    let message_ts = event["ts"].as_str()?;
+    if config.settle_delay_ms > 0 {
+        tokio::time::sleep(std::time::Duration::from_millis(config.settle_delay_ms)).await;
+    }
+
+    let mut collector = ContextCollector::new(config);
+    if let Some(thread_ts) = event["thread_ts"].as_str() {
+        let fetch_limit = config
+            .history_limit
+            .saturating_mul(4)
+            .clamp(50, 200)
+            .to_string();
+        match adapter
+            .api_get(
+                "conversations.replies",
+                &[
+                    ("channel", channel_id),
+                    ("ts", thread_ts),
+                    ("limit", fetch_limit.as_str()),
+                    ("inclusive", "true"),
+                ],
+            )
+            .await
+        {
+            Ok(response) => {
+                let messages = slack_response_messages(&response);
+                let root = messages
+                    .iter()
+                    .find(|message| message["ts"].as_str() == Some(thread_ts))
+                    .and_then(|message| recovered_slack_message(channel_id, message));
+                if let Some(root) = root {
+                    collector.add(root, "thread_root");
+                } else {
+                    collector.failure(
+                        "thread_root",
+                        "target_not_found",
+                        Some(format!("slack:{channel_id}:{thread_ts}")),
+                    );
+                }
+                let before_limit = config.history_limit.div_ceil(2);
+                let after_limit = config.history_limit / 2;
+                let found = add_slack_window(
+                    &mut collector,
+                    channel_id,
+                    messages,
+                    message_ts,
+                    before_limit,
+                    after_limit,
+                    None,
+                    "current_window",
+                );
+                if response["has_more"].as_bool() == Some(true) {
+                    collector.failure(
+                        "current_window",
+                        "window_truncated",
+                        Some(format!("slack:{channel_id}:{message_ts}")),
+                    );
+                } else if !found {
+                    collector.failure(
+                        "current_window",
+                        "target_not_found",
+                        Some(format!("slack:{channel_id}:{message_ts}")),
+                    );
+                }
+            }
+            Err(error) => {
+                debug!(
+                    channel_id,
+                    thread_ts,
+                    error = %error,
+                    "Slack context recovery could not fetch current thread"
+                );
+                collector.failure(
+                    "current_window",
+                    "api_error",
+                    Some(format!("slack:{channel_id}:{message_ts}")),
+                );
+            }
+        }
+    } else {
+        let before_limit = config.history_limit.div_ceil(2);
+        let after_limit = config.history_limit / 2;
+        if before_limit > 0 {
+            let before_limit = before_limit.to_string();
+            let before_params = [
+                ("channel", channel_id),
+                ("latest", message_ts),
+                ("inclusive", "false"),
+                ("limit", before_limit.as_str()),
+            ];
+            match adapter
+                .api_get("conversations.history", &before_params)
+                .await
+            {
+                Ok(response) => {
+                    for message in slack_response_messages(&response) {
+                        if let Some(recovered) = recovered_slack_message(channel_id, &message) {
+                            collector.add(recovered, "current_window");
+                        }
+                    }
+                }
+                Err(error) => {
+                    debug!(
+                        channel_id,
+                        message_ts,
+                        direction = "before",
+                        error = %error,
+                        "Slack context recovery could not fetch current window"
+                    );
+                    collector.failure(
+                        "current_window",
+                        "api_error",
+                        Some(format!("slack:{channel_id}:{message_ts}")),
+                    );
+                }
+            }
+        }
+        if after_limit > 0 {
+            let after_params = [
+                ("channel", channel_id),
+                ("oldest", message_ts),
+                ("inclusive", "false"),
+                ("limit", SLACK_CONTEXT_AFTER_FETCH_LIMIT),
+            ];
+            match adapter
+                .api_get("conversations.history", &after_params)
+                .await
+            {
+                Ok(response) => add_complete_slack_after_window(
+                    &mut collector,
+                    channel_id,
+                    &response,
+                    after_limit,
+                    "current_window",
+                    "current_window",
+                    &format!("slack:{channel_id}:{message_ts}"),
+                ),
+                Err(error) => {
+                    debug!(
+                        channel_id,
+                        message_ts,
+                        direction = "after",
+                        error = %error,
+                        "Slack context recovery could not fetch current window"
+                    );
+                    collector.failure(
+                        "current_window",
+                        "api_error",
+                        Some(format!("slack:{channel_id}:{message_ts}")),
+                    );
+                }
+            }
+        }
+    }
+
+    let links = slack_message_links(
+        event["text"].as_str().unwrap_or_default(),
+        config.link_limit,
+    );
+    let workspace_host = if links.is_empty() {
+        None
+    } else {
+        adapter.get_workspace_host().await
+    };
+    for link in links {
+        if workspace_host != Some(link.workspace.as_str()) {
+            collector.failure(
+                "linked_target",
+                if workspace_host.is_some() {
+                    "disallowed_workspace"
+                } else {
+                    "workspace_unverified"
+                },
+                Some(format!("slack:{}:{}", link.channel_id, link.message_ts)),
+            );
+            continue;
+        }
+        if !allow_all_channels && !allowed_channels.contains(&link.channel_id) {
+            collector.failure(
+                "linked_target",
+                "disallowed_target",
+                Some(format!("slack:{}:{}", link.channel_id, link.message_ts)),
+            );
+            continue;
+        }
+        recover_slack_link(&mut collector, adapter, &link, config).await;
+    }
+
+    collector.finish()
+}
+
 /// Call apps.connections.open to get a WebSocket URL for Socket Mode.
 async fn get_socket_mode_url(app_token: &str) -> Result<String> {
     let client = reqwest::Client::new();
@@ -1067,6 +1604,7 @@ async fn handle_message(
     allowed_channels: &HashSet<String>,
     allowed_users: &HashSet<String>,
     stt_config: &SttConfig,
+    context_recovery: &ContextRecoveryConfig,
     inbound_attachment_content_blocks: bool,
     dispatcher: &Arc<crate::dispatch::Dispatcher>,
 ) {
@@ -1299,6 +1837,14 @@ async fn handle_message(
         timestamp: Some(crate::timestamp::slack_ts_to_iso8601(&ts)),
         message_id: Some(ts.clone()),
         receiver_id: bot_id.map(|id| id.to_string()),
+        recovered_context: recover_slack_context(
+            event,
+            adapter,
+            context_recovery,
+            allow_all_channels,
+            allowed_channels,
+        )
+        .await,
     };
 
     let trigger_msg = MessageRef {
@@ -1649,6 +2195,161 @@ mod tests {
     use super::*;
     use crate::adapter::ChatAdapter;
     use serde_json::json;
+
+    fn recovery_config() -> ContextRecoveryConfig {
+        ContextRecoveryConfig {
+            enabled: true,
+            history_limit: 12,
+            link_limit: 4,
+            link_neighbors: 2,
+            max_message_chars: 2_000,
+            max_total_chars: 12_000,
+            settle_delay_ms: 0,
+        }
+    }
+
+    #[test]
+    fn recovered_message_preserves_thread_and_attachment_count() {
+        let message = json!({
+            "ts": "1721234567.123456",
+            "thread_ts": "1721234000.654321",
+            "user": "U123",
+            "text": "context",
+            "files": [{"id": "F1"}],
+            "attachments": [{"id": "A1"}]
+        });
+        let recovered = recovered_slack_message("C123", &message).unwrap();
+        assert_eq!(recovered.message_id, "1721234567.123456");
+        assert_eq!(recovered.thread_id.as_deref(), Some("1721234000.654321"));
+        assert_eq!(recovered.sender_id.as_deref(), Some("U123"));
+        assert_eq!(recovered.attachment_count, 2);
+    }
+
+    #[test]
+    fn slack_window_selects_target_and_bounded_neighbors() {
+        let cfg = recovery_config();
+        let mut collector = ContextCollector::new(&cfg);
+        let messages = (1..=5)
+            .map(|index| {
+                json!({
+                    "ts": format!("172123400{index}.000001"),
+                    "user": "U123",
+                    "text": format!("message-{index}")
+                })
+            })
+            .collect();
+        assert!(add_slack_window(
+            &mut collector,
+            "C123",
+            messages,
+            "1721234003.000001",
+            1,
+            1,
+            Some("linked_target"),
+            "linked_neighbor",
+        ));
+        let context = collector.finish().unwrap();
+        let ids: Vec<_> = context
+            .messages
+            .iter()
+            .map(|message| message.message_id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                "1721234002.000001",
+                "1721234003.000001",
+                "1721234004.000001"
+            ]
+        );
+        assert_eq!(context.messages[1].relations, vec!["linked_target"]);
+    }
+
+    #[test]
+    fn linked_after_window_does_not_present_distant_messages_when_truncated() {
+        let cfg = recovery_config();
+        let mut collector = ContextCollector::new(&cfg);
+        let response = json!({
+            "has_more": true,
+            "messages": [
+                {"ts": "1721234999.000001", "user": "U123", "text": "distant-20"},
+                {"ts": "1721234998.000001", "user": "U123", "text": "distant-19"}
+            ]
+        });
+        add_complete_slack_after_window(
+            &mut collector,
+            "C123",
+            &response,
+            2,
+            "linked_neighbor",
+            "linked_neighbors",
+            "slack:C123:1721234000.000001",
+        );
+        let context = collector.finish().unwrap();
+        assert!(context.messages.is_empty());
+        assert!(context.incomplete);
+        assert_eq!(context.failures[0].operation, "linked_neighbors");
+        assert_eq!(context.failures[0].code, "window_truncated");
+    }
+
+    #[test]
+    fn current_after_window_does_not_present_distant_messages_when_truncated() {
+        let cfg = recovery_config();
+        let mut collector = ContextCollector::new(&cfg);
+        let response = json!({
+            "has_more": true,
+            "messages": [
+                {"ts": "1721234999.000001", "user": "U123", "text": "distant-20"},
+                {"ts": "1721234998.000001", "user": "U123", "text": "distant-19"}
+            ]
+        });
+        add_complete_slack_after_window(
+            &mut collector,
+            "C123",
+            &response,
+            2,
+            "current_window",
+            "current_window",
+            "slack:C123:1721234000.000001",
+        );
+        let context = collector.finish().unwrap();
+        assert!(context.messages.is_empty());
+        assert!(context.incomplete);
+        assert_eq!(context.failures[0].operation, "current_window");
+        assert_eq!(context.failures[0].code, "window_truncated");
+    }
+
+    #[test]
+    fn complete_after_window_selects_nearest_messages_in_timestamp_order() {
+        let cfg = recovery_config();
+        let mut collector = ContextCollector::new(&cfg);
+        let response = json!({
+            "has_more": false,
+            "messages": [
+                {"ts": "1721234004.000001", "user": "U123", "text": "after-4"},
+                {"ts": "1721234003.000001", "user": "U123", "text": "after-3"},
+                {"ts": "1721234002.000001", "user": "U123", "text": "after-2"},
+                {"ts": "1721234001.000001", "user": "U123", "text": "after-1"}
+            ]
+        });
+        add_complete_slack_after_window(
+            &mut collector,
+            "C123",
+            &response,
+            2,
+            "current_window",
+            "current_window",
+            "slack:C123:1721234000.000001",
+        );
+        let context = collector.finish().unwrap();
+        let ids: Vec<_> = context
+            .messages
+            .iter()
+            .map(|message| message.message_id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["1721234001.000001", "1721234002.000001"]);
+        assert!(!context.incomplete);
+    }
 
     /// Bot's own `<@UID>` trigger mention is stripped.
     #[test]

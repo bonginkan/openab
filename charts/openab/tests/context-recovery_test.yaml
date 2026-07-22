@@ -1,0 +1,59 @@
+suite: context recovery config
+templates:
+  - templates/configmap.yaml
+tests:
+  - it: discord renders the bounded context recovery table
+    set:
+      agents.kiro.discord.contextRecovery.enabled: true
+      agents.kiro.discord.contextRecovery.historyLimit: 20
+      agents.kiro.discord.contextRecovery.linkLimit: 5
+      agents.kiro.discord.contextRecovery.linkNeighbors: 3
+      agents.kiro.discord.contextRecovery.maxMessageChars: 3000
+      agents.kiro.discord.contextRecovery.maxTotalChars: 15000
+      agents.kiro.discord.contextRecovery.settleDelayMs: 400
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: '\[discord\.context_recovery\]'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'enabled = true'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'history_limit = 20'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'link_limit = 5'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'link_neighbors = 3'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'max_message_chars = 3000'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'max_total_chars = 15000'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'settle_delay_ms = 400'
+
+  - it: slack renders the bounded context recovery table
+    set:
+      agents.kiro.slack.enabled: true
+      agents.kiro.slack.botToken: xoxb-x
+      agents.kiro.slack.appToken: xapp-x
+      agents.kiro.slack.contextRecovery.enabled: true
+      agents.kiro.slack.contextRecovery.historyLimit: 8
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: '\[slack\.context_recovery\]'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'history_limit = 8'
+
+  - it: omits context recovery tables when not configured
+    asserts:
+      - notMatchRegex:
+          path: data["config.toml"]
+          pattern: 'context_recovery'
