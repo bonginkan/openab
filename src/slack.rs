@@ -1,5 +1,5 @@
 use crate::acp::ContentBlock;
-use crate::adapter::{ChannelRef, ChatAdapter, MessageRef, SenderContext};
+use crate::adapter::{ChannelRef, ChatAdapter, MessageRef, OutboundAttachment, SenderContext};
 use crate::bot_turns::{BotTurnTracker, TurnAction, TurnSeverity};
 use crate::config::{AllowBots, AllowUsers, SttConfig};
 use crate::media;
@@ -13,6 +13,12 @@ use tokio_tungstenite::tungstenite;
 use tracing::{debug, error, info, warn};
 
 const SLACK_API: &str = "https://slack.com/api";
+
+#[derive(Debug, Clone)]
+struct SlackCompletedUploadFile {
+    id: String,
+    title: String,
+}
 
 /// Map Unicode emoji to Slack short names for reactions API.
 /// Only covers the default `[reactions.emojis]` set. Custom emoji configured
@@ -336,6 +342,45 @@ impl SlackAdapter {
         cache.insert(thread_ts.to_string(), tokio::time::Instant::now());
         enforce_cache_bounds(&mut cache, self.session_ttl);
     }
+
+    async fn request_external_upload_url(
+        &self,
+        filename: &str,
+        length: usize,
+    ) -> Result<(String, String)> {
+        let resp = self
+            .api_post(
+                "files.getUploadURLExternal",
+                serde_json::json!({
+                    "filename": filename,
+                    "length": length,
+                }),
+            )
+            .await?;
+        let upload_url = resp["upload_url"]
+            .as_str()
+            .ok_or_else(|| anyhow!("no upload_url in files.getUploadURLExternal response"))?;
+        let file_id = resp["file_id"]
+            .as_str()
+            .ok_or_else(|| anyhow!("no file_id in files.getUploadURLExternal response"))?;
+        Ok((upload_url.to_string(), file_id.to_string()))
+    }
+
+    async fn upload_external_file_bytes(&self, upload_url: &str, data: Vec<u8>) -> Result<()> {
+        let resp = self
+            .client
+            .post(upload_url)
+            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+            .body(data)
+            .send()
+            .await?;
+        let status = resp.status();
+        anyhow::ensure!(
+            status.is_success(),
+            "Slack external file upload failed: HTTP {status}"
+        );
+        Ok(())
+    }
 }
 
 /// Shared eviction policy for positive-only caches.
@@ -390,6 +435,55 @@ impl ChatAdapter for SlackAdapter {
                 origin_event_id: None,
             },
             message_id: ts.to_string(),
+        })
+    }
+
+    async fn send_attachments(
+        &self,
+        channel: &ChannelRef,
+        content: &str,
+        attachments: Vec<OutboundAttachment>,
+        reply_to_message_id: Option<&str>,
+    ) -> Result<MessageRef> {
+        anyhow::ensure!(!attachments.is_empty(), "no Slack attachments to upload");
+
+        let mut completed_files = Vec::with_capacity(attachments.len());
+        for attachment in attachments {
+            let (upload_url, file_id) = self
+                .request_external_upload_url(&attachment.filename, attachment.data.len())
+                .await?;
+            self.upload_external_file_bytes(&upload_url, attachment.data)
+                .await?;
+            completed_files.push(SlackCompletedUploadFile {
+                id: file_id,
+                title: attachment.filename,
+            });
+        }
+
+        let thread_ts = slack_upload_thread_ts(channel.thread_id.as_deref(), reply_to_message_id);
+        let body =
+            slack_complete_upload_body(&channel.channel_id, thread_ts, content, &completed_files);
+        let resp = self.api_post("files.completeUploadExternal", body).await?;
+        let message_id = extract_slack_file_share_ts(&resp, &channel.channel_id)
+            .or(thread_ts)
+            .or_else(|| {
+                resp["files"]
+                    .as_array()
+                    .and_then(|files| files.first())
+                    .and_then(|file| file["id"].as_str())
+            })
+            .unwrap_or_default()
+            .to_string();
+
+        Ok(MessageRef {
+            channel: ChannelRef {
+                platform: "slack".into(),
+                channel_id: channel.channel_id.clone(),
+                thread_id: channel.thread_id.clone(),
+                parent_id: None,
+                origin_event_id: None,
+            },
+            message_id,
         })
     }
 
@@ -1305,6 +1399,86 @@ fn bot_id_matches_trusted(
         || resolved_user_id.is_some_and(|uid| trusted_bot_ids.contains(uid))
 }
 
+fn slack_upload_thread_ts<'a>(
+    channel_thread_ts: Option<&'a str>,
+    reply_to_message_id: Option<&'a str>,
+) -> Option<&'a str> {
+    channel_thread_ts
+        .filter(|ts| !ts.is_empty())
+        .or_else(|| reply_to_message_id.filter(|ts| !ts.is_empty()))
+}
+
+fn slack_complete_upload_body(
+    channel_id: &str,
+    thread_ts: Option<&str>,
+    content: &str,
+    files: &[SlackCompletedUploadFile],
+) -> serde_json::Value {
+    let uploaded_files: Vec<_> = files
+        .iter()
+        .map(|file| {
+            serde_json::json!({
+                "id": file.id,
+                "title": file.title,
+            })
+        })
+        .collect();
+    let mut body = serde_json::json!({
+        "channel_id": channel_id,
+        "files": uploaded_files,
+    });
+    if let Some(thread_ts) = thread_ts.filter(|ts| !ts.is_empty()) {
+        body["thread_ts"] = serde_json::Value::String(thread_ts.to_string());
+    }
+    if !content.is_empty() {
+        body["initial_comment"] = serde_json::Value::String(markdown_to_mrkdwn(content));
+    }
+    body
+}
+
+fn extract_slack_file_share_ts<'a>(
+    complete_upload_response: &'a serde_json::Value,
+    channel_id: &str,
+) -> Option<&'a str> {
+    if let Some(files) = complete_upload_response["files"].as_array() {
+        for file in files {
+            if let Some(ts) = extract_slack_file_share_ts_from_file(file, channel_id) {
+                return Some(ts);
+            }
+        }
+    }
+    extract_slack_file_share_ts_from_file(&complete_upload_response["file"], channel_id)
+}
+
+fn extract_slack_file_share_ts_from_file<'a>(
+    file: &'a serde_json::Value,
+    channel_id: &str,
+) -> Option<&'a str> {
+    for visibility in ["public", "private"] {
+        let Some(shares) = file["shares"][visibility].as_object() else {
+            continue;
+        };
+        if let Some(ts) = shares
+            .get(channel_id)
+            .and_then(|entries| entries.as_array())
+            .and_then(|entries| entries.first())
+            .and_then(|entry| entry["ts"].as_str())
+        {
+            return Some(ts);
+        }
+        for entries in shares.values() {
+            if let Some(ts) = entries
+                .as_array()
+                .and_then(|entries| entries.first())
+                .and_then(|entry| entry["ts"].as_str())
+            {
+                return Some(ts);
+            }
+        }
+    }
+    None
+}
+
 /// True only when a Slack non-bot event represents a real user message
 /// that should reset the bot-turn counter.
 ///
@@ -1653,6 +1827,101 @@ mod tests {
     fn trusted_bot_ids_rejects_empty_event_bot_id() {
         let trusted = HashSet::from(["".to_string()]);
         assert!(!bot_id_matches_trusted(&trusted, "", None));
+    }
+
+    // --- outbound Slack upload tests ---
+
+    #[test]
+    fn upload_thread_ts_prefers_existing_thread() {
+        assert_eq!(
+            slack_upload_thread_ts(Some("111.000001"), Some("222.000002")),
+            Some("111.000001")
+        );
+    }
+
+    #[test]
+    fn upload_thread_ts_falls_back_to_reply_target() {
+        assert_eq!(
+            slack_upload_thread_ts(None, Some("222.000002")),
+            Some("222.000002")
+        );
+    }
+
+    #[test]
+    fn complete_upload_body_sets_channel_thread_comment_and_files() {
+        let files = vec![
+            SlackCompletedUploadFile {
+                id: "F111".into(),
+                title: "report.pdf".into(),
+            },
+            SlackCompletedUploadFile {
+                id: "F222".into(),
+                title: "chart.png".into(),
+            },
+        ];
+        let body = slack_complete_upload_body("C123", Some("111.000001"), "**done**", &files);
+
+        assert_eq!(body["channel_id"], "C123");
+        assert_eq!(body["thread_ts"], "111.000001");
+        assert_eq!(body["initial_comment"], "*done*");
+        assert_eq!(body["files"][0]["id"], "F111");
+        assert_eq!(body["files"][0]["title"], "report.pdf");
+        assert_eq!(body["files"][1]["id"], "F222");
+        assert_eq!(body["files"][1]["title"], "chart.png");
+    }
+
+    #[test]
+    fn complete_upload_body_omits_empty_comment_and_thread() {
+        let files = vec![SlackCompletedUploadFile {
+            id: "F111".into(),
+            title: "report.pdf".into(),
+        }];
+        let body = slack_complete_upload_body("C123", None, "", &files);
+
+        assert!(body.get("thread_ts").is_none());
+        assert!(body.get("initial_comment").is_none());
+        assert_eq!(body["files"][0]["id"], "F111");
+    }
+
+    #[test]
+    fn extract_file_share_ts_prefers_target_public_channel() {
+        let resp = serde_json::json!({
+            "ok": true,
+            "files": [{
+                "id": "F111",
+                "shares": {
+                    "public": {
+                        "C999": [{ "ts": "999.000009" }],
+                        "C123": [{ "ts": "123.000001" }]
+                    }
+                }
+            }]
+        });
+
+        assert_eq!(
+            extract_slack_file_share_ts(&resp, "C123"),
+            Some("123.000001")
+        );
+    }
+
+    #[test]
+    fn extract_file_share_ts_handles_private_share() {
+        let resp = serde_json::json!({
+            "ok": true,
+            "files": [{
+                "id": "F111",
+                "shares": {
+                    "private": {
+                        "G123": [{ "ts": "123.000001" }]
+                    }
+                }
+            }]
+        });
+
+        assert_eq!(
+            extract_slack_file_share_ts(&resp, "G123"),
+            Some("123.000001")
+        );
     }
 
     /// Per-thread streaming: ON by default, OFF when another bot is present (#534).
