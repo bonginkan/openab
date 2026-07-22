@@ -83,7 +83,8 @@ working_dir = "/home/agent"
 
 # [attachments]
 # enabled = false
-# # Enable agent-generated image uploads via [[attach_image:path]] output directives.
+# # Enable agent-generated file/image uploads via [[attach_image:path]]
+# # and [[attach_file:path]] output directives.
 # # Empty allowed_dirs means only [agent].working_dir is allowed.
 # # For Codex image generation, include "/home/node/.codex/generated_images".
 # # allowed_dirs = ["/home/agent"]

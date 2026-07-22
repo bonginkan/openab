@@ -8,7 +8,7 @@ allowed_users = ["U0AN2L7FQLE"]
 allow_bot_messages = "mentions"
 trusted_bot_ids = []
 allow_user_messages = "multibot-mentions"
-max_bot_turns = 100
+max_bot_turns = 10000
 
 [agent]
 # Local patched fork of codex-acp with mid-turn steering (bonginkan/codex-acp).

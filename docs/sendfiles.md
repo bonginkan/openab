@@ -281,4 +281,4 @@ A: Not currently. OpenAB streams text via ACP JSON-RPC. File sending is done out
 A: OpenAB does not impose its own byte-size cap, but destination platforms still enforce upload limits. Use the [Large Files & Enterprise Best Practice](#large-files--enterprise-best-practice) pattern when the platform rejects the upload.
 
 **Q: Does this work with Slack / Telegram / LINE?**
-A: Same concept — call the platform's file upload API using the channel ID from `sender_context`. API details differ per platform. For Slack, use [`files.upload`](https://api.slack.com/methods/files.upload). For Telegram, use [`sendDocument`](https://core.telegram.org/bots/api#senddocument).
+A: Same concept — call the platform's file upload API using the channel ID from `sender_context`. API details differ per platform. OpenAB supports Slack via [`files.getUploadURLExternal`](https://docs.slack.dev/reference/methods/files.getUploadURLExternal/) followed by [`files.completeUploadExternal`](https://docs.slack.dev/reference/methods/files.completeUploadExternal/). For Telegram, use [`sendDocument`](https://core.telegram.org/bots/api#senddocument).

@@ -46,6 +46,7 @@ Socket Mode uses a persistent WebSocket connection — no public URL or ingress 
 | `groups:read` | List private channels |
 | `reactions:write` | Add/remove emoji reactions |
 | `files:read` | Download file attachments (images, audio) |
+| `files:write` | Upload outbound file attachments |
 | `users:read` | Resolve user display names |
 
 ## 5. Install to Workspace

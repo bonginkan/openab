@@ -35,11 +35,11 @@ Each agent lives under `agents.<name>`.
 | `slack.allowedUsers` | Slack user allowlist. Empty means allow all users by default. | `[]` |
 | `nameOverride` | Override this agent's generated resource name. | `""` |
 | `workingDir` | Working directory and HOME inside the container. | `"/home/agent"` |
-| `attachments.enabled` | Enable agent-generated image uploads via `[[attach_image:path]]`. | `false` |
-| `attachments.allowedDirs` | Directories OpenAB may read outbound images from. Empty = `workingDir` only. | `[]` |
+| `attachments.enabled` | Enable agent-generated file/image uploads via `[[attach_image:path]]` and `[[attach_file:path]]`. | `false` |
+| `attachments.allowedDirs` | Directories OpenAB may read outbound files from. Empty = `workingDir` only. | `[]` |
 | `attachments.autoStageGeneratedImages` | Move generated images from known staging folders into `autoStageDir` before upload. | `false` |
 | `attachments.autoStageDir` | Destination for auto-staged generated images. Must be inside `allowedDirs`. | `""` |
-| `attachments.maxFiles` | Maximum outbound images per response. | `10` |
+| `attachments.maxFiles` | Maximum outbound files per response. | `10` |
 | `env` | Inline environment variables passed to the agent process. | `{}` |
 | `envFrom` | Additional environment sources from existing Secrets or ConfigMaps. | `[]` |
 | `pool.maxSessions` | Maximum concurrent ACP sessions for the agent. | `10` |
