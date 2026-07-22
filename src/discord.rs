@@ -2306,6 +2306,7 @@ fn discord_context_guild_channel_allowed(
     actual_guild_id: u64,
     expected_guild_id: u64,
     target_channel_id: u64,
+    is_thread: bool,
     parent_channel_id: Option<u64>,
     allow_all_channels: bool,
     allowed_channels: &HashSet<u64>,
@@ -2313,7 +2314,8 @@ fn discord_context_guild_channel_allowed(
     actual_guild_id == expected_guild_id
         && (allow_all_channels
             || allowed_channels.contains(&target_channel_id)
-            || parent_channel_id.is_some_and(|parent| allowed_channels.contains(&parent)))
+            || (is_thread
+                && parent_channel_id.is_some_and(|parent| allowed_channels.contains(&parent))))
 }
 
 async fn discord_context_target_allowed(
@@ -2350,6 +2352,7 @@ async fn discord_context_target_allowed(
                 channel.guild_id.get(),
                 target_guild_id,
                 target_channel_id.get(),
+                channel.thread_metadata.is_some(),
                 channel.parent_id.map(|parent| parent.get()),
                 allow_all_channels,
                 allowed_channels,
@@ -3601,6 +3604,7 @@ mod tests {
             2,
             1,
             20,
+            false,
             None,
             true,
             &HashSet::new(),
@@ -3613,6 +3617,20 @@ mod tests {
             1,
             1,
             20,
+            true,
+            Some(10),
+            false,
+            &HashSet::from([10]),
+        ));
+    }
+
+    #[test]
+    fn context_link_rejects_category_child_when_only_parent_is_allowlisted() {
+        assert!(!discord_context_guild_channel_allowed(
+            1,
+            1,
+            20,
+            false,
             Some(10),
             false,
             &HashSet::from([10]),

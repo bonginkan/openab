@@ -17,6 +17,9 @@ use tracing::{debug, error, info, warn};
 
 const SLACK_API: &str = "https://slack.com/api";
 const SLACK_EVENT_DEDUPE_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+// Slack returns at most 100 messages for a time-bounded history query. After-side
+// context is only usable when this complete page reaches the target boundary.
+const SLACK_CONTEXT_AFTER_FETCH_LIMIT: &str = "100";
 
 #[derive(Debug, Clone)]
 struct SlackCompletedUploadFile {
@@ -1157,6 +1160,38 @@ fn add_slack_window(
     target_index.is_some()
 }
 
+#[allow(clippy::too_many_arguments)]
+fn add_complete_slack_after_window(
+    collector: &mut ContextCollector<'_>,
+    channel_id: &str,
+    response: &serde_json::Value,
+    after_limit: usize,
+    neighbor_relation: &str,
+    failure_operation: &str,
+    source_ref: &str,
+) {
+    if after_limit == 0 {
+        return;
+    }
+    if response["has_more"].as_bool() != Some(false) {
+        collector.failure(
+            failure_operation,
+            "window_truncated",
+            Some(source_ref.to_string()),
+        );
+        return;
+    }
+
+    for message in slack_response_messages(response)
+        .into_iter()
+        .take(after_limit)
+    {
+        if let Some(recovered) = recovered_slack_message(channel_id, &message) {
+            collector.add(recovered, neighbor_relation);
+        }
+    }
+}
+
 async fn recover_slack_link(
     collector: &mut ContextCollector<'_>,
     adapter: &SlackAdapter,
@@ -1273,34 +1308,65 @@ async fn recover_slack_link(
         }
     }
 
-    let neighbor_limit = config.link_neighbors.to_string();
     if config.link_neighbors > 0 {
-        for (bound, direction) in [("latest", "before"), ("oldest", "after")] {
-            let params = [
-                ("channel", link.channel_id.as_str()),
-                (bound, link.message_ts.as_str()),
-                ("inclusive", "false"),
-                ("limit", neighbor_limit.as_str()),
-            ];
-            match adapter.api_get("conversations.history", &params).await {
-                Ok(response) => {
-                    for message in slack_response_messages(&response) {
-                        if let Some(recovered) = recovered_slack_message(&link.channel_id, &message)
-                        {
-                            collector.add(recovered, "linked_neighbor");
-                        }
+        let neighbor_limit = config.link_neighbors.to_string();
+        let before_params = [
+            ("channel", link.channel_id.as_str()),
+            ("latest", link.message_ts.as_str()),
+            ("inclusive", "false"),
+            ("limit", neighbor_limit.as_str()),
+        ];
+        match adapter
+            .api_get("conversations.history", &before_params)
+            .await
+        {
+            Ok(response) => {
+                for message in slack_response_messages(&response) {
+                    if let Some(recovered) = recovered_slack_message(&link.channel_id, &message) {
+                        collector.add(recovered, "linked_neighbor");
                     }
                 }
-                Err(error) => {
-                    debug!(
-                        channel_id = link.channel_id,
-                        message_ts = link.message_ts,
-                        direction,
-                        error = %error,
-                        "Slack context recovery could not fetch linked neighbors"
-                    );
-                    collector.failure("linked_neighbors", "api_error", Some(source_ref.clone()));
-                }
+            }
+            Err(error) => {
+                debug!(
+                    channel_id = link.channel_id,
+                    message_ts = link.message_ts,
+                    direction = "before",
+                    error = %error,
+                    "Slack context recovery could not fetch linked neighbors"
+                );
+                collector.failure("linked_neighbors", "api_error", Some(source_ref.clone()));
+            }
+        }
+
+        let after_params = [
+            ("channel", link.channel_id.as_str()),
+            ("oldest", link.message_ts.as_str()),
+            ("inclusive", "false"),
+            ("limit", SLACK_CONTEXT_AFTER_FETCH_LIMIT),
+        ];
+        match adapter
+            .api_get("conversations.history", &after_params)
+            .await
+        {
+            Ok(response) => add_complete_slack_after_window(
+                collector,
+                &link.channel_id,
+                &response,
+                config.link_neighbors,
+                "linked_neighbor",
+                "linked_neighbors",
+                &source_ref,
+            ),
+            Err(error) => {
+                debug!(
+                    channel_id = link.channel_id,
+                    message_ts = link.message_ts,
+                    direction = "after",
+                    error = %error,
+                    "Slack context recovery could not fetch linked neighbors"
+                );
+                collector.failure("linked_neighbors", "api_error", Some(source_ref));
             }
         }
     }
@@ -1399,18 +1465,18 @@ async fn recover_slack_context(
     } else {
         let before_limit = config.history_limit.div_ceil(2);
         let after_limit = config.history_limit / 2;
-        for (bound, limit) in [("latest", before_limit), ("oldest", after_limit)] {
-            if limit == 0 {
-                continue;
-            }
-            let limit = limit.to_string();
-            let params = [
+        if before_limit > 0 {
+            let before_limit = before_limit.to_string();
+            let before_params = [
                 ("channel", channel_id),
-                (bound, message_ts),
+                ("latest", message_ts),
                 ("inclusive", "false"),
-                ("limit", limit.as_str()),
+                ("limit", before_limit.as_str()),
             ];
-            match adapter.api_get("conversations.history", &params).await {
+            match adapter
+                .api_get("conversations.history", &before_params)
+                .await
+            {
                 Ok(response) => {
                     for message in slack_response_messages(&response) {
                         if let Some(recovered) = recovered_slack_message(channel_id, &message) {
@@ -1422,7 +1488,43 @@ async fn recover_slack_context(
                     debug!(
                         channel_id,
                         message_ts,
-                        bound,
+                        direction = "before",
+                        error = %error,
+                        "Slack context recovery could not fetch current window"
+                    );
+                    collector.failure(
+                        "current_window",
+                        "api_error",
+                        Some(format!("slack:{channel_id}:{message_ts}")),
+                    );
+                }
+            }
+        }
+        if after_limit > 0 {
+            let after_params = [
+                ("channel", channel_id),
+                ("oldest", message_ts),
+                ("inclusive", "false"),
+                ("limit", SLACK_CONTEXT_AFTER_FETCH_LIMIT),
+            ];
+            match adapter
+                .api_get("conversations.history", &after_params)
+                .await
+            {
+                Ok(response) => add_complete_slack_after_window(
+                    &mut collector,
+                    channel_id,
+                    &response,
+                    after_limit,
+                    "current_window",
+                    "current_window",
+                    &format!("slack:{channel_id}:{message_ts}"),
+                ),
+                Err(error) => {
+                    debug!(
+                        channel_id,
+                        message_ts,
+                        direction = "after",
                         error = %error,
                         "Slack context recovery could not fetch current window"
                     );
@@ -2161,6 +2263,92 @@ mod tests {
             ]
         );
         assert_eq!(context.messages[1].relations, vec!["linked_target"]);
+    }
+
+    #[test]
+    fn linked_after_window_does_not_present_distant_messages_when_truncated() {
+        let cfg = recovery_config();
+        let mut collector = ContextCollector::new(&cfg);
+        let response = json!({
+            "has_more": true,
+            "messages": [
+                {"ts": "1721234999.000001", "user": "U123", "text": "distant-20"},
+                {"ts": "1721234998.000001", "user": "U123", "text": "distant-19"}
+            ]
+        });
+        add_complete_slack_after_window(
+            &mut collector,
+            "C123",
+            &response,
+            2,
+            "linked_neighbor",
+            "linked_neighbors",
+            "slack:C123:1721234000.000001",
+        );
+        let context = collector.finish().unwrap();
+        assert!(context.messages.is_empty());
+        assert!(context.incomplete);
+        assert_eq!(context.failures[0].operation, "linked_neighbors");
+        assert_eq!(context.failures[0].code, "window_truncated");
+    }
+
+    #[test]
+    fn current_after_window_does_not_present_distant_messages_when_truncated() {
+        let cfg = recovery_config();
+        let mut collector = ContextCollector::new(&cfg);
+        let response = json!({
+            "has_more": true,
+            "messages": [
+                {"ts": "1721234999.000001", "user": "U123", "text": "distant-20"},
+                {"ts": "1721234998.000001", "user": "U123", "text": "distant-19"}
+            ]
+        });
+        add_complete_slack_after_window(
+            &mut collector,
+            "C123",
+            &response,
+            2,
+            "current_window",
+            "current_window",
+            "slack:C123:1721234000.000001",
+        );
+        let context = collector.finish().unwrap();
+        assert!(context.messages.is_empty());
+        assert!(context.incomplete);
+        assert_eq!(context.failures[0].operation, "current_window");
+        assert_eq!(context.failures[0].code, "window_truncated");
+    }
+
+    #[test]
+    fn complete_after_window_selects_nearest_messages_in_timestamp_order() {
+        let cfg = recovery_config();
+        let mut collector = ContextCollector::new(&cfg);
+        let response = json!({
+            "has_more": false,
+            "messages": [
+                {"ts": "1721234004.000001", "user": "U123", "text": "after-4"},
+                {"ts": "1721234003.000001", "user": "U123", "text": "after-3"},
+                {"ts": "1721234002.000001", "user": "U123", "text": "after-2"},
+                {"ts": "1721234001.000001", "user": "U123", "text": "after-1"}
+            ]
+        });
+        add_complete_slack_after_window(
+            &mut collector,
+            "C123",
+            &response,
+            2,
+            "current_window",
+            "current_window",
+            "slack:C123:1721234000.000001",
+        );
+        let context = collector.finish().unwrap();
+        let ids: Vec<_> = context
+            .messages
+            .iter()
+            .map(|message| message.message_id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["1721234001.000001", "1721234002.000001"]);
+        assert!(!context.incomplete);
     }
 
     /// Bot's own `<@UID>` trigger mention is stripped.
