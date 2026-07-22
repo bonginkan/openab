@@ -9,6 +9,7 @@ use crate::context_recovery::{
     discord_message_links, ContextCollector, DiscordMessageLink, RecoveredContext, RecoveredMessage,
 };
 use crate::format;
+use crate::ingress_audit::{IngressAuditGuard, IngressAuditRecord, IngressDecision};
 use crate::media;
 use crate::remind::{self, ReminderStore};
 use async_trait::async_trait;
@@ -403,6 +404,19 @@ impl Handler {
 #[serenity::async_trait]
 impl EventHandler for Handler {
     async fn message(&self, ctx: Context, msg: Message) {
+        let mut audit = IngressAuditGuard::new(IngressAuditRecord::new(
+            "discord",
+            msg.id.to_string(),
+            msg.channel_id.to_string(),
+            None,
+            msg.guild_id.map(|id| id.to_string()),
+            msg.author.id.to_string(),
+            msg.author.bot,
+            msg.timestamp.to_rfc3339(),
+            "message",
+            msg.content.chars().count(),
+            msg.attachments.len(),
+        ));
         let bot_id = ctx.cache.current_user().id;
 
         if !self.guild_allowed(msg.guild_id.map(|id| id.get())) {
@@ -411,6 +425,7 @@ impl EventHandler for Handler {
                 channel_id = %msg.channel_id,
                 "message ignored from disallowed guild"
             );
+            audit.finish(IngressDecision::GuildDenied);
             return;
         }
 
@@ -437,7 +452,10 @@ impl EventHandler for Handler {
             if msg.author.bot {
                 match tracker.classify_bot_message(&thread_key) {
                     TurnAction::Continue => {}
-                    TurnAction::SilentStop => return,
+                    TurnAction::SilentStop => {
+                        audit.finish(IngressDecision::BotTurnLimit);
+                        return;
+                    }
                     TurnAction::WarnAndStop {
                         severity,
                         turns,
@@ -456,6 +474,7 @@ impl EventHandler for Handler {
                                 "soft bot turn limit reached",
                             ),
                         }
+                        audit.finish(IngressDecision::BotTurnLimit);
                         // Only post the warning if this bot is allowed in the channel/thread.
                         // Bot turn counting intentionally runs before channel gating so ALL
                         // bot messages are counted, but the *warning message* must respect
@@ -530,6 +549,7 @@ impl EventHandler for Handler {
 
         // Ignore own messages (after counting toward bot turns above)
         if msg.author.id == bot_id {
+            audit.finish(IngressDecision::SelfMessage);
             return;
         }
 
@@ -555,9 +575,13 @@ impl EventHandler for Handler {
         // Bot message gating (from upstream #321)
         if msg.author.bot {
             match self.allow_bot_messages {
-                AllowBots::Off => return,
+                AllowBots::Off => {
+                    audit.finish(IngressDecision::BotPolicyDenied);
+                    return;
+                }
                 AllowBots::Mentions => {
                     if !is_mentioned {
+                        audit.finish(IngressDecision::MentionRequired);
                         return;
                     }
                 }
@@ -595,6 +619,7 @@ impl EventHandler for Handler {
                             Ok(msgs) => msgs,
                             Err(e) => {
                                 tracing::warn!(channel_id = %msg.channel_id, error = %e, "failed to fetch history for bot turn cap, rejecting (fail-closed)");
+                                audit.finish(IngressDecision::LoopCheckFailed);
                                 return;
                             }
                         }
@@ -606,6 +631,7 @@ impl EventHandler for Handler {
                         .count();
                     if consecutive_bot >= cap {
                         tracing::warn!(channel_id = %msg.channel_id, cap, "bot turn cap reached, ignoring");
+                        audit.finish(IngressDecision::BotTurnLimit);
                         return;
                     }
                 }
@@ -615,6 +641,7 @@ impl EventHandler for Handler {
                 && !self.trusted_bot_ids.contains(&msg.author.id.get())
             {
                 tracing::debug!(bot_id = %msg.author.id, "bot not in trusted_bot_ids, ignoring");
+                audit.finish(IngressDecision::BotUntrusted);
                 return;
             }
         }
@@ -671,10 +698,12 @@ impl EventHandler for Handler {
         // DM gating: allow_dm must be true, otherwise reject
         if is_dm && !self.allow_dm {
             tracing::debug!(channel_id = %msg.channel_id, "DM rejected (allow_dm=false)");
+            audit.finish(IngressDecision::ChannelDenied);
             return;
         }
 
         if !is_dm && !in_allowed_channel && !in_thread {
+            audit.finish(IngressDecision::ChannelDenied);
             return;
         }
 
@@ -687,9 +716,13 @@ impl EventHandler for Handler {
         // DMs are treated as implicit @mention (mirrors Slack behavior).
         if !is_user_trigger && !is_dm {
             match self.allow_user_messages {
-                AllowUsers::Mentions => return,
+                AllowUsers::Mentions => {
+                    audit.finish(IngressDecision::MentionRequired);
+                    return;
+                }
                 AllowUsers::Involved => {
                     if !in_thread {
+                        audit.finish(IngressDecision::ThreadRequired);
                         return;
                     }
                     let (involved, _) = if bot_owns_thread {
@@ -700,11 +733,13 @@ impl EventHandler for Handler {
                     };
                     if !involved {
                         tracing::debug!(channel_id = %msg.channel_id, "bot not involved in thread, ignoring");
+                        audit.finish(IngressDecision::BotNotInvolved);
                         return;
                     }
                 }
                 AllowUsers::MultibotMentions => {
                     if !in_thread {
+                        audit.finish(IngressDecision::ThreadRequired);
                         return;
                     }
                     let (involved, other_bot) = if bot_owns_thread {
@@ -719,10 +754,12 @@ impl EventHandler for Handler {
                     };
                     if !involved {
                         tracing::debug!(channel_id = %msg.channel_id, "bot not involved in thread, ignoring");
+                        audit.finish(IngressDecision::BotNotInvolved);
                         return;
                     }
                     if other_bot {
                         tracing::debug!(channel_id = %msg.channel_id, "multi-bot thread, requiring @mention");
+                        audit.finish(IngressDecision::MultiBotMentionRequired);
                         return;
                     }
                 }
@@ -736,6 +773,7 @@ impl EventHandler for Handler {
             msg.author.id.get(),
         ) {
             tracing::info!(user_id = %msg.author.id, "denied user, ignoring");
+            audit.finish(IngressDecision::UserDenied);
             let msg_ref = discord_msg_ref(&msg);
             let _ = adapter.add_reaction(&msg_ref, "🚫").await;
             return;
@@ -747,6 +785,7 @@ impl EventHandler for Handler {
         if prompt.is_empty()
             && (msg.attachments.is_empty() || !self.inbound_attachment_content_blocks)
         {
+            audit.finish(IngressDecision::EmptyContent);
             return;
         }
 
@@ -900,10 +939,13 @@ impl EventHandler for Handler {
                 Ok(ch) => ch,
                 Err(e) => {
                     error!("failed to create thread: {e}");
+                    audit.finish(IngressDecision::ThreadCreateFailed);
                     return;
                 }
             }
         };
+
+        audit.set_thread_id((!is_dm).then(|| thread_channel.channel_id.clone()));
 
         if !in_thread && !is_dm && thread_channel.parent_id.is_some() {
             // A top-level trigger that created/joined a thread makes this bot
@@ -982,11 +1024,15 @@ impl EventHandler for Handler {
                 estimated_tokens,
                 other_bot_present: other_bot_present_flag,
             };
-            if let Err(e) = dispatcher
+            match dispatcher
                 .submit(thread_key, thread_channel, adapter, buf_msg)
                 .await
             {
-                error!("dispatcher submit error: {e}");
+                Ok(()) => audit.finish(IngressDecision::Dispatched),
+                Err(e) => {
+                    audit.finish(IngressDecision::DispatchFailed);
+                    error!("dispatcher submit error: {e}");
+                }
             }
         });
     }

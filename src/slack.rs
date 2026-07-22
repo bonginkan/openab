@@ -5,6 +5,7 @@ use crate::config::{AllowBots, AllowUsers, ContextRecoveryConfig, SttConfig};
 use crate::context_recovery::{
     slack_message_links, ContextCollector, RecoveredContext, RecoveredMessage, SlackMessageLink,
 };
+use crate::ingress_audit::{IngressAuditGuard, IngressAuditRecord, IngressDecision};
 use crate::media;
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
@@ -700,6 +701,7 @@ pub async fn run_slack_adapter(
 
                                     // Route events
                                     if envelope["type"].as_str() == Some("events_api") {
+                                        let mut audit = slack_ingress_audit(&envelope);
                                         if let Some(duplicate_key) =
                                             duplicate_slack_event_key(&mut seen_events, &envelope)
                                         {
@@ -711,6 +713,7 @@ pub async fn run_slack_adapter(
                                                 retry_reason = envelope["retry_reason"].as_str().unwrap_or(""),
                                                 "duplicate Slack events_api envelope ignored"
                                             );
+                                            audit.finish(IngressDecision::Duplicate);
                                             continue;
                                         }
                                         let event = &envelope["payload"]["event"];
@@ -722,7 +725,10 @@ pub async fn run_slack_adapter(
                                                     || event["subtype"].as_str() == Some("bot_message");
                                                 if is_bot {
                                                     match allow_bot_messages {
-                                                        AllowBots::Off => { continue; }
+                                                        AllowBots::Off => {
+                                                            audit.finish(IngressDecision::BotPolicyDenied);
+                                                            continue;
+                                                        }
                                                         AllowBots::Mentions | AllowBots::All => {
                                                             if !trusted_bot_ids.is_empty() {
                                                                 let event_bot_id = event["bot_id"].as_str().unwrap_or("");
@@ -731,6 +737,7 @@ pub async fn run_slack_adapter(
                                                                     .await;
                                                                 if !is_trusted {
                                                                     debug!(event_bot_id, "bot not in trusted_bot_ids, ignoring app_mention");
+                                                                    audit.finish(IngressDecision::BotUntrusted);
                                                                     continue;
                                                                 }
                                                             }
@@ -758,6 +765,7 @@ pub async fn run_slack_adapter(
                                                         &context_recovery,
                                                         inbound_attachment_content_blocks,
                                                         &dispatcher,
+                                                        audit,
                                                     )
                                                     .await;
                                                 });
@@ -796,7 +804,10 @@ pub async fn run_slack_adapter(
                                                     "channel_join" | "channel_leave" |
                                                     "channel_topic" | "channel_purpose"
                                                 );
-                                                if skip_subtype { continue; }
+                                                if skip_subtype {
+                                                    audit.finish(IngressDecision::UnsupportedSubtype);
+                                                    continue;
+                                                }
 
                                                 // --- Eager multibot detection ---
                                                 // Runs before self-check and bot gating so we always detect
@@ -825,12 +836,16 @@ pub async fn run_slack_adapter(
                                                     if is_bot {
                                                         match tracker.classify_bot_message(&turn_key) {
                                                             TurnAction::Continue => {}
-                                                            TurnAction::SilentStop => continue,
+                                                            TurnAction::SilentStop => {
+                                                                audit.finish(IngressDecision::BotTurnLimit);
+                                                                continue;
+                                                            }
                                                             TurnAction::WarnAndStop { severity, turns, user_message } => {
                                                                 match severity {
                                                                     TurnSeverity::Hard => warn!(channel_id, turns, "hard bot turn limit reached"),
                                                                     TurnSeverity::Soft => info!(channel_id, turns, max = max_bot_turns, "soft bot turn limit reached"),
                                                                 }
+                                                                audit.finish(IngressDecision::BotTurnLimit);
                                                                 let channel_allowed = allow_all_channels
                                                                     || allowed_channels.contains(channel_id);
                                                                 if !is_own_bot_msg && channel_allowed {
@@ -852,19 +867,31 @@ pub async fn run_slack_adapter(
                                                 }
 
                                                 // Ignore own bot messages (after counting toward turns)
-                                                if is_own_bot_msg { continue; }
+                                                if is_own_bot_msg {
+                                                    audit.finish(IngressDecision::SelfMessage);
+                                                    continue;
+                                                }
 
                                                 // Skip messages that @mention the bot — app_mention handles those
                                                 // (except in DMs where app_mention doesn't fire)
-                                                if mentions_bot && !is_dm { continue; }
+                                                if mentions_bot && !is_dm {
+                                                    audit.finish(IngressDecision::Duplicate);
+                                                    continue;
+                                                }
 
                                                 // --- Bot message gating ---
                                                 if is_bot {
                                                     let event_bot_id = event["bot_id"].as_str().unwrap_or("");
                                                     match allow_bot_messages {
-                                                        AllowBots::Off => { continue; }
+                                                        AllowBots::Off => {
+                                                            audit.finish(IngressDecision::BotPolicyDenied);
+                                                            continue;
+                                                        }
                                                         AllowBots::Mentions => {
-                                                            if !mentions_bot { continue; }
+                                                            if !mentions_bot {
+                                                                audit.finish(IngressDecision::MentionRequired);
+                                                                continue;
+                                                            }
                                                         }
                                                         AllowBots::All => {
                                                             // Loop protection: count consecutive bot msgs (fail-closed)
@@ -890,12 +917,14 @@ pub async fn run_slack_adapter(
                                                                                 .count();
                                                                             if consecutive >= cap {
                                                                                 warn!(channel_id, cap, "bot turn cap reached, ignoring");
+                                                                                audit.finish(IngressDecision::BotTurnLimit);
                                                                                 continue;
                                                                             }
                                                                         }
                                                                     }
                                                                     Err(e) => {
                                                                         warn!(channel_id, thread_ts, error = %e, "failed to fetch thread for bot loop check, rejecting (fail-closed)");
+                                                                        audit.finish(IngressDecision::LoopCheckFailed);
                                                                         continue;
                                                                     }
                                                                 }
@@ -909,11 +938,15 @@ pub async fn run_slack_adapter(
                                                             .await;
                                                         if !is_trusted {
                                                             debug!(event_bot_id, "bot not in trusted_bot_ids, ignoring");
+                                                            audit.finish(IngressDecision::BotUntrusted);
                                                             continue;
                                                         }
                                                     }
                                                     // Bot messages must be in a thread (no top-level bot processing)
-                                                    if !has_thread { continue; }
+                                                    if !has_thread {
+                                                        audit.finish(IngressDecision::ThreadRequired);
+                                                        continue;
+                                                    }
                                                 }
 
                                                 // --- User message gating ---
@@ -923,10 +956,14 @@ pub async fn run_slack_adapter(
                                                     } else {
                                                         match allow_user_messages {
                                                             AllowUsers::Mentions => {
-                                                                if !mentions_bot { continue; }
+                                                                if !mentions_bot {
+                                                                    audit.finish(IngressDecision::MentionRequired);
+                                                                    continue;
+                                                                }
                                                             }
                                                             AllowUsers::Involved => {
                                                                 if !has_thread {
+                                                                    audit.finish(IngressDecision::ThreadRequired);
                                                                     continue;
                                                                 }
                                                                 let thread_ts = event["thread_ts"].as_str().unwrap_or("");
@@ -935,11 +972,13 @@ pub async fn run_slack_adapter(
                                                                     .await;
                                                                 if !involved {
                                                                     debug!(channel_id, thread_ts, "bot not involved in thread, ignoring");
+                                                                    audit.finish(IngressDecision::BotNotInvolved);
                                                                     continue;
                                                                 }
                                                             }
                                                             AllowUsers::MultibotMentions => {
                                                                 if !has_thread {
+                                                                    audit.finish(IngressDecision::ThreadRequired);
                                                                     continue;
                                                                 }
                                                                 let thread_ts = event["thread_ts"].as_str().unwrap_or("");
@@ -948,6 +987,7 @@ pub async fn run_slack_adapter(
                                                                     .await;
                                                                 if !involved {
                                                                     debug!(channel_id, thread_ts, "bot not involved in thread, ignoring");
+                                                                    audit.finish(IngressDecision::BotNotInvolved);
                                                                     continue;
                                                                 }
                                                                 // In multi-bot threads, require @mention — mirrors
@@ -959,6 +999,7 @@ pub async fn run_slack_adapter(
                                                                 // and survives changes to the earlier dedup.
                                                                 if other_bot && !mentions_bot {
                                                                     debug!(channel_id, thread_ts, "multi-bot thread without @mention, ignoring");
+                                                                    audit.finish(IngressDecision::MultiBotMentionRequired);
                                                                     continue;
                                                                 }
                                                             }
@@ -990,11 +1031,12 @@ pub async fn run_slack_adapter(
                                                         &context_recovery,
                                                         inbound_attachment_content_blocks,
                                                         &dispatcher,
+                                                        audit,
                                                     )
                                                     .await;
                                                 });
                                             }
-                                            _ => {}
+                                            _ => audit.finish(IngressDecision::UnsupportedEvent),
                                         }
                                     }
                                 }
@@ -1042,6 +1084,49 @@ fn duplicate_slack_event_key(
     }
     seen_events.insert(key, now);
     None
+}
+
+fn slack_ingress_audit(envelope: &serde_json::Value) -> IngressAuditGuard {
+    let event = &envelope["payload"]["event"];
+    let event_type = event["type"].as_str().unwrap_or("unknown");
+    let subtype = event["subtype"].as_str();
+    let event_kind = subtype.map_or_else(
+        || event_type.to_string(),
+        |subtype| format!("{event_type}:{subtype}"),
+    );
+    let event_id = envelope["payload"]["event_id"]
+        .as_str()
+        .or_else(|| event["event_ts"].as_str())
+        .or_else(|| event["ts"].as_str())
+        .or_else(|| envelope["envelope_id"].as_str())
+        .unwrap_or("");
+    let sender_id = event["user"]
+        .as_str()
+        .or_else(|| event["bot_id"].as_str())
+        .unwrap_or("");
+    let attachment_count = event["files"].as_array().map_or(0, Vec::len)
+        + event["attachments"].as_array().map_or(0, Vec::len);
+
+    IngressAuditGuard::new(IngressAuditRecord::new(
+        "slack",
+        event_id,
+        event["channel"].as_str().unwrap_or(""),
+        event["thread_ts"].as_str().map(ToOwned::to_owned),
+        envelope["payload"]["team_id"]
+            .as_str()
+            .map(ToOwned::to_owned),
+        sender_id,
+        event["bot_id"].is_string() || subtype == Some("bot_message"),
+        event["event_ts"]
+            .as_str()
+            .or_else(|| event["ts"].as_str())
+            .map(ToOwned::to_owned),
+        event_kind,
+        event["text"]
+            .as_str()
+            .map_or(0, |text| text.chars().count()),
+        attachment_count,
+    ))
 }
 
 fn slack_event_dedupe_key(envelope: &serde_json::Value) -> Option<String> {
@@ -1607,36 +1692,51 @@ async fn handle_message(
     context_recovery: &ContextRecoveryConfig,
     inbound_attachment_content_blocks: bool,
     dispatcher: &Arc<crate::dispatch::Dispatcher>,
+    mut audit: IngressAuditGuard,
 ) {
     let channel_id = match event["channel"].as_str() {
         Some(ch) => ch.to_string(),
-        None => return,
+        None => {
+            audit.finish(IngressDecision::MalformedEvent);
+            return;
+        }
     };
     // Bot messages may lack "user" field — fall back to "bot_id" as sender identifier
     let user_id = match event["user"].as_str().or_else(|| event["bot_id"].as_str()) {
         Some(u) => u.to_string(),
-        None => return,
+        None => {
+            audit.finish(IngressDecision::MalformedEvent);
+            return;
+        }
     };
     let is_bot_msg =
         event["bot_id"].is_string() || event["subtype"].as_str() == Some("bot_message");
     let text = match event["text"].as_str() {
         Some(t) => t.to_string(),
-        None => return,
+        None => {
+            audit.finish(IngressDecision::MalformedEvent);
+            return;
+        }
     };
     let ts = match event["ts"].as_str() {
         Some(ts) => ts.to_string(),
-        None => return,
+        None => {
+            audit.finish(IngressDecision::MalformedEvent);
+            return;
+        }
     };
     let thread_ts = event["thread_ts"].as_str().map(|s| s.to_string());
 
     // Check allowed channels
     if !allow_all_channels && !allowed_channels.contains(&channel_id) {
+        audit.finish(IngressDecision::ChannelDenied);
         return;
     }
 
     // Check allowed users — skip for bot messages (they go through trusted_bot_ids instead)
     if !is_bot_msg && !allow_all_users && !allowed_users.contains(&user_id) {
         tracing::info!(user_id, "denied Slack user, ignoring");
+        audit.finish(IngressDecision::UserDenied);
         let msg_ref = MessageRef {
             channel: ChannelRef {
                 platform: "slack".into(),
@@ -1661,6 +1761,7 @@ async fn handle_message(
     let has_files = files.is_some_and(|f| !f.is_empty());
 
     if prompt.is_empty() && (!has_files || !inbound_attachment_content_blocks) {
+        audit.finish(IngressDecision::EmptyContent);
         return;
     }
 
@@ -1915,11 +2016,15 @@ async fn handle_message(
         estimated_tokens,
         other_bot_present,
     };
-    if let Err(e) = dispatcher
+    match dispatcher
         .submit(thread_key, thread_channel, adapter_dyn, buf_msg)
         .await
     {
-        error!("Slack dispatcher submit error: {e}");
+        Ok(()) => audit.finish(IngressDecision::Dispatched),
+        Err(e) => {
+            audit.finish(IngressDecision::DispatchFailed);
+            error!("Slack dispatcher submit error: {e}");
+        }
     }
 }
 
@@ -2439,6 +2544,32 @@ mod tests {
             slack_event_dedupe_key(&envelope).as_deref(),
             Some("event:Ev123")
         );
+    }
+
+    #[test]
+    fn slack_ingress_audit_uses_envelope_fallback_without_content() {
+        let envelope = json!({
+            "envelope_id": "Ee123",
+            "payload": {
+                "team_id": "T123",
+                "event": {
+                    "type": "message",
+                    "channel": "C123",
+                    "user": "U123",
+                    "text": "private message",
+                    "files": [{"id": "F1"}]
+                }
+            }
+        });
+
+        let audit = slack_ingress_audit(&envelope);
+        let record = audit.snapshot().unwrap();
+        assert_eq!(record["event_id"], "Ee123");
+        assert_eq!(record["scope_id"], "T123");
+        assert_eq!(record["content_chars"], 15);
+        assert_eq!(record["attachment_count"], 1);
+        assert_eq!(record["route_decision"], "unclassified_drop");
+        assert!(record.get("content").is_none());
     }
 
     #[test]
