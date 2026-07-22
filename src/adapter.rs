@@ -1725,13 +1725,18 @@ fn steer_prompt_text(blocks: &[ContentBlock]) -> String {
     blocks
         .iter()
         .filter_map(|b| match b {
-            ContentBlock::Text { text } => Some(text.as_str()),
+            ContentBlock::Text { text } if !is_sender_context_block(text) => Some(text.as_str()),
             _ => None,
         })
         .collect::<Vec<_>>()
         .join("\n")
         .trim()
         .to_string()
+}
+
+fn is_sender_context_block(text: &str) -> bool {
+    let trimmed = text.trim();
+    trimmed.starts_with("<sender_context>") && trimmed.contains("</sender_context>")
 }
 
 /// Make mention syntax inert inside a quoted steer prompt while keeping the
@@ -2339,6 +2344,19 @@ mod tests {
             steer_prompt_text(&blocks),
             "use bun instead\nand add a test"
         );
+    }
+
+    #[test]
+    fn steer_prompt_text_omits_sender_context_block() {
+        let blocks = vec![
+            ContentBlock::Text {
+                text: "<sender_context>\n{\"sender_id\":\"U1\"}\n</sender_context>\n\n".to_string(),
+            },
+            ContentBlock::Text {
+                text: "  run the task  ".to_string(),
+            },
+        ];
+        assert_eq!(steer_prompt_text(&blocks), "run the task");
     }
 
     #[test]

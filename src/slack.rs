@@ -13,6 +13,7 @@ use tokio_tungstenite::tungstenite;
 use tracing::{debug, error, info, warn};
 
 const SLACK_API: &str = "https://slack.com/api";
+const SLACK_EVENT_DEDUPE_TTL: std::time::Duration = std::time::Duration::from_secs(600);
 
 #[derive(Debug, Clone)]
 struct SlackCompletedUploadFile {
@@ -602,6 +603,7 @@ pub async fn run_slack_adapter(
 ) -> Result<()> {
     let bot_token = adapter.bot_token().to_string();
     let bot_turns = Arc::new(tokio::sync::Mutex::new(BotTurnTracker::new(max_bot_turns)));
+    let mut seen_events: HashMap<String, std::time::Instant> = HashMap::new();
 
     loop {
         // Check for shutdown before (re)connecting
@@ -663,6 +665,19 @@ pub async fn run_slack_adapter(
 
                                     // Route events
                                     if envelope["type"].as_str() == Some("events_api") {
+                                        if let Some(duplicate_key) =
+                                            duplicate_slack_event_key(&mut seen_events, &envelope)
+                                        {
+                                            info!(
+                                                duplicate_key,
+                                                envelope_id = envelope["envelope_id"].as_str().unwrap_or(""),
+                                                event_id = envelope["payload"]["event_id"].as_str().unwrap_or(""),
+                                                retry_attempt = envelope["retry_attempt"].as_i64(),
+                                                retry_reason = envelope["retry_reason"].as_str().unwrap_or(""),
+                                                "duplicate Slack events_api envelope ignored"
+                                            );
+                                            continue;
+                                        }
                                         let event = &envelope["payload"]["event"];
                                         let event_type = event["type"].as_str().unwrap_or("");
                                         match event_type {
@@ -974,6 +989,52 @@ pub async fn run_slack_adapter(
         warn!("reconnecting to Slack Socket Mode in 5s...");
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
     }
+}
+
+fn duplicate_slack_event_key(
+    seen_events: &mut HashMap<String, std::time::Instant>,
+    envelope: &serde_json::Value,
+) -> Option<String> {
+    let key = slack_event_dedupe_key(envelope)?;
+    let now = std::time::Instant::now();
+    seen_events.retain(|_, seen_at| now.duration_since(*seen_at) < SLACK_EVENT_DEDUPE_TTL);
+    if seen_events.contains_key(&key) {
+        return Some(key);
+    }
+    seen_events.insert(key, now);
+    None
+}
+
+fn slack_event_dedupe_key(envelope: &serde_json::Value) -> Option<String> {
+    if let Some(event_id) = envelope["payload"]["event_id"].as_str() {
+        if !event_id.is_empty() {
+            return Some(format!("event:{event_id}"));
+        }
+    }
+
+    let event = &envelope["payload"]["event"];
+    let event_type = event["type"].as_str().unwrap_or("");
+    let channel = event["channel"]
+        .as_str()
+        .or_else(|| event["item"]["channel"].as_str())
+        .unwrap_or("");
+    let ts = event["ts"]
+        .as_str()
+        .or_else(|| event["event_ts"].as_str())
+        .or_else(|| event["item"]["ts"].as_str())
+        .unwrap_or("");
+    let actor = event["user"]
+        .as_str()
+        .or_else(|| event["bot_id"].as_str())
+        .unwrap_or("");
+
+    if event_type.is_empty() || channel.is_empty() || ts.is_empty() {
+        return None;
+    }
+
+    Some(format!(
+        "event-fallback:{event_type}:{channel}:{ts}:{actor}"
+    ))
 }
 
 /// Call apps.connections.open to get a WebSocket URL for Socket Mode.
@@ -1587,6 +1648,7 @@ fn markdown_to_mrkdwn(text: &str) -> String {
 mod tests {
     use super::*;
     use crate::adapter::ChatAdapter;
+    use serde_json::json;
 
     /// Bot's own `<@UID>` trigger mention is stripped.
     #[test]
@@ -1657,6 +1719,64 @@ mod tests {
     fn resolve_mentions_preserves_longer_uid_prefix() {
         let out = resolve_slack_mentions("<@U1BOTX> hello", Some("U1BOT"));
         assert_eq!(out, "<@U1BOTX> hello");
+    }
+
+    #[test]
+    fn slack_event_dedupe_key_prefers_payload_event_id() {
+        let envelope = json!({
+            "payload": {
+                "event_id": "Ev123",
+                "event": {
+                    "type": "message",
+                    "channel": "C123",
+                    "ts": "111.222",
+                    "user": "U123"
+                }
+            }
+        });
+        assert_eq!(
+            slack_event_dedupe_key(&envelope).as_deref(),
+            Some("event:Ev123")
+        );
+    }
+
+    #[test]
+    fn slack_event_dedupe_key_falls_back_to_message_identity() {
+        let envelope = json!({
+            "payload": {
+                "event": {
+                    "type": "message",
+                    "channel": "C123",
+                    "ts": "111.222",
+                    "user": "U123"
+                }
+            }
+        });
+        assert_eq!(
+            slack_event_dedupe_key(&envelope).as_deref(),
+            Some("event-fallback:message:C123:111.222:U123")
+        );
+    }
+
+    #[test]
+    fn duplicate_slack_event_key_rejects_second_seen_event() {
+        let envelope = json!({
+            "payload": {
+                "event_id": "Ev123",
+                "event": {
+                    "type": "message",
+                    "channel": "C123",
+                    "ts": "111.222",
+                    "user": "U123"
+                }
+            }
+        });
+        let mut seen = HashMap::new();
+        assert_eq!(duplicate_slack_event_key(&mut seen, &envelope), None);
+        assert_eq!(
+            duplicate_slack_event_key(&mut seen, &envelope).as_deref(),
+            Some("event:Ev123")
+        );
     }
 
     // --- text_mentions_uid tests ---
