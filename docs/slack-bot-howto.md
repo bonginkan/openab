@@ -145,3 +145,9 @@ On Discord, none of these apply: slash commands work in thread-channels, the cha
 
 1. Verify `reactions:write` scope is added
 2. Reinstall the app after adding the scope
+
+### File uploads fail with "files.getUploadURLExternal: missing_scope"
+
+1. Verify `files:write` is added under **OAuth & Permissions** → **Bot Token Scopes**
+2. Reinstall the app after adding or changing bot token scopes
+3. Restart openab if you replaced the bot token during reinstall
