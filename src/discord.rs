@@ -897,6 +897,14 @@ impl EventHandler for Handler {
                                     u64::from(attachment.size),
                                     &attachment.url,
                                 ));
+                            } else {
+                                debug!(url = %attachment.url, filename = %attachment.filename, "adding file attachment link");
+                                extra_blocks.push(file_attachment_block(
+                                    &attachment.filename,
+                                    attachment.content_type.as_deref(),
+                                    u64::from(attachment.size),
+                                    &attachment.url,
+                                ));
                             }
                         }
                         Err(e) => {
@@ -2286,6 +2294,23 @@ fn video_attachment_block(
     }
 }
 
+fn file_attachment_block(
+    filename: &str,
+    content_type: Option<&str>,
+    size: u64,
+    url: &str,
+) -> ContentBlock {
+    ContentBlock::Text {
+        text: format!(
+            "[File attachment: {} ({}, {} bytes) — download URL: {}]",
+            filename,
+            content_type.unwrap_or("unknown"),
+            size,
+            url
+        ),
+    }
+}
+
 /// Build a `SenderContext` for Discord messages.
 ///
 /// Pure function extracted from `EventHandler::message` for testability.
@@ -2911,6 +2936,25 @@ mod tests {
         assert!(text.contains("content_type: video/mp4"));
         assert!(text.contains("size_bytes: 12345"));
         assert!(text.contains("url: https://cdn.discordapp.com/attachments/demo.mp4"));
+    }
+
+    #[test]
+    fn file_attachment_block_includes_actionable_metadata() {
+        let block = file_attachment_block(
+            "document.pdf",
+            Some("application/pdf"),
+            12345,
+            "https://cdn.discordapp.com/attachments/document.pdf",
+        );
+
+        let ContentBlock::Text { text } = block else {
+            panic!("file attachments must be forwarded as text metadata");
+        };
+
+        assert_eq!(
+            text,
+            "[File attachment: document.pdf (application/pdf, 12345 bytes) — download URL: https://cdn.discordapp.com/attachments/document.pdf]"
+        );
     }
 
     // --- thread-race error detection ---
