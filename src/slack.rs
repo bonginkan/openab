@@ -1,7 +1,11 @@
 use crate::acp::ContentBlock;
-use crate::adapter::{ChannelRef, ChatAdapter, MessageRef, SenderContext};
+use crate::adapter::{ChannelRef, ChatAdapter, MessageRef, OutboundAttachment, SenderContext};
 use crate::bot_turns::{BotTurnTracker, TurnAction, TurnSeverity};
-use crate::config::{AllowBots, AllowUsers, SttConfig};
+use crate::config::{AllowBots, AllowUsers, ContextRecoveryConfig, SttConfig};
+use crate::context_recovery::{
+    slack_message_links, ContextCollector, RecoveredContext, RecoveredMessage, SlackMessageLink,
+};
+use crate::ingress_audit::{IngressAuditGuard, IngressAuditRecord, IngressDecision};
 use crate::media;
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
@@ -13,6 +17,16 @@ use tokio_tungstenite::tungstenite;
 use tracing::{debug, error, info, warn};
 
 const SLACK_API: &str = "https://slack.com/api";
+const SLACK_EVENT_DEDUPE_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+// Slack returns at most 100 messages for a time-bounded history query. After-side
+// context is only usable when this complete page reaches the target boundary.
+const SLACK_CONTEXT_AFTER_FETCH_LIMIT: &str = "100";
+
+#[derive(Debug, Clone)]
+struct SlackCompletedUploadFile {
+    id: String,
+    title: String,
+}
 
 /// Map Unicode emoji to Slack short names for reactions API.
 /// Only covers the default `[reactions.emojis]` set. Custom emoji configured
@@ -57,6 +71,7 @@ pub struct SlackAdapter {
     client: reqwest::Client,
     bot_token: String,
     bot_user_id: tokio::sync::OnceCell<String>,
+    workspace_host: tokio::sync::OnceCell<String>,
     user_cache: tokio::sync::Mutex<HashMap<String, (String, tokio::time::Instant)>>,
     /// Cache: Bot ID (B...) → Bot User ID (U...) for trusted_bot_ids matching.
     bot_id_cache: tokio::sync::Mutex<HashMap<String, String>>,
@@ -79,6 +94,7 @@ impl SlackAdapter {
             client: reqwest::Client::new(),
             bot_token,
             bot_user_id: tokio::sync::OnceCell::new(),
+            workspace_host: tokio::sync::OnceCell::new(),
             user_cache: tokio::sync::Mutex::new(HashMap::new()),
             bot_id_cache: tokio::sync::Mutex::new(HashMap::new()),
             participated_threads: tokio::sync::Mutex::new(HashMap::new()),
@@ -122,6 +138,32 @@ impl SlackAdapter {
             .map(|s| s.as_str())
     }
 
+    async fn get_workspace_host(&self) -> Option<&str> {
+        self.workspace_host
+            .get_or_try_init(|| async {
+                let response = self
+                    .api_post("auth.test", serde_json::json!({}))
+                    .await
+                    .map_err(|error| anyhow!("auth.test failed: {error}"))?;
+                let url = response["url"]
+                    .as_str()
+                    .ok_or_else(|| anyhow!("no url in auth.test response"))?;
+                let parsed = reqwest::Url::parse(url)?;
+                let host = parsed
+                    .host_str()
+                    .and_then(|host| host.strip_suffix(".slack.com"))
+                    .filter(|host| !host.is_empty())
+                    .ok_or_else(|| anyhow!("auth.test returned a non-Slack workspace URL"))?;
+                Ok::<String, anyhow::Error>(host.to_ascii_lowercase())
+            })
+            .await
+            .inspect_err(|error| {
+                warn!(error = %error, "Slack workspace identity unavailable for context recovery")
+            })
+            .ok()
+            .map(String::as_str)
+    }
+
     async fn api_post(&self, method: &str, body: serde_json::Value) -> Result<serde_json::Value> {
         let resp = self
             .client
@@ -134,8 +176,27 @@ impl SlackAdapter {
 
         let json: serde_json::Value = resp.json().await?;
         if json["ok"].as_bool() != Some(true) {
-            let err = json["error"].as_str().unwrap_or("unknown error");
-            return Err(anyhow!("Slack API {method}: {err}"));
+            return Err(anyhow!(slack_api_error_message(method, &json)));
+        }
+        Ok(json)
+    }
+
+    async fn api_post_form(
+        &self,
+        method: &str,
+        form: &[(&str, String)],
+    ) -> Result<serde_json::Value> {
+        let resp = self
+            .client
+            .post(format!("{SLACK_API}/{method}"))
+            .header("Authorization", format!("Bearer {}", self.bot_token))
+            .form(form)
+            .send()
+            .await?;
+
+        let json: serde_json::Value = resp.json().await?;
+        if json["ok"].as_bool() != Some(true) {
+            return Err(anyhow!(slack_api_error_message(method, &json)));
         }
         Ok(json)
     }
@@ -153,8 +214,7 @@ impl SlackAdapter {
 
         let json: serde_json::Value = resp.json().await?;
         if json["ok"].as_bool() != Some(true) {
-            let err = json["error"].as_str().unwrap_or("unknown error");
-            return Err(anyhow!("Slack API {method}: {err}"));
+            return Err(anyhow!(slack_api_error_message(method, &json)));
         }
         Ok(json)
     }
@@ -336,6 +396,43 @@ impl SlackAdapter {
         cache.insert(thread_ts.to_string(), tokio::time::Instant::now());
         enforce_cache_bounds(&mut cache, self.session_ttl);
     }
+
+    async fn request_external_upload_url(
+        &self,
+        filename: &str,
+        length: usize,
+    ) -> Result<(String, String)> {
+        let length = length.to_string();
+        let resp = self
+            .api_post_form(
+                "files.getUploadURLExternal",
+                &[("filename", filename.to_string()), ("length", length)],
+            )
+            .await?;
+        let upload_url = resp["upload_url"]
+            .as_str()
+            .ok_or_else(|| anyhow!("no upload_url in files.getUploadURLExternal response"))?;
+        let file_id = resp["file_id"]
+            .as_str()
+            .ok_or_else(|| anyhow!("no file_id in files.getUploadURLExternal response"))?;
+        Ok((upload_url.to_string(), file_id.to_string()))
+    }
+
+    async fn upload_external_file_bytes(&self, upload_url: &str, data: Vec<u8>) -> Result<()> {
+        let resp = self
+            .client
+            .post(upload_url)
+            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+            .body(data)
+            .send()
+            .await?;
+        let status = resp.status();
+        anyhow::ensure!(
+            status.is_success(),
+            "Slack external file upload failed: HTTP {status}"
+        );
+        Ok(())
+    }
 }
 
 /// Shared eviction policy for positive-only caches.
@@ -390,6 +487,55 @@ impl ChatAdapter for SlackAdapter {
                 origin_event_id: None,
             },
             message_id: ts.to_string(),
+        })
+    }
+
+    async fn send_attachments(
+        &self,
+        channel: &ChannelRef,
+        content: &str,
+        attachments: Vec<OutboundAttachment>,
+        reply_to_message_id: Option<&str>,
+    ) -> Result<MessageRef> {
+        anyhow::ensure!(!attachments.is_empty(), "no Slack attachments to upload");
+
+        let mut completed_files = Vec::with_capacity(attachments.len());
+        for attachment in attachments {
+            let (upload_url, file_id) = self
+                .request_external_upload_url(&attachment.filename, attachment.data.len())
+                .await?;
+            self.upload_external_file_bytes(&upload_url, attachment.data)
+                .await?;
+            completed_files.push(SlackCompletedUploadFile {
+                id: file_id,
+                title: attachment.filename,
+            });
+        }
+
+        let thread_ts = slack_upload_thread_ts(channel.thread_id.as_deref(), reply_to_message_id);
+        let body =
+            slack_complete_upload_body(&channel.channel_id, thread_ts, content, &completed_files);
+        let resp = self.api_post("files.completeUploadExternal", body).await?;
+        let message_id = extract_slack_file_share_ts(&resp, &channel.channel_id)
+            .or(thread_ts)
+            .or_else(|| {
+                resp["files"]
+                    .as_array()
+                    .and_then(|files| files.first())
+                    .and_then(|file| file["id"].as_str())
+            })
+            .unwrap_or_default()
+            .to_string();
+
+        Ok(MessageRef {
+            channel: ChannelRef {
+                platform: "slack".into(),
+                channel_id: channel.channel_id.clone(),
+                thread_id: channel.thread_id.clone(),
+                parent_id: None,
+                origin_event_id: None,
+            },
+            message_id,
         })
     }
 
@@ -486,11 +632,14 @@ pub async fn run_slack_adapter(
     allow_user_messages: AllowUsers,
     max_bot_turns: u32,
     stt_config: SttConfig,
+    context_recovery: ContextRecoveryConfig,
+    inbound_attachment_content_blocks: bool,
     mut shutdown_rx: watch::Receiver<bool>,
     dispatcher: Arc<crate::dispatch::Dispatcher>,
 ) -> Result<()> {
     let bot_token = adapter.bot_token().to_string();
     let bot_turns = Arc::new(tokio::sync::Mutex::new(BotTurnTracker::new(max_bot_turns)));
+    let mut seen_events: HashMap<String, std::time::Instant> = HashMap::new();
 
     loop {
         // Check for shutdown before (re)connecting
@@ -552,6 +701,21 @@ pub async fn run_slack_adapter(
 
                                     // Route events
                                     if envelope["type"].as_str() == Some("events_api") {
+                                        let mut audit = slack_ingress_audit(&envelope);
+                                        if let Some(duplicate_key) =
+                                            duplicate_slack_event_key(&mut seen_events, &envelope)
+                                        {
+                                            info!(
+                                                duplicate_key,
+                                                envelope_id = envelope["envelope_id"].as_str().unwrap_or(""),
+                                                event_id = envelope["payload"]["event_id"].as_str().unwrap_or(""),
+                                                retry_attempt = envelope["retry_attempt"].as_i64(),
+                                                retry_reason = envelope["retry_reason"].as_str().unwrap_or(""),
+                                                "duplicate Slack events_api envelope ignored"
+                                            );
+                                            audit.finish(IngressDecision::Duplicate);
+                                            continue;
+                                        }
                                         let event = &envelope["payload"]["event"];
                                         let event_type = event["type"].as_str().unwrap_or("");
                                         match event_type {
@@ -561,7 +725,10 @@ pub async fn run_slack_adapter(
                                                     || event["subtype"].as_str() == Some("bot_message");
                                                 if is_bot {
                                                     match allow_bot_messages {
-                                                        AllowBots::Off => { continue; }
+                                                        AllowBots::Off => {
+                                                            audit.finish(IngressDecision::BotPolicyDenied);
+                                                            continue;
+                                                        }
                                                         AllowBots::Mentions | AllowBots::All => {
                                                             if !trusted_bot_ids.is_empty() {
                                                                 let event_bot_id = event["bot_id"].as_str().unwrap_or("");
@@ -570,6 +737,7 @@ pub async fn run_slack_adapter(
                                                                     .await;
                                                                 if !is_trusted {
                                                                     debug!(event_bot_id, "bot not in trusted_bot_ids, ignoring app_mention");
+                                                                    audit.finish(IngressDecision::BotUntrusted);
                                                                     continue;
                                                                 }
                                                             }
@@ -582,6 +750,7 @@ pub async fn run_slack_adapter(
                                                 let allowed_channels = allowed_channels.clone();
                                                 let allowed_users = allowed_users.clone();
                                                 let stt_config = stt_config.clone();
+                                                let context_recovery = context_recovery.clone();
                                                 let dispatcher = dispatcher.clone();
                                                 tokio::spawn(async move {
                                                     handle_message(
@@ -593,7 +762,10 @@ pub async fn run_slack_adapter(
                                                         &allowed_channels,
                                                         &allowed_users,
                                                         &stt_config,
+                                                        &context_recovery,
+                                                        inbound_attachment_content_blocks,
                                                         &dispatcher,
+                                                        audit,
                                                     )
                                                     .await;
                                                 });
@@ -632,7 +804,10 @@ pub async fn run_slack_adapter(
                                                     "channel_join" | "channel_leave" |
                                                     "channel_topic" | "channel_purpose"
                                                 );
-                                                if skip_subtype { continue; }
+                                                if skip_subtype {
+                                                    audit.finish(IngressDecision::UnsupportedSubtype);
+                                                    continue;
+                                                }
 
                                                 // --- Eager multibot detection ---
                                                 // Runs before self-check and bot gating so we always detect
@@ -661,12 +836,16 @@ pub async fn run_slack_adapter(
                                                     if is_bot {
                                                         match tracker.classify_bot_message(&turn_key) {
                                                             TurnAction::Continue => {}
-                                                            TurnAction::SilentStop => continue,
+                                                            TurnAction::SilentStop => {
+                                                                audit.finish(IngressDecision::BotTurnLimit);
+                                                                continue;
+                                                            }
                                                             TurnAction::WarnAndStop { severity, turns, user_message } => {
                                                                 match severity {
                                                                     TurnSeverity::Hard => warn!(channel_id, turns, "hard bot turn limit reached"),
                                                                     TurnSeverity::Soft => info!(channel_id, turns, max = max_bot_turns, "soft bot turn limit reached"),
                                                                 }
+                                                                audit.finish(IngressDecision::BotTurnLimit);
                                                                 let channel_allowed = allow_all_channels
                                                                     || allowed_channels.contains(channel_id);
                                                                 if !is_own_bot_msg && channel_allowed {
@@ -688,19 +867,31 @@ pub async fn run_slack_adapter(
                                                 }
 
                                                 // Ignore own bot messages (after counting toward turns)
-                                                if is_own_bot_msg { continue; }
+                                                if is_own_bot_msg {
+                                                    audit.finish(IngressDecision::SelfMessage);
+                                                    continue;
+                                                }
 
                                                 // Skip messages that @mention the bot — app_mention handles those
                                                 // (except in DMs where app_mention doesn't fire)
-                                                if mentions_bot && !is_dm { continue; }
+                                                if mentions_bot && !is_dm {
+                                                    audit.finish(IngressDecision::Duplicate);
+                                                    continue;
+                                                }
 
                                                 // --- Bot message gating ---
                                                 if is_bot {
                                                     let event_bot_id = event["bot_id"].as_str().unwrap_or("");
                                                     match allow_bot_messages {
-                                                        AllowBots::Off => { continue; }
+                                                        AllowBots::Off => {
+                                                            audit.finish(IngressDecision::BotPolicyDenied);
+                                                            continue;
+                                                        }
                                                         AllowBots::Mentions => {
-                                                            if !mentions_bot { continue; }
+                                                            if !mentions_bot {
+                                                                audit.finish(IngressDecision::MentionRequired);
+                                                                continue;
+                                                            }
                                                         }
                                                         AllowBots::All => {
                                                             // Loop protection: count consecutive bot msgs (fail-closed)
@@ -726,12 +917,14 @@ pub async fn run_slack_adapter(
                                                                                 .count();
                                                                             if consecutive >= cap {
                                                                                 warn!(channel_id, cap, "bot turn cap reached, ignoring");
+                                                                                audit.finish(IngressDecision::BotTurnLimit);
                                                                                 continue;
                                                                             }
                                                                         }
                                                                     }
                                                                     Err(e) => {
                                                                         warn!(channel_id, thread_ts, error = %e, "failed to fetch thread for bot loop check, rejecting (fail-closed)");
+                                                                        audit.finish(IngressDecision::LoopCheckFailed);
                                                                         continue;
                                                                     }
                                                                 }
@@ -745,11 +938,15 @@ pub async fn run_slack_adapter(
                                                             .await;
                                                         if !is_trusted {
                                                             debug!(event_bot_id, "bot not in trusted_bot_ids, ignoring");
+                                                            audit.finish(IngressDecision::BotUntrusted);
                                                             continue;
                                                         }
                                                     }
                                                     // Bot messages must be in a thread (no top-level bot processing)
-                                                    if !has_thread { continue; }
+                                                    if !has_thread {
+                                                        audit.finish(IngressDecision::ThreadRequired);
+                                                        continue;
+                                                    }
                                                 }
 
                                                 // --- User message gating ---
@@ -759,10 +956,14 @@ pub async fn run_slack_adapter(
                                                     } else {
                                                         match allow_user_messages {
                                                             AllowUsers::Mentions => {
-                                                                if !mentions_bot { continue; }
+                                                                if !mentions_bot {
+                                                                    audit.finish(IngressDecision::MentionRequired);
+                                                                    continue;
+                                                                }
                                                             }
                                                             AllowUsers::Involved => {
                                                                 if !has_thread {
+                                                                    audit.finish(IngressDecision::ThreadRequired);
                                                                     continue;
                                                                 }
                                                                 let thread_ts = event["thread_ts"].as_str().unwrap_or("");
@@ -771,11 +972,13 @@ pub async fn run_slack_adapter(
                                                                     .await;
                                                                 if !involved {
                                                                     debug!(channel_id, thread_ts, "bot not involved in thread, ignoring");
+                                                                    audit.finish(IngressDecision::BotNotInvolved);
                                                                     continue;
                                                                 }
                                                             }
                                                             AllowUsers::MultibotMentions => {
                                                                 if !has_thread {
+                                                                    audit.finish(IngressDecision::ThreadRequired);
                                                                     continue;
                                                                 }
                                                                 let thread_ts = event["thread_ts"].as_str().unwrap_or("");
@@ -784,6 +987,7 @@ pub async fn run_slack_adapter(
                                                                     .await;
                                                                 if !involved {
                                                                     debug!(channel_id, thread_ts, "bot not involved in thread, ignoring");
+                                                                    audit.finish(IngressDecision::BotNotInvolved);
                                                                     continue;
                                                                 }
                                                                 // In multi-bot threads, require @mention — mirrors
@@ -795,6 +999,7 @@ pub async fn run_slack_adapter(
                                                                 // and survives changes to the earlier dedup.
                                                                 if other_bot && !mentions_bot {
                                                                     debug!(channel_id, thread_ts, "multi-bot thread without @mention, ignoring");
+                                                                    audit.finish(IngressDecision::MultiBotMentionRequired);
                                                                     continue;
                                                                 }
                                                             }
@@ -811,6 +1016,7 @@ pub async fn run_slack_adapter(
                                                 let allowed_channels = allowed_channels.clone();
                                                 let allowed_users = allowed_users.clone();
                                                 let stt_config = stt_config.clone();
+                                                let context_recovery = context_recovery.clone();
                                                 let dispatcher = dispatcher.clone();
                                                 tokio::spawn(async move {
                                                     handle_message(
@@ -822,12 +1028,15 @@ pub async fn run_slack_adapter(
                                                         &allowed_channels,
                                                         &allowed_users,
                                                         &stt_config,
+                                                        &context_recovery,
+                                                        inbound_attachment_content_blocks,
                                                         &dispatcher,
+                                                        audit,
                                                     )
                                                     .await;
                                                 });
                                             }
-                                            _ => {}
+                                            _ => audit.finish(IngressDecision::UnsupportedEvent),
                                         }
                                     }
                                 }
@@ -863,6 +1072,593 @@ pub async fn run_slack_adapter(
     }
 }
 
+fn duplicate_slack_event_key(
+    seen_events: &mut HashMap<String, std::time::Instant>,
+    envelope: &serde_json::Value,
+) -> Option<String> {
+    let key = slack_event_dedupe_key(envelope)?;
+    let now = std::time::Instant::now();
+    seen_events.retain(|_, seen_at| now.duration_since(*seen_at) < SLACK_EVENT_DEDUPE_TTL);
+    if seen_events.contains_key(&key) {
+        return Some(key);
+    }
+    seen_events.insert(key, now);
+    None
+}
+
+fn slack_ingress_audit(envelope: &serde_json::Value) -> IngressAuditGuard {
+    let event = &envelope["payload"]["event"];
+    let event_type = event["type"].as_str().unwrap_or("unknown");
+    let subtype = event["subtype"].as_str();
+    let event_kind = subtype.map_or_else(
+        || event_type.to_string(),
+        |subtype| format!("{event_type}:{subtype}"),
+    );
+    let event_id = envelope["payload"]["event_id"]
+        .as_str()
+        .or_else(|| event["event_ts"].as_str())
+        .or_else(|| event["ts"].as_str())
+        .or_else(|| envelope["envelope_id"].as_str())
+        .unwrap_or("");
+    let sender_id = event["user"]
+        .as_str()
+        .or_else(|| event["bot_id"].as_str())
+        .unwrap_or("");
+    let attachment_count = event["files"].as_array().map_or(0, Vec::len)
+        + event["attachments"].as_array().map_or(0, Vec::len);
+
+    IngressAuditGuard::new(IngressAuditRecord::new(
+        "slack",
+        event_id,
+        event["channel"].as_str().unwrap_or(""),
+        event["thread_ts"].as_str().map(ToOwned::to_owned),
+        envelope["payload"]["team_id"]
+            .as_str()
+            .map(ToOwned::to_owned),
+        sender_id,
+        event["bot_id"].is_string() || subtype == Some("bot_message"),
+        event["event_ts"]
+            .as_str()
+            .or_else(|| event["ts"].as_str())
+            .map(ToOwned::to_owned),
+        event_kind,
+        event["text"]
+            .as_str()
+            .map_or(0, |text| text.chars().count()),
+        attachment_count,
+    ))
+}
+
+fn slack_event_dedupe_key(envelope: &serde_json::Value) -> Option<String> {
+    if let Some(event_id) = envelope["payload"]["event_id"].as_str() {
+        if !event_id.is_empty() {
+            return Some(format!("event:{event_id}"));
+        }
+    }
+
+    let event = &envelope["payload"]["event"];
+    let event_type = event["type"].as_str().unwrap_or("");
+    let channel = event["channel"]
+        .as_str()
+        .or_else(|| event["item"]["channel"].as_str())
+        .unwrap_or("");
+    let ts = event["ts"]
+        .as_str()
+        .or_else(|| event["event_ts"].as_str())
+        .or_else(|| event["item"]["ts"].as_str())
+        .unwrap_or("");
+    let actor = event["user"]
+        .as_str()
+        .or_else(|| event["bot_id"].as_str())
+        .unwrap_or("");
+
+    if event_type.is_empty() || channel.is_empty() || ts.is_empty() {
+        return None;
+    }
+
+    Some(format!(
+        "event-fallback:{event_type}:{channel}:{ts}:{actor}"
+    ))
+}
+
+fn recovered_slack_message(
+    channel_id: &str,
+    message: &serde_json::Value,
+) -> Option<RecoveredMessage> {
+    let message_ts = message["ts"].as_str()?;
+    let sender_id = message["user"]
+        .as_str()
+        .or_else(|| message["bot_id"].as_str())
+        .map(ToOwned::to_owned);
+    let attachment_count = message["files"].as_array().map_or(0, Vec::len)
+        + message["attachments"].as_array().map_or(0, Vec::len);
+    Some(RecoveredMessage {
+        channel_id: channel_id.to_string(),
+        thread_id: message["thread_ts"].as_str().map(ToOwned::to_owned),
+        message_id: message_ts.to_string(),
+        sender_id,
+        sender_name: None,
+        timestamp: Some(crate::timestamp::slack_ts_to_iso8601(message_ts)),
+        content: message["text"].as_str().unwrap_or_default().to_string(),
+        attachment_count,
+        relations: Vec::new(),
+    })
+}
+
+fn slack_response_messages(response: &serde_json::Value) -> Vec<serde_json::Value> {
+    let mut messages = response["messages"].as_array().cloned().unwrap_or_default();
+    messages.sort_by(|left, right| {
+        left["ts"]
+            .as_str()
+            .unwrap_or_default()
+            .cmp(right["ts"].as_str().unwrap_or_default())
+    });
+    messages
+}
+
+#[allow(clippy::too_many_arguments)]
+fn add_slack_window(
+    collector: &mut ContextCollector<'_>,
+    channel_id: &str,
+    mut messages: Vec<serde_json::Value>,
+    target_ts: &str,
+    before_limit: usize,
+    after_limit: usize,
+    target_relation: Option<&str>,
+    neighbor_relation: &str,
+) -> bool {
+    messages.sort_by(|left, right| {
+        left["ts"]
+            .as_str()
+            .unwrap_or_default()
+            .cmp(right["ts"].as_str().unwrap_or_default())
+    });
+    let target_index = messages
+        .iter()
+        .position(|message| message["ts"].as_str() == Some(target_ts));
+    let insertion_index = target_index.unwrap_or_else(|| {
+        messages
+            .iter()
+            .position(|message| message["ts"].as_str().is_some_and(|ts| ts > target_ts))
+            .unwrap_or(messages.len())
+    });
+    let before_start = insertion_index.saturating_sub(before_limit);
+    for message in &messages[before_start..insertion_index] {
+        if let Some(recovered) = recovered_slack_message(channel_id, message) {
+            collector.add(recovered, neighbor_relation);
+        }
+    }
+
+    if let (Some(index), Some(relation)) = (target_index, target_relation) {
+        if let Some(recovered) = recovered_slack_message(channel_id, &messages[index]) {
+            collector.add(recovered, relation);
+        }
+    }
+
+    let after_start = target_index.map_or(insertion_index, |index| index + 1);
+    let after_end = (after_start + after_limit).min(messages.len());
+    for message in &messages[after_start..after_end] {
+        if let Some(recovered) = recovered_slack_message(channel_id, message) {
+            collector.add(recovered, neighbor_relation);
+        }
+    }
+    target_index.is_some()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn add_complete_slack_after_window(
+    collector: &mut ContextCollector<'_>,
+    channel_id: &str,
+    response: &serde_json::Value,
+    after_limit: usize,
+    neighbor_relation: &str,
+    failure_operation: &str,
+    source_ref: &str,
+) {
+    if after_limit == 0 {
+        return;
+    }
+    if response["has_more"].as_bool() != Some(false) {
+        collector.failure(
+            failure_operation,
+            "window_truncated",
+            Some(source_ref.to_string()),
+        );
+        return;
+    }
+
+    for message in slack_response_messages(response)
+        .into_iter()
+        .take(after_limit)
+    {
+        if let Some(recovered) = recovered_slack_message(channel_id, &message) {
+            collector.add(recovered, neighbor_relation);
+        }
+    }
+}
+
+async fn recover_slack_link(
+    collector: &mut ContextCollector<'_>,
+    adapter: &SlackAdapter,
+    link: &SlackMessageLink,
+    config: &ContextRecoveryConfig,
+) {
+    let source_ref = format!("slack:{}:{}", link.channel_id, link.message_ts);
+    if let Some(thread_ts) = &link.thread_ts {
+        let fetch_limit = config
+            .history_limit
+            .saturating_mul(4)
+            .clamp(50, 200)
+            .to_string();
+        match adapter
+            .api_get(
+                "conversations.replies",
+                &[
+                    ("channel", link.channel_id.as_str()),
+                    ("ts", thread_ts.as_str()),
+                    ("limit", fetch_limit.as_str()),
+                    ("inclusive", "true"),
+                ],
+            )
+            .await
+        {
+            Ok(response) => {
+                let messages = slack_response_messages(&response);
+                let root = messages
+                    .iter()
+                    .find(|message| message["ts"].as_str() == Some(thread_ts.as_str()))
+                    .and_then(|message| recovered_slack_message(&link.channel_id, message));
+                if let Some(root) = root {
+                    collector.add(root, "thread_root");
+                } else {
+                    collector.failure(
+                        "thread_root",
+                        "target_not_found",
+                        Some(format!("slack:{}:{thread_ts}", link.channel_id)),
+                    );
+                }
+                let found = add_slack_window(
+                    collector,
+                    &link.channel_id,
+                    messages,
+                    &link.message_ts,
+                    config.link_neighbors,
+                    config.link_neighbors,
+                    Some("linked_target"),
+                    "linked_neighbor",
+                );
+                let truncated = response["has_more"].as_bool() == Some(true);
+                if !found {
+                    let code = if truncated {
+                        "window_truncated"
+                    } else {
+                        "target_not_found"
+                    };
+                    collector.failure("linked_target", code, Some(source_ref));
+                } else if truncated {
+                    collector.failure("linked_neighbors", "window_truncated", Some(source_ref));
+                }
+            }
+            Err(error) => {
+                debug!(
+                    channel_id = link.channel_id,
+                    message_ts = link.message_ts,
+                    error = %error,
+                    "Slack context recovery could not fetch linked thread"
+                );
+                collector.failure("linked_target", "api_error", Some(source_ref));
+            }
+        }
+        return;
+    }
+
+    match adapter
+        .api_get(
+            "conversations.history",
+            &[
+                ("channel", link.channel_id.as_str()),
+                ("oldest", link.message_ts.as_str()),
+                ("latest", link.message_ts.as_str()),
+                ("inclusive", "true"),
+                ("limit", "1"),
+            ],
+        )
+        .await
+    {
+        Ok(response) => {
+            let found = add_slack_window(
+                collector,
+                &link.channel_id,
+                slack_response_messages(&response),
+                &link.message_ts,
+                0,
+                0,
+                Some("linked_target"),
+                "linked_neighbor",
+            );
+            if !found {
+                collector.failure("linked_target", "target_not_found", Some(source_ref));
+                return;
+            }
+        }
+        Err(error) => {
+            debug!(
+                channel_id = link.channel_id,
+                message_ts = link.message_ts,
+                error = %error,
+                "Slack context recovery could not fetch linked target"
+            );
+            collector.failure("linked_target", "api_error", Some(source_ref));
+            return;
+        }
+    }
+
+    if config.link_neighbors > 0 {
+        let neighbor_limit = config.link_neighbors.to_string();
+        let before_params = [
+            ("channel", link.channel_id.as_str()),
+            ("latest", link.message_ts.as_str()),
+            ("inclusive", "false"),
+            ("limit", neighbor_limit.as_str()),
+        ];
+        match adapter
+            .api_get("conversations.history", &before_params)
+            .await
+        {
+            Ok(response) => {
+                for message in slack_response_messages(&response) {
+                    if let Some(recovered) = recovered_slack_message(&link.channel_id, &message) {
+                        collector.add(recovered, "linked_neighbor");
+                    }
+                }
+            }
+            Err(error) => {
+                debug!(
+                    channel_id = link.channel_id,
+                    message_ts = link.message_ts,
+                    direction = "before",
+                    error = %error,
+                    "Slack context recovery could not fetch linked neighbors"
+                );
+                collector.failure("linked_neighbors", "api_error", Some(source_ref.clone()));
+            }
+        }
+
+        let after_params = [
+            ("channel", link.channel_id.as_str()),
+            ("oldest", link.message_ts.as_str()),
+            ("inclusive", "false"),
+            ("limit", SLACK_CONTEXT_AFTER_FETCH_LIMIT),
+        ];
+        match adapter
+            .api_get("conversations.history", &after_params)
+            .await
+        {
+            Ok(response) => add_complete_slack_after_window(
+                collector,
+                &link.channel_id,
+                &response,
+                config.link_neighbors,
+                "linked_neighbor",
+                "linked_neighbors",
+                &source_ref,
+            ),
+            Err(error) => {
+                debug!(
+                    channel_id = link.channel_id,
+                    message_ts = link.message_ts,
+                    direction = "after",
+                    error = %error,
+                    "Slack context recovery could not fetch linked neighbors"
+                );
+                collector.failure("linked_neighbors", "api_error", Some(source_ref));
+            }
+        }
+    }
+}
+
+async fn recover_slack_context(
+    event: &serde_json::Value,
+    adapter: &SlackAdapter,
+    config: &ContextRecoveryConfig,
+    allow_all_channels: bool,
+    allowed_channels: &HashSet<String>,
+) -> Option<RecoveredContext> {
+    if !config.enabled {
+        return None;
+    }
+    let channel_id = event["channel"].as_str()?;
+    let message_ts = event["ts"].as_str()?;
+    if config.settle_delay_ms > 0 {
+        tokio::time::sleep(std::time::Duration::from_millis(config.settle_delay_ms)).await;
+    }
+
+    let mut collector = ContextCollector::new(config);
+    if let Some(thread_ts) = event["thread_ts"].as_str() {
+        let fetch_limit = config
+            .history_limit
+            .saturating_mul(4)
+            .clamp(50, 200)
+            .to_string();
+        match adapter
+            .api_get(
+                "conversations.replies",
+                &[
+                    ("channel", channel_id),
+                    ("ts", thread_ts),
+                    ("limit", fetch_limit.as_str()),
+                    ("inclusive", "true"),
+                ],
+            )
+            .await
+        {
+            Ok(response) => {
+                let messages = slack_response_messages(&response);
+                let root = messages
+                    .iter()
+                    .find(|message| message["ts"].as_str() == Some(thread_ts))
+                    .and_then(|message| recovered_slack_message(channel_id, message));
+                if let Some(root) = root {
+                    collector.add(root, "thread_root");
+                } else {
+                    collector.failure(
+                        "thread_root",
+                        "target_not_found",
+                        Some(format!("slack:{channel_id}:{thread_ts}")),
+                    );
+                }
+                let before_limit = config.history_limit.div_ceil(2);
+                let after_limit = config.history_limit / 2;
+                let found = add_slack_window(
+                    &mut collector,
+                    channel_id,
+                    messages,
+                    message_ts,
+                    before_limit,
+                    after_limit,
+                    None,
+                    "current_window",
+                );
+                if response["has_more"].as_bool() == Some(true) {
+                    collector.failure(
+                        "current_window",
+                        "window_truncated",
+                        Some(format!("slack:{channel_id}:{message_ts}")),
+                    );
+                } else if !found {
+                    collector.failure(
+                        "current_window",
+                        "target_not_found",
+                        Some(format!("slack:{channel_id}:{message_ts}")),
+                    );
+                }
+            }
+            Err(error) => {
+                debug!(
+                    channel_id,
+                    thread_ts,
+                    error = %error,
+                    "Slack context recovery could not fetch current thread"
+                );
+                collector.failure(
+                    "current_window",
+                    "api_error",
+                    Some(format!("slack:{channel_id}:{message_ts}")),
+                );
+            }
+        }
+    } else {
+        let before_limit = config.history_limit.div_ceil(2);
+        let after_limit = config.history_limit / 2;
+        if before_limit > 0 {
+            let before_limit = before_limit.to_string();
+            let before_params = [
+                ("channel", channel_id),
+                ("latest", message_ts),
+                ("inclusive", "false"),
+                ("limit", before_limit.as_str()),
+            ];
+            match adapter
+                .api_get("conversations.history", &before_params)
+                .await
+            {
+                Ok(response) => {
+                    for message in slack_response_messages(&response) {
+                        if let Some(recovered) = recovered_slack_message(channel_id, &message) {
+                            collector.add(recovered, "current_window");
+                        }
+                    }
+                }
+                Err(error) => {
+                    debug!(
+                        channel_id,
+                        message_ts,
+                        direction = "before",
+                        error = %error,
+                        "Slack context recovery could not fetch current window"
+                    );
+                    collector.failure(
+                        "current_window",
+                        "api_error",
+                        Some(format!("slack:{channel_id}:{message_ts}")),
+                    );
+                }
+            }
+        }
+        if after_limit > 0 {
+            let after_params = [
+                ("channel", channel_id),
+                ("oldest", message_ts),
+                ("inclusive", "false"),
+                ("limit", SLACK_CONTEXT_AFTER_FETCH_LIMIT),
+            ];
+            match adapter
+                .api_get("conversations.history", &after_params)
+                .await
+            {
+                Ok(response) => add_complete_slack_after_window(
+                    &mut collector,
+                    channel_id,
+                    &response,
+                    after_limit,
+                    "current_window",
+                    "current_window",
+                    &format!("slack:{channel_id}:{message_ts}"),
+                ),
+                Err(error) => {
+                    debug!(
+                        channel_id,
+                        message_ts,
+                        direction = "after",
+                        error = %error,
+                        "Slack context recovery could not fetch current window"
+                    );
+                    collector.failure(
+                        "current_window",
+                        "api_error",
+                        Some(format!("slack:{channel_id}:{message_ts}")),
+                    );
+                }
+            }
+        }
+    }
+
+    let links = slack_message_links(
+        event["text"].as_str().unwrap_or_default(),
+        config.link_limit,
+    );
+    let workspace_host = if links.is_empty() {
+        None
+    } else {
+        adapter.get_workspace_host().await
+    };
+    for link in links {
+        if workspace_host != Some(link.workspace.as_str()) {
+            collector.failure(
+                "linked_target",
+                if workspace_host.is_some() {
+                    "disallowed_workspace"
+                } else {
+                    "workspace_unverified"
+                },
+                Some(format!("slack:{}:{}", link.channel_id, link.message_ts)),
+            );
+            continue;
+        }
+        if !allow_all_channels && !allowed_channels.contains(&link.channel_id) {
+            collector.failure(
+                "linked_target",
+                "disallowed_target",
+                Some(format!("slack:{}:{}", link.channel_id, link.message_ts)),
+            );
+            continue;
+        }
+        recover_slack_link(&mut collector, adapter, &link, config).await;
+    }
+
+    collector.finish()
+}
+
 /// Call apps.connections.open to get a WebSocket URL for Socket Mode.
 async fn get_socket_mode_url(app_token: &str) -> Result<String> {
     let client = reqwest::Client::new();
@@ -893,37 +1689,54 @@ async fn handle_message(
     allowed_channels: &HashSet<String>,
     allowed_users: &HashSet<String>,
     stt_config: &SttConfig,
+    context_recovery: &ContextRecoveryConfig,
+    inbound_attachment_content_blocks: bool,
     dispatcher: &Arc<crate::dispatch::Dispatcher>,
+    mut audit: IngressAuditGuard,
 ) {
     let channel_id = match event["channel"].as_str() {
         Some(ch) => ch.to_string(),
-        None => return,
+        None => {
+            audit.finish(IngressDecision::MalformedEvent);
+            return;
+        }
     };
     // Bot messages may lack "user" field — fall back to "bot_id" as sender identifier
     let user_id = match event["user"].as_str().or_else(|| event["bot_id"].as_str()) {
         Some(u) => u.to_string(),
-        None => return,
+        None => {
+            audit.finish(IngressDecision::MalformedEvent);
+            return;
+        }
     };
     let is_bot_msg =
         event["bot_id"].is_string() || event["subtype"].as_str() == Some("bot_message");
     let text = match event["text"].as_str() {
         Some(t) => t.to_string(),
-        None => return,
+        None => {
+            audit.finish(IngressDecision::MalformedEvent);
+            return;
+        }
     };
     let ts = match event["ts"].as_str() {
         Some(ts) => ts.to_string(),
-        None => return,
+        None => {
+            audit.finish(IngressDecision::MalformedEvent);
+            return;
+        }
     };
     let thread_ts = event["thread_ts"].as_str().map(|s| s.to_string());
 
     // Check allowed channels
     if !allow_all_channels && !allowed_channels.contains(&channel_id) {
+        audit.finish(IngressDecision::ChannelDenied);
         return;
     }
 
     // Check allowed users — skip for bot messages (they go through trusted_bot_ids instead)
     if !is_bot_msg && !allow_all_users && !allowed_users.contains(&user_id) {
         tracing::info!(user_id, "denied Slack user, ignoring");
+        audit.finish(IngressDecision::UserDenied);
         let msg_ref = MessageRef {
             channel: ChannelRef {
                 platform: "slack".into(),
@@ -947,162 +1760,140 @@ async fn handle_message(
     let files = event["files"].as_array();
     let has_files = files.is_some_and(|f| !f.is_empty());
 
-    if prompt.is_empty() && !has_files {
+    if prompt.is_empty() && (!has_files || !inbound_attachment_content_blocks) {
+        audit.finish(IngressDecision::EmptyContent);
         return;
     }
 
-    // Caps mirror Discord's text-file attachment flow (PR #291) so both
-    // adapters apply the same limits: 5 files or 1 MB of text per message.
-    const TEXT_TOTAL_CAP: u64 = 1024 * 1024;
+    // Match Discord's attachment-count guard while allowing files of any size.
     const TEXT_FILE_COUNT_CAP: u32 = 5;
 
     let mut extra_blocks = Vec::new();
     let mut echo_entries: Vec<crate::stt::EchoEntry> = Vec::new();
-    let mut text_file_bytes: u64 = 0;
     let mut text_file_count: u32 = 0;
     let mut failed_image_files: Vec<String> = Vec::new();
 
-    if let Some(files) = files {
-        for file in files {
-            let mimetype_raw = file["mimetype"].as_str().unwrap_or("");
-            let mimetype = strip_mime_params(mimetype_raw);
-            let filename = file["name"].as_str().unwrap_or("file");
-            let size = file["size"].as_u64().unwrap_or(0);
-            // Slack private files require Bearer token to download
-            let url = slack_file_download_url(file);
+    if inbound_attachment_content_blocks {
+        if let Some(files) = files {
+            for file in files {
+                let mimetype_raw = file["mimetype"].as_str().unwrap_or("");
+                let mimetype = strip_mime_params(mimetype_raw);
+                let filename = file["name"].as_str().unwrap_or("file");
+                let size = file["size"].as_u64().unwrap_or(0);
+                // Slack private files require Bearer token to download
+                let url = slack_file_download_url(file);
 
-            if url.is_empty() {
-                continue;
-            }
+                if url.is_empty() {
+                    continue;
+                }
 
-            if media::is_audio_mime(mimetype) {
-                if stt_config.enabled {
-                    match media::download_and_transcribe(
+                if media::is_audio_mime(mimetype) {
+                    if stt_config.enabled {
+                        match media::download_and_transcribe(
+                            url,
+                            filename,
+                            mimetype,
+                            size,
+                            stt_config,
+                            Some(bot_token),
+                        )
+                        .await
+                        {
+                            Some(transcript) => {
+                                debug!(
+                                    filename,
+                                    chars = transcript.len(),
+                                    "voice transcript injected"
+                                );
+                                extra_blocks.insert(
+                                    0,
+                                    ContentBlock::Text {
+                                        text: format!("[Voice message transcript]: {transcript}"),
+                                    },
+                                );
+                                echo_entries.push(crate::stt::EchoEntry::Success(transcript));
+                            }
+                            None => {
+                                warn!(filename, "STT failed for voice attachment");
+                                echo_entries.push(crate::stt::EchoEntry::Failed);
+                            }
+                        }
+                    } else {
+                        debug!(filename, "skipping audio attachment (STT disabled)");
+                        let msg_ref = MessageRef {
+                            channel: ChannelRef {
+                                platform: "slack".into(),
+                                channel_id: channel_id.clone(),
+                                thread_id: thread_ts.clone(),
+                                parent_id: None,
+                                origin_event_id: None,
+                            },
+                            message_id: ts.clone(),
+                        };
+                        let _ = adapter.add_reaction(&msg_ref, "🎤").await;
+                    }
+                } else if media::is_text_file(filename, Some(mimetype)) {
+                    if text_file_count >= TEXT_FILE_COUNT_CAP {
+                        debug!(
+                            filename,
+                            count = text_file_count,
+                            "text file count cap reached, skipping"
+                        );
+                        continue;
+                    }
+                    if let Some((block, _)) =
+                        media::download_and_read_text_file(url, filename, size, Some(bot_token))
+                            .await
+                    {
+                        text_file_count += 1;
+                        debug!(filename, "adding text file attachment");
+                        extra_blocks.push(block);
+                    }
+                } else {
+                    match media::download_and_encode_image(
                         url,
+                        Some(mimetype),
                         filename,
-                        mimetype,
                         size,
-                        stt_config,
                         Some(bot_token),
                     )
                     .await
                     {
-                        Some(transcript) => {
-                            debug!(
-                                filename,
-                                chars = transcript.len(),
-                                "voice transcript injected"
-                            );
-                            extra_blocks.insert(
-                                0,
-                                ContentBlock::Text {
-                                    text: format!("[Voice message transcript]: {transcript}"),
-                                },
-                            );
-                            echo_entries.push(crate::stt::EchoEntry::Success(transcript));
+                        Ok(block) => {
+                            debug!(filename, "adding image attachment");
+                            extra_blocks.push(block);
                         }
-                        None => {
-                            warn!(filename, "STT failed for voice attachment");
-                            echo_entries.push(crate::stt::EchoEntry::Failed);
-                        }
-                    }
-                } else {
-                    debug!(filename, "skipping audio attachment (STT disabled)");
-                    let msg_ref = MessageRef {
-                        channel: ChannelRef {
-                            platform: "slack".into(),
-                            channel_id: channel_id.clone(),
-                            thread_id: thread_ts.clone(),
-                            parent_id: None,
-                            origin_event_id: None,
-                        },
-                        message_id: ts.clone(),
-                    };
-                    let _ = adapter.add_reaction(&msg_ref, "🎤").await;
-                }
-            } else if media::is_text_file(filename, Some(mimetype)) {
-                if text_file_count >= TEXT_FILE_COUNT_CAP {
-                    debug!(
-                        filename,
-                        count = text_file_count,
-                        "text file count cap reached, skipping"
-                    );
-                    continue;
-                }
-                // Pre-check with Slack-reported size as a fast path when the
-                // field is populated. Slack can report `size == 0` for
-                // externally-backed files, so this is advisory only — the
-                // authoritative cap check happens after download using
-                // `actual_bytes`.
-                if size > 0 && text_file_bytes + size > TEXT_TOTAL_CAP {
-                    debug!(
-                        filename,
-                        total = text_file_bytes,
-                        "text attachments total exceeds 1MB cap, skipping remaining"
-                    );
-                    continue;
-                }
-                if let Some((block, actual_bytes)) =
-                    media::download_and_read_text_file(url, filename, size, Some(bot_token)).await
-                {
-                    if text_file_bytes + actual_bytes > TEXT_TOTAL_CAP {
-                        debug!(
-                            filename,
-                            running = text_file_bytes,
-                            actual = actual_bytes,
-                            "text attachments total exceeds 1MB cap after download, dropping file",
-                        );
-                        continue;
-                    }
-                    text_file_bytes += actual_bytes;
-                    text_file_count += 1;
-                    debug!(filename, "adding text file attachment");
-                    extra_blocks.push(block);
-                }
-            } else {
-                match media::download_and_encode_image(
-                    url,
-                    Some(mimetype),
-                    filename,
-                    size,
-                    Some(bot_token),
-                )
-                .await
-                {
-                    Ok(block) => {
-                        debug!(filename, "adding image attachment");
-                        extra_blocks.push(block);
-                    }
-                    Err(media::MediaFetchError::NotAnImage) => {}
-                    Err(media::MediaFetchError::SizeExceeded { actual, limit }) => {
-                        warn!(filename, actual, limit, "image exceeds size limit");
-                        failed_image_files.push(filename.to_string());
-                    }
-                    Err(
-                        media::MediaFetchError::UnsupportedResponseType { .. }
-                        | media::MediaFetchError::InvalidImageBody { .. },
-                    ) => {
-                        warn!(
+                        Err(media::MediaFetchError::NotAnImage) => {}
+                        Err(
+                            media::MediaFetchError::UnsupportedResponseType { .. }
+                            | media::MediaFetchError::InvalidImageBody { .. },
+                        ) => {
+                            warn!(
                             filename,
                             "image validation failed; server may have returned non-image content"
                         );
-                        failed_image_files.push(filename.to_string());
-                    }
-                    Err(media::MediaFetchError::ProcessingFailed(ref e)) => {
-                        warn!(filename, error = %e, "image post-processing failed");
-                        failed_image_files.push(filename.to_string());
-                    }
-                    Err(media::MediaFetchError::HttpStatus(status)) if status.is_client_error() => {
-                        warn!(filename, %status, "image download denied");
-                        failed_image_files.push(filename.to_string());
-                    }
-                    Err(e) => {
-                        warn!(filename, error = %e, "image download failed");
-                        failed_image_files.push(filename.to_string());
+                            failed_image_files.push(filename.to_string());
+                        }
+                        Err(media::MediaFetchError::ProcessingFailed(ref e)) => {
+                            warn!(filename, error = %e, "image post-processing failed");
+                            failed_image_files.push(filename.to_string());
+                        }
+                        Err(media::MediaFetchError::HttpStatus(status))
+                            if status.is_client_error() =>
+                        {
+                            warn!(filename, %status, "image download denied");
+                            failed_image_files.push(filename.to_string());
+                        }
+                        Err(e) => {
+                            warn!(filename, error = %e, "image download failed");
+                            failed_image_files.push(filename.to_string());
+                        }
                     }
                 }
             }
         }
+    } else if has_files {
+        debug!("inbound attachment ContentBlocks disabled; not forwarding Slack files to ACP");
     }
 
     // Notify user if any images couldn't be processed.
@@ -1122,8 +1913,7 @@ async fn handle_message(
         let msg = format!(
             ":warning: I couldn't process the file(s) you shared (`{file_list}`). \
              This can happen when the bot lacks the `files:read` OAuth scope, \
-             the file format isn't supported (PNG/JPEG/GIF/WebP only), \
-             or the file is too large."
+             or the file format isn't supported (PNG/JPEG/GIF/WebP only)."
         );
         if let Err(e) = adapter.send_message(&warn_channel, &msg).await {
             warn!(error = %e, "failed to send image validation warning to user");
@@ -1148,6 +1938,14 @@ async fn handle_message(
         timestamp: Some(crate::timestamp::slack_ts_to_iso8601(&ts)),
         message_id: Some(ts.clone()),
         receiver_id: bot_id.map(|id| id.to_string()),
+        recovered_context: recover_slack_context(
+            event,
+            adapter,
+            context_recovery,
+            allow_all_channels,
+            allowed_channels,
+        )
+        .await,
     };
 
     let trigger_msg = MessageRef {
@@ -1218,11 +2016,15 @@ async fn handle_message(
         estimated_tokens,
         other_bot_present,
     };
-    if let Err(e) = dispatcher
+    match dispatcher
         .submit(thread_key, thread_channel, adapter_dyn, buf_msg)
         .await
     {
-        error!("Slack dispatcher submit error: {e}");
+        Ok(()) => audit.finish(IngressDecision::Dispatched),
+        Err(e) => {
+            audit.finish(IngressDecision::DispatchFailed);
+            error!("Slack dispatcher submit error: {e}");
+        }
     }
 }
 
@@ -1325,6 +2127,127 @@ fn bot_id_matches_trusted(
         || resolved_user_id.is_some_and(|uid| trusted_bot_ids.contains(uid))
 }
 
+fn slack_api_error_message(method: &str, json: &serde_json::Value) -> String {
+    let err = json["error"].as_str().unwrap_or("unknown error");
+    let mut message = format!("Slack API {method}: {err}");
+
+    let needed = json["needed"].as_str().filter(|s| !s.is_empty());
+    let provided = json["provided"].as_str().filter(|s| !s.is_empty());
+    let response_messages = json["response_metadata"]["messages"]
+        .as_array()
+        .into_iter()
+        .flat_map(|messages| messages.iter().filter_map(|message| message.as_str()))
+        .filter(|message| !message.is_empty())
+        .collect::<Vec<_>>();
+    let mut details = Vec::new();
+    if let Some(needed) = needed {
+        details.push(format!("needed: {needed}"));
+    }
+    if let Some(provided) = provided {
+        details.push(format!("provided: {provided}"));
+    }
+    if !response_messages.is_empty() {
+        details.push(format!("messages: {}", response_messages.join("; ")));
+    }
+    if !details.is_empty() {
+        message.push_str(" (");
+        message.push_str(&details.join("; "));
+        message.push(')');
+    }
+
+    if err == "missing_scope"
+        && slack_scope_list_contains(needed.unwrap_or_default(), "files:write")
+    {
+        message.push_str("; add files:write to Slack Bot Token Scopes and reinstall the app");
+    }
+
+    message
+}
+
+fn slack_scope_list_contains(scopes: &str, target: &str) -> bool {
+    scopes.split(',').any(|scope| scope.trim() == target)
+}
+
+fn slack_upload_thread_ts<'a>(
+    channel_thread_ts: Option<&'a str>,
+    reply_to_message_id: Option<&'a str>,
+) -> Option<&'a str> {
+    channel_thread_ts
+        .filter(|ts| !ts.is_empty())
+        .or_else(|| reply_to_message_id.filter(|ts| !ts.is_empty()))
+}
+
+fn slack_complete_upload_body(
+    channel_id: &str,
+    thread_ts: Option<&str>,
+    content: &str,
+    files: &[SlackCompletedUploadFile],
+) -> serde_json::Value {
+    let uploaded_files: Vec<_> = files
+        .iter()
+        .map(|file| {
+            serde_json::json!({
+                "id": file.id,
+                "title": file.title,
+            })
+        })
+        .collect();
+    let mut body = serde_json::json!({
+        "channel_id": channel_id,
+        "files": uploaded_files,
+    });
+    if let Some(thread_ts) = thread_ts.filter(|ts| !ts.is_empty()) {
+        body["thread_ts"] = serde_json::Value::String(thread_ts.to_string());
+    }
+    if !content.is_empty() {
+        body["initial_comment"] = serde_json::Value::String(markdown_to_mrkdwn(content));
+    }
+    body
+}
+
+fn extract_slack_file_share_ts<'a>(
+    complete_upload_response: &'a serde_json::Value,
+    channel_id: &str,
+) -> Option<&'a str> {
+    if let Some(files) = complete_upload_response["files"].as_array() {
+        for file in files {
+            if let Some(ts) = extract_slack_file_share_ts_from_file(file, channel_id) {
+                return Some(ts);
+            }
+        }
+    }
+    extract_slack_file_share_ts_from_file(&complete_upload_response["file"], channel_id)
+}
+
+fn extract_slack_file_share_ts_from_file<'a>(
+    file: &'a serde_json::Value,
+    channel_id: &str,
+) -> Option<&'a str> {
+    for visibility in ["public", "private"] {
+        let Some(shares) = file["shares"][visibility].as_object() else {
+            continue;
+        };
+        if let Some(ts) = shares
+            .get(channel_id)
+            .and_then(|entries| entries.as_array())
+            .and_then(|entries| entries.first())
+            .and_then(|entry| entry["ts"].as_str())
+        {
+            return Some(ts);
+        }
+        for entries in shares.values() {
+            if let Some(ts) = entries
+                .as_array()
+                .and_then(|entries| entries.first())
+                .and_then(|entry| entry["ts"].as_str())
+            {
+                return Some(ts);
+            }
+        }
+    }
+    None
+}
+
 /// True only when a Slack non-bot event represents a real user message
 /// that should reset the bot-turn counter.
 ///
@@ -1376,6 +2299,162 @@ fn markdown_to_mrkdwn(text: &str) -> String {
 mod tests {
     use super::*;
     use crate::adapter::ChatAdapter;
+    use serde_json::json;
+
+    fn recovery_config() -> ContextRecoveryConfig {
+        ContextRecoveryConfig {
+            enabled: true,
+            history_limit: 12,
+            link_limit: 4,
+            link_neighbors: 2,
+            max_message_chars: 2_000,
+            max_total_chars: 12_000,
+            settle_delay_ms: 0,
+        }
+    }
+
+    #[test]
+    fn recovered_message_preserves_thread_and_attachment_count() {
+        let message = json!({
+            "ts": "1721234567.123456",
+            "thread_ts": "1721234000.654321",
+            "user": "U123",
+            "text": "context",
+            "files": [{"id": "F1"}],
+            "attachments": [{"id": "A1"}]
+        });
+        let recovered = recovered_slack_message("C123", &message).unwrap();
+        assert_eq!(recovered.message_id, "1721234567.123456");
+        assert_eq!(recovered.thread_id.as_deref(), Some("1721234000.654321"));
+        assert_eq!(recovered.sender_id.as_deref(), Some("U123"));
+        assert_eq!(recovered.attachment_count, 2);
+    }
+
+    #[test]
+    fn slack_window_selects_target_and_bounded_neighbors() {
+        let cfg = recovery_config();
+        let mut collector = ContextCollector::new(&cfg);
+        let messages = (1..=5)
+            .map(|index| {
+                json!({
+                    "ts": format!("172123400{index}.000001"),
+                    "user": "U123",
+                    "text": format!("message-{index}")
+                })
+            })
+            .collect();
+        assert!(add_slack_window(
+            &mut collector,
+            "C123",
+            messages,
+            "1721234003.000001",
+            1,
+            1,
+            Some("linked_target"),
+            "linked_neighbor",
+        ));
+        let context = collector.finish().unwrap();
+        let ids: Vec<_> = context
+            .messages
+            .iter()
+            .map(|message| message.message_id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                "1721234002.000001",
+                "1721234003.000001",
+                "1721234004.000001"
+            ]
+        );
+        assert_eq!(context.messages[1].relations, vec!["linked_target"]);
+    }
+
+    #[test]
+    fn linked_after_window_does_not_present_distant_messages_when_truncated() {
+        let cfg = recovery_config();
+        let mut collector = ContextCollector::new(&cfg);
+        let response = json!({
+            "has_more": true,
+            "messages": [
+                {"ts": "1721234999.000001", "user": "U123", "text": "distant-20"},
+                {"ts": "1721234998.000001", "user": "U123", "text": "distant-19"}
+            ]
+        });
+        add_complete_slack_after_window(
+            &mut collector,
+            "C123",
+            &response,
+            2,
+            "linked_neighbor",
+            "linked_neighbors",
+            "slack:C123:1721234000.000001",
+        );
+        let context = collector.finish().unwrap();
+        assert!(context.messages.is_empty());
+        assert!(context.incomplete);
+        assert_eq!(context.failures[0].operation, "linked_neighbors");
+        assert_eq!(context.failures[0].code, "window_truncated");
+    }
+
+    #[test]
+    fn current_after_window_does_not_present_distant_messages_when_truncated() {
+        let cfg = recovery_config();
+        let mut collector = ContextCollector::new(&cfg);
+        let response = json!({
+            "has_more": true,
+            "messages": [
+                {"ts": "1721234999.000001", "user": "U123", "text": "distant-20"},
+                {"ts": "1721234998.000001", "user": "U123", "text": "distant-19"}
+            ]
+        });
+        add_complete_slack_after_window(
+            &mut collector,
+            "C123",
+            &response,
+            2,
+            "current_window",
+            "current_window",
+            "slack:C123:1721234000.000001",
+        );
+        let context = collector.finish().unwrap();
+        assert!(context.messages.is_empty());
+        assert!(context.incomplete);
+        assert_eq!(context.failures[0].operation, "current_window");
+        assert_eq!(context.failures[0].code, "window_truncated");
+    }
+
+    #[test]
+    fn complete_after_window_selects_nearest_messages_in_timestamp_order() {
+        let cfg = recovery_config();
+        let mut collector = ContextCollector::new(&cfg);
+        let response = json!({
+            "has_more": false,
+            "messages": [
+                {"ts": "1721234004.000001", "user": "U123", "text": "after-4"},
+                {"ts": "1721234003.000001", "user": "U123", "text": "after-3"},
+                {"ts": "1721234002.000001", "user": "U123", "text": "after-2"},
+                {"ts": "1721234001.000001", "user": "U123", "text": "after-1"}
+            ]
+        });
+        add_complete_slack_after_window(
+            &mut collector,
+            "C123",
+            &response,
+            2,
+            "current_window",
+            "current_window",
+            "slack:C123:1721234000.000001",
+        );
+        let context = collector.finish().unwrap();
+        let ids: Vec<_> = context
+            .messages
+            .iter()
+            .map(|message| message.message_id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["1721234001.000001", "1721234002.000001"]);
+        assert!(!context.incomplete);
+    }
 
     /// Bot's own `<@UID>` trigger mention is stripped.
     #[test]
@@ -1446,6 +2525,90 @@ mod tests {
     fn resolve_mentions_preserves_longer_uid_prefix() {
         let out = resolve_slack_mentions("<@U1BOTX> hello", Some("U1BOT"));
         assert_eq!(out, "<@U1BOTX> hello");
+    }
+
+    #[test]
+    fn slack_event_dedupe_key_prefers_payload_event_id() {
+        let envelope = json!({
+            "payload": {
+                "event_id": "Ev123",
+                "event": {
+                    "type": "message",
+                    "channel": "C123",
+                    "ts": "111.222",
+                    "user": "U123"
+                }
+            }
+        });
+        assert_eq!(
+            slack_event_dedupe_key(&envelope).as_deref(),
+            Some("event:Ev123")
+        );
+    }
+
+    #[test]
+    fn slack_ingress_audit_uses_envelope_fallback_without_content() {
+        let envelope = json!({
+            "envelope_id": "Ee123",
+            "payload": {
+                "team_id": "T123",
+                "event": {
+                    "type": "message",
+                    "channel": "C123",
+                    "user": "U123",
+                    "text": "private message",
+                    "files": [{"id": "F1"}]
+                }
+            }
+        });
+
+        let audit = slack_ingress_audit(&envelope);
+        let record = audit.snapshot().unwrap();
+        assert_eq!(record["event_id"], "Ee123");
+        assert_eq!(record["scope_id"], "T123");
+        assert_eq!(record["content_chars"], 15);
+        assert_eq!(record["attachment_count"], 1);
+        assert_eq!(record["route_decision"], "unclassified_drop");
+        assert!(record.get("content").is_none());
+    }
+
+    #[test]
+    fn slack_event_dedupe_key_falls_back_to_message_identity() {
+        let envelope = json!({
+            "payload": {
+                "event": {
+                    "type": "message",
+                    "channel": "C123",
+                    "ts": "111.222",
+                    "user": "U123"
+                }
+            }
+        });
+        assert_eq!(
+            slack_event_dedupe_key(&envelope).as_deref(),
+            Some("event-fallback:message:C123:111.222:U123")
+        );
+    }
+
+    #[test]
+    fn duplicate_slack_event_key_rejects_second_seen_event() {
+        let envelope = json!({
+            "payload": {
+                "event_id": "Ev123",
+                "event": {
+                    "type": "message",
+                    "channel": "C123",
+                    "ts": "111.222",
+                    "user": "U123"
+                }
+            }
+        });
+        let mut seen = HashMap::new();
+        assert_eq!(duplicate_slack_event_key(&mut seen, &envelope), None);
+        assert_eq!(
+            duplicate_slack_event_key(&mut seen, &envelope).as_deref(),
+            Some("event:Ev123")
+        );
     }
 
     // --- text_mentions_uid tests ---
@@ -1673,6 +2836,151 @@ mod tests {
     fn trusted_bot_ids_rejects_empty_event_bot_id() {
         let trusted = HashSet::from(["".to_string()]);
         assert!(!bot_id_matches_trusted(&trusted, "", None));
+    }
+
+    // --- Slack API error formatting tests ---
+
+    #[test]
+    fn api_error_message_includes_scope_details_and_upload_hint() {
+        let json = serde_json::json!({
+            "ok": false,
+            "error": "missing_scope",
+            "needed": "files:write",
+            "provided": "app_mentions:read,chat:write,files:read"
+        });
+
+        let message = slack_api_error_message("files.getUploadURLExternal", &json);
+
+        assert!(message.contains("Slack API files.getUploadURLExternal: missing_scope"));
+        assert!(message.contains("needed: files:write"));
+        assert!(message.contains("provided: app_mentions:read,chat:write,files:read"));
+        assert!(message.contains("add files:write to Slack Bot Token Scopes"));
+        assert!(message.contains("reinstall the app"));
+    }
+
+    #[test]
+    fn api_error_message_handles_missing_error_shape() {
+        let json = serde_json::json!({ "ok": false });
+
+        assert_eq!(
+            slack_api_error_message("chat.postMessage", &json),
+            "Slack API chat.postMessage: unknown error"
+        );
+    }
+
+    #[test]
+    fn api_error_message_includes_response_metadata_messages() {
+        let json = serde_json::json!({
+            "ok": false,
+            "error": "invalid_arguments",
+            "response_metadata": {
+                "messages": [
+                    "[ERROR] missing required field: length",
+                    "[ERROR] missing required field: filename"
+                ]
+            }
+        });
+
+        let message = slack_api_error_message("files.getUploadURLExternal", &json);
+
+        assert!(message.contains("Slack API files.getUploadURLExternal: invalid_arguments"));
+        assert!(message.contains("[ERROR] missing required field: length"));
+        assert!(message.contains("[ERROR] missing required field: filename"));
+    }
+
+    // --- outbound Slack upload tests ---
+
+    #[test]
+    fn upload_thread_ts_prefers_existing_thread() {
+        assert_eq!(
+            slack_upload_thread_ts(Some("111.000001"), Some("222.000002")),
+            Some("111.000001")
+        );
+    }
+
+    #[test]
+    fn upload_thread_ts_falls_back_to_reply_target() {
+        assert_eq!(
+            slack_upload_thread_ts(None, Some("222.000002")),
+            Some("222.000002")
+        );
+    }
+
+    #[test]
+    fn complete_upload_body_sets_channel_thread_comment_and_files() {
+        let files = vec![
+            SlackCompletedUploadFile {
+                id: "F111".into(),
+                title: "report.pdf".into(),
+            },
+            SlackCompletedUploadFile {
+                id: "F222".into(),
+                title: "chart.png".into(),
+            },
+        ];
+        let body = slack_complete_upload_body("C123", Some("111.000001"), "**done**", &files);
+
+        assert_eq!(body["channel_id"], "C123");
+        assert_eq!(body["thread_ts"], "111.000001");
+        assert_eq!(body["initial_comment"], "*done*");
+        assert_eq!(body["files"][0]["id"], "F111");
+        assert_eq!(body["files"][0]["title"], "report.pdf");
+        assert_eq!(body["files"][1]["id"], "F222");
+        assert_eq!(body["files"][1]["title"], "chart.png");
+    }
+
+    #[test]
+    fn complete_upload_body_omits_empty_comment_and_thread() {
+        let files = vec![SlackCompletedUploadFile {
+            id: "F111".into(),
+            title: "report.pdf".into(),
+        }];
+        let body = slack_complete_upload_body("C123", None, "", &files);
+
+        assert!(body.get("thread_ts").is_none());
+        assert!(body.get("initial_comment").is_none());
+        assert_eq!(body["files"][0]["id"], "F111");
+    }
+
+    #[test]
+    fn extract_file_share_ts_prefers_target_public_channel() {
+        let resp = serde_json::json!({
+            "ok": true,
+            "files": [{
+                "id": "F111",
+                "shares": {
+                    "public": {
+                        "C999": [{ "ts": "999.000009" }],
+                        "C123": [{ "ts": "123.000001" }]
+                    }
+                }
+            }]
+        });
+
+        assert_eq!(
+            extract_slack_file_share_ts(&resp, "C123"),
+            Some("123.000001")
+        );
+    }
+
+    #[test]
+    fn extract_file_share_ts_handles_private_share() {
+        let resp = serde_json::json!({
+            "ok": true,
+            "files": [{
+                "id": "F111",
+                "shares": {
+                    "private": {
+                        "G123": [{ "ts": "123.000001" }]
+                    }
+                }
+            }]
+        });
+
+        assert_eq!(
+            extract_slack_file_share_ts(&resp, "G123"),
+            Some("123.000001")
+        );
     }
 
     /// Per-thread streaming: ON by default, OFF when another bot is present (#534).

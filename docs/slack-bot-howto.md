@@ -42,10 +42,13 @@ Socket Mode uses a persistent WebSocket connection — no public URL or ingress 
 | `chat:write` | Send and edit messages |
 | `channels:history` | Read public channel messages (for thread context) |
 | `groups:history` | Read private channel messages (for thread context) |
+| `im:history` | Read DM history (only needed for DM context recovery) |
+| `mpim:history` | Read group-DM history (only needed for MPIM context recovery) |
 | `channels:read` | List public channels |
 | `groups:read` | List private channels |
 | `reactions:write` | Add/remove emoji reactions |
 | `files:read` | Download file attachments (images, audio) |
+| `files:write` | Upload outbound file attachments |
 | `users:read` | Resolve user display names |
 
 ## 5. Install to Workspace
@@ -67,6 +70,9 @@ bot_token = "${SLACK_BOT_TOKEN}"
 app_token = "${SLACK_APP_TOKEN}"
 allowed_channels = []                # empty = allow all channels
 # allowed_users = ["U0123456789"]    # empty = allow all users
+
+[slack.context_recovery]
+enabled = true                       # bounded history, thread-root, and permalink recovery
 ```
 
 Set the environment variables:
@@ -144,3 +150,9 @@ On Discord, none of these apply: slash commands work in thread-channels, the cha
 
 1. Verify `reactions:write` scope is added
 2. Reinstall the app after adding the scope
+
+### File uploads fail with "files.getUploadURLExternal: missing_scope"
+
+1. Verify `files:write` is added under **OAuth & Permissions** → **Bot Token Scopes**
+2. Reinstall the app after adding or changing bot token scopes
+3. Restart openab if you replaced the bot token during reinstall

@@ -4,8 +4,12 @@ use crate::adapter::{
     AdapterRouter, ChannelRef, ChatAdapter, MessageRef, OutboundAttachment, SenderContext,
 };
 use crate::bot_turns::{BotTurnTracker, TurnAction, TurnSeverity, BOT_TURN_LIMIT_WARNING_PREFIX};
-use crate::config::{AllowBots, AllowUsers, SttConfig};
+use crate::config::{AllowBots, AllowUsers, ContextRecoveryConfig, SttConfig};
+use crate::context_recovery::{
+    discord_message_links, ContextCollector, DiscordMessageLink, RecoveredContext, RecoveredMessage,
+};
 use crate::format;
+use crate::ingress_audit::{IngressAuditGuard, IngressAuditRecord, IngressDecision};
 use crate::media;
 use crate::remind::{self, ReminderStore};
 use async_trait::async_trait;
@@ -253,6 +257,8 @@ pub struct Handler {
     pub allowed_channels: HashSet<u64>,
     pub allowed_users: HashSet<u64>,
     pub stt_config: SttConfig,
+    pub context_recovery: ContextRecoveryConfig,
+    pub inbound_attachment_content_blocks: bool,
     pub adapter: OnceLock<Arc<dyn ChatAdapter>>,
     pub allow_bot_messages: AllowBots,
     pub trusted_bot_ids: HashSet<u64>,
@@ -398,6 +404,19 @@ impl Handler {
 #[serenity::async_trait]
 impl EventHandler for Handler {
     async fn message(&self, ctx: Context, msg: Message) {
+        let mut audit = IngressAuditGuard::new(IngressAuditRecord::new(
+            "discord",
+            msg.id.to_string(),
+            msg.channel_id.to_string(),
+            None,
+            msg.guild_id.map(|id| id.to_string()),
+            msg.author.id.to_string(),
+            msg.author.bot,
+            msg.timestamp.to_rfc3339(),
+            "message",
+            msg.content.chars().count(),
+            msg.attachments.len(),
+        ));
         let bot_id = ctx.cache.current_user().id;
 
         if !self.guild_allowed(msg.guild_id.map(|id| id.get())) {
@@ -406,6 +425,7 @@ impl EventHandler for Handler {
                 channel_id = %msg.channel_id,
                 "message ignored from disallowed guild"
             );
+            audit.finish(IngressDecision::GuildDenied);
             return;
         }
 
@@ -432,7 +452,10 @@ impl EventHandler for Handler {
             if msg.author.bot {
                 match tracker.classify_bot_message(&thread_key) {
                     TurnAction::Continue => {}
-                    TurnAction::SilentStop => return,
+                    TurnAction::SilentStop => {
+                        audit.finish(IngressDecision::BotTurnLimit);
+                        return;
+                    }
                     TurnAction::WarnAndStop {
                         severity,
                         turns,
@@ -451,6 +474,7 @@ impl EventHandler for Handler {
                                 "soft bot turn limit reached",
                             ),
                         }
+                        audit.finish(IngressDecision::BotTurnLimit);
                         // Only post the warning if this bot is allowed in the channel/thread.
                         // Bot turn counting intentionally runs before channel gating so ALL
                         // bot messages are counted, but the *warning message* must respect
@@ -525,6 +549,7 @@ impl EventHandler for Handler {
 
         // Ignore own messages (after counting toward bot turns above)
         if msg.author.id == bot_id {
+            audit.finish(IngressDecision::SelfMessage);
             return;
         }
 
@@ -550,9 +575,13 @@ impl EventHandler for Handler {
         // Bot message gating (from upstream #321)
         if msg.author.bot {
             match self.allow_bot_messages {
-                AllowBots::Off => return,
+                AllowBots::Off => {
+                    audit.finish(IngressDecision::BotPolicyDenied);
+                    return;
+                }
                 AllowBots::Mentions => {
                     if !is_mentioned {
+                        audit.finish(IngressDecision::MentionRequired);
                         return;
                     }
                 }
@@ -590,6 +619,7 @@ impl EventHandler for Handler {
                             Ok(msgs) => msgs,
                             Err(e) => {
                                 tracing::warn!(channel_id = %msg.channel_id, error = %e, "failed to fetch history for bot turn cap, rejecting (fail-closed)");
+                                audit.finish(IngressDecision::LoopCheckFailed);
                                 return;
                             }
                         }
@@ -601,6 +631,7 @@ impl EventHandler for Handler {
                         .count();
                     if consecutive_bot >= cap {
                         tracing::warn!(channel_id = %msg.channel_id, cap, "bot turn cap reached, ignoring");
+                        audit.finish(IngressDecision::BotTurnLimit);
                         return;
                     }
                 }
@@ -610,6 +641,7 @@ impl EventHandler for Handler {
                 && !self.trusted_bot_ids.contains(&msg.author.id.get())
             {
                 tracing::debug!(bot_id = %msg.author.id, "bot not in trusted_bot_ids, ignoring");
+                audit.finish(IngressDecision::BotUntrusted);
                 return;
             }
         }
@@ -666,10 +698,12 @@ impl EventHandler for Handler {
         // DM gating: allow_dm must be true, otherwise reject
         if is_dm && !self.allow_dm {
             tracing::debug!(channel_id = %msg.channel_id, "DM rejected (allow_dm=false)");
+            audit.finish(IngressDecision::ChannelDenied);
             return;
         }
 
         if !is_dm && !in_allowed_channel && !in_thread {
+            audit.finish(IngressDecision::ChannelDenied);
             return;
         }
 
@@ -682,9 +716,13 @@ impl EventHandler for Handler {
         // DMs are treated as implicit @mention (mirrors Slack behavior).
         if !is_user_trigger && !is_dm {
             match self.allow_user_messages {
-                AllowUsers::Mentions => return,
+                AllowUsers::Mentions => {
+                    audit.finish(IngressDecision::MentionRequired);
+                    return;
+                }
                 AllowUsers::Involved => {
                     if !in_thread {
+                        audit.finish(IngressDecision::ThreadRequired);
                         return;
                     }
                     let (involved, _) = if bot_owns_thread {
@@ -695,11 +733,13 @@ impl EventHandler for Handler {
                     };
                     if !involved {
                         tracing::debug!(channel_id = %msg.channel_id, "bot not involved in thread, ignoring");
+                        audit.finish(IngressDecision::BotNotInvolved);
                         return;
                     }
                 }
                 AllowUsers::MultibotMentions => {
                     if !in_thread {
+                        audit.finish(IngressDecision::ThreadRequired);
                         return;
                     }
                     let (involved, other_bot) = if bot_owns_thread {
@@ -714,10 +754,12 @@ impl EventHandler for Handler {
                     };
                     if !involved {
                         tracing::debug!(channel_id = %msg.channel_id, "bot not involved in thread, ignoring");
+                        audit.finish(IngressDecision::BotNotInvolved);
                         return;
                     }
                     if other_bot {
                         tracing::debug!(channel_id = %msg.channel_id, "multi-bot thread, requiring @mention");
+                        audit.finish(IngressDecision::MultiBotMentionRequired);
                         return;
                     }
                 }
@@ -731,6 +773,7 @@ impl EventHandler for Handler {
             msg.author.id.get(),
         ) {
             tracing::info!(user_id = %msg.author.id, "denied user, ignoring");
+            audit.finish(IngressDecision::UserDenied);
             let msg_ref = discord_msg_ref(&msg);
             let _ = adapter.add_reaction(&msg_ref, "🚫").await;
             return;
@@ -738,8 +781,11 @@ impl EventHandler for Handler {
 
         let prompt = resolve_mentions(&msg.content, bot_id, &self.allowed_role_ids);
 
-        // No text and no attachments → skip
-        if prompt.is_empty() && msg.attachments.is_empty() {
+        // No dispatchable text/content → skip.
+        if prompt.is_empty()
+            && (msg.attachments.is_empty() || !self.inbound_attachment_content_blocks)
+        {
+            audit.finish(IngressDecision::EmptyContent);
             return;
         }
 
@@ -761,123 +807,123 @@ impl EventHandler for Handler {
             &bot_id.to_string(),
         );
 
-        // Build extra content blocks from attachments (audio -> STT, text -> inline,
-        // image -> encode, video -> URL for agent-side inspection).
+        // Build extra content blocks from attachments when enabled (audio -> STT,
+        // text -> inline, image -> encode, video -> URL for agent-side inspection).
         let mut extra_blocks = Vec::new();
         let mut echo_entries: Vec<crate::stt::EchoEntry> = Vec::new();
         let mut failed_image_files: Vec<String> = Vec::new();
-        let mut text_file_bytes: u64 = 0;
         let mut text_file_count: u32 = 0;
-        const TEXT_TOTAL_CAP: u64 = 1024 * 1024; // 1 MB total for all text file attachments
         const TEXT_FILE_COUNT_CAP: u32 = 5;
 
-        for attachment in &msg.attachments {
-            let mime = attachment.content_type.as_deref().unwrap_or("");
-            if media::is_audio_mime(mime) {
-                if self.stt_config.enabled {
-                    let mime_clean = mime.split(';').next().unwrap_or(mime).trim();
-                    match media::download_and_transcribe(
+        if self.inbound_attachment_content_blocks {
+            for attachment in &msg.attachments {
+                let mime = attachment.content_type.as_deref().unwrap_or("");
+                if media::is_audio_mime(mime) {
+                    if self.stt_config.enabled {
+                        let mime_clean = mime.split(';').next().unwrap_or(mime).trim();
+                        match media::download_and_transcribe(
+                            &attachment.url,
+                            &attachment.filename,
+                            mime_clean,
+                            u64::from(attachment.size),
+                            &self.stt_config,
+                            None,
+                        )
+                        .await
+                        {
+                            Some(transcript) => {
+                                debug!(filename = %attachment.filename, chars = transcript.len(), "voice transcript injected");
+                                extra_blocks.insert(
+                                    0,
+                                    ContentBlock::Text {
+                                        text: format!("[Voice message transcript]: {transcript}"),
+                                    },
+                                );
+                                echo_entries.push(crate::stt::EchoEntry::Success(transcript));
+                            }
+                            None => {
+                                warn!(filename = %attachment.filename, "STT failed for voice attachment");
+                                echo_entries.push(crate::stt::EchoEntry::Failed);
+                            }
+                        }
+                    } else {
+                        tracing::warn!(filename = %attachment.filename, "skipping audio attachment (STT disabled)");
+                        let msg_ref = discord_msg_ref(&msg);
+                        let _ = adapter.add_reaction(&msg_ref, "🎤").await;
+                    }
+                } else if media::is_text_file(
+                    &attachment.filename,
+                    attachment.content_type.as_deref(),
+                ) {
+                    if text_file_count >= TEXT_FILE_COUNT_CAP {
+                        tracing::warn!(filename = %attachment.filename, count = text_file_count, "text file count cap reached, skipping");
+                        continue;
+                    }
+                    if let Some((block, _)) = media::download_and_read_text_file(
                         &attachment.url,
                         &attachment.filename,
-                        mime_clean,
                         u64::from(attachment.size),
-                        &self.stt_config,
                         None,
                     )
                     .await
                     {
-                        Some(transcript) => {
-                            debug!(filename = %attachment.filename, chars = transcript.len(), "voice transcript injected");
-                            extra_blocks.insert(
-                                0,
-                                ContentBlock::Text {
-                                    text: format!("[Voice message transcript]: {transcript}"),
-                                },
-                            );
-                            echo_entries.push(crate::stt::EchoEntry::Success(transcript));
-                        }
-                        None => {
-                            warn!(filename = %attachment.filename, "STT failed for voice attachment");
-                            echo_entries.push(crate::stt::EchoEntry::Failed);
-                        }
-                    }
-                } else {
-                    tracing::warn!(filename = %attachment.filename, "skipping audio attachment (STT disabled)");
-                    let msg_ref = discord_msg_ref(&msg);
-                    let _ = adapter.add_reaction(&msg_ref, "🎤").await;
-                }
-            } else if media::is_text_file(&attachment.filename, attachment.content_type.as_deref())
-            {
-                if text_file_count >= TEXT_FILE_COUNT_CAP {
-                    tracing::warn!(filename = %attachment.filename, count = text_file_count, "text file count cap reached, skipping");
-                    continue;
-                }
-                // Pre-check with Discord-reported size (fast path, avoids unnecessary download).
-                // Running total uses actual downloaded bytes for accurate accounting.
-                if text_file_bytes + u64::from(attachment.size) > TEXT_TOTAL_CAP {
-                    tracing::warn!(filename = %attachment.filename, total = text_file_bytes, "text attachments total exceeds 1MB cap, skipping remaining");
-                    continue;
-                }
-                if let Some((block, actual_bytes)) = media::download_and_read_text_file(
-                    &attachment.url,
-                    &attachment.filename,
-                    u64::from(attachment.size),
-                    None,
-                )
-                .await
-                {
-                    text_file_bytes += actual_bytes;
-                    text_file_count += 1;
-                    debug!(filename = %attachment.filename, "adding text file attachment");
-                    extra_blocks.push(block);
-                }
-            } else {
-                match media::download_and_encode_image(
-                    &attachment.url,
-                    attachment.content_type.as_deref(),
-                    &attachment.filename,
-                    u64::from(attachment.size),
-                    None,
-                )
-                .await
-                {
-                    Ok(block) => {
-                        debug!(url = %attachment.url, filename = %attachment.filename, "adding image attachment");
+                        text_file_count += 1;
+                        debug!(filename = %attachment.filename, "adding text file attachment");
                         extra_blocks.push(block);
                     }
-                    Err(media::MediaFetchError::NotAnImage) => {
-                        if media::is_video_file(
-                            &attachment.filename,
-                            attachment.content_type.as_deref(),
-                        ) {
-                            debug!(url = %attachment.url, filename = %attachment.filename, "adding video attachment link");
-                            extra_blocks.push(video_attachment_block(
-                                &attachment.filename,
-                                attachment.content_type.as_deref(),
-                                u64::from(attachment.size),
-                                &attachment.url,
-                            ));
-                        } else {
-                            debug!(url = %attachment.url, filename = %attachment.filename, "adding file attachment link");
-                            extra_blocks.push(file_attachment_block(
-                                &attachment.filename,
-                                attachment.content_type.as_deref(),
-                                u64::from(attachment.size),
-                                &attachment.url,
-                            ));
+                } else {
+                    match media::download_and_encode_image(
+                        &attachment.url,
+                        attachment.content_type.as_deref(),
+                        &attachment.filename,
+                        u64::from(attachment.size),
+                        None,
+                    )
+                    .await
+                    {
+                        Ok(block) => {
+                            debug!(url = %attachment.url, filename = %attachment.filename, "adding image attachment");
+                            extra_blocks.push(block);
                         }
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            url = %attachment.url,
-                            filename = %attachment.filename,
-                            error = %e,
-                            "image attachment failed"
-                        );
-                        failed_image_files.push(attachment.filename.clone());
+                        Err(media::MediaFetchError::NotAnImage) => {
+                            if media::is_video_file(
+                                &attachment.filename,
+                                attachment.content_type.as_deref(),
+                            ) {
+                                debug!(url = %attachment.url, filename = %attachment.filename, "adding video attachment link");
+                                extra_blocks.push(video_attachment_block(
+                                    &attachment.filename,
+                                    attachment.content_type.as_deref(),
+                                    u64::from(attachment.size),
+                                    &attachment.url,
+                                ));
+                            } else {
+                                debug!(url = %attachment.url, filename = %attachment.filename, "adding file attachment link");
+                                extra_blocks.push(file_attachment_block(
+                                    &attachment.filename,
+                                    attachment.content_type.as_deref(),
+                                    u64::from(attachment.size),
+                                    &attachment.url,
+                                ));
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                url = %attachment.url,
+                                filename = %attachment.filename,
+                                error = %e,
+                                "image attachment failed"
+                            );
+                            failed_image_files.push(attachment.filename.clone());
+                        }
                     }
                 }
             }
+        } else if !msg.attachments.is_empty() {
+            tracing::debug!(
+                num_attachments = msg.attachments.len(),
+                "inbound attachment ContentBlocks disabled; not forwarding attachments to ACP"
+            );
         }
 
         tracing::debug!(
@@ -901,10 +947,13 @@ impl EventHandler for Handler {
                 Ok(ch) => ch,
                 Err(e) => {
                     error!("failed to create thread: {e}");
+                    audit.finish(IngressDecision::ThreadCreateFailed);
                     return;
                 }
             }
         };
+
+        audit.set_thread_id((!is_dm).then(|| thread_channel.channel_id.clone()));
 
         if !in_thread && !is_dm && thread_channel.parent_id.is_some() {
             // A top-level trigger that created/joined a thread makes this bot
@@ -945,6 +994,14 @@ impl EventHandler for Handler {
         if sender.thread_id.is_none() && thread_channel.parent_id.is_some() {
             sender.thread_id = Some(thread_channel.channel_id.clone());
         }
+        sender.recovered_context = recover_discord_context(
+            &ctx.http,
+            &msg,
+            &self.context_recovery,
+            self.allow_all_channels,
+            &self.allowed_channels,
+        )
+        .await;
 
         let dispatcher = self.dispatcher.clone();
         let stt_cfg = self.stt_config.clone();
@@ -975,11 +1032,15 @@ impl EventHandler for Handler {
                 estimated_tokens,
                 other_bot_present: other_bot_present_flag,
             };
-            if let Err(e) = dispatcher
+            match dispatcher
                 .submit(thread_key, thread_channel, adapter, buf_msg)
                 .await
             {
-                error!("dispatcher submit error: {e}");
+                Ok(()) => audit.finish(IngressDecision::Dispatched),
+                Err(e) => {
+                    audit.finish(IngressDecision::DispatchFailed);
+                    error!("dispatcher submit error: {e}");
+                }
             }
         });
     }
@@ -2287,7 +2348,344 @@ fn build_sender_context(
         timestamp: Some(timestamp.to_string()),
         message_id: Some(message_id.to_string()),
         receiver_id: Some(receiver_id.to_string()),
+        recovered_context: None,
     }
+}
+
+fn recovered_discord_message(message: &Message) -> RecoveredMessage {
+    RecoveredMessage {
+        channel_id: message.channel_id.to_string(),
+        thread_id: None,
+        message_id: message.id.to_string(),
+        sender_id: Some(message.author.id.to_string()),
+        sender_name: Some(
+            message
+                .author
+                .global_name
+                .as_ref()
+                .unwrap_or(&message.author.name)
+                .clone(),
+        ),
+        timestamp: message.timestamp.to_rfc3339(),
+        content: message.content.clone(),
+        attachment_count: message.attachments.len(),
+        relations: Vec::new(),
+    }
+}
+
+fn discord_context_guild_channel_allowed(
+    actual_guild_id: u64,
+    expected_guild_id: u64,
+    target_channel_id: u64,
+    is_thread: bool,
+    parent_channel_id: Option<u64>,
+    allow_all_channels: bool,
+    allowed_channels: &HashSet<u64>,
+) -> bool {
+    actual_guild_id == expected_guild_id
+        && (allow_all_channels
+            || allowed_channels.contains(&target_channel_id)
+            || (is_thread
+                && parent_channel_id.is_some_and(|parent| allowed_channels.contains(&parent))))
+}
+
+async fn discord_context_target_allowed(
+    http: &Http,
+    current_guild_id: Option<u64>,
+    current_channel_id: ChannelId,
+    link: &DiscordMessageLink,
+    allow_all_channels: bool,
+    allowed_channels: &HashSet<u64>,
+) -> serenity::Result<bool> {
+    let target_channel_id = match link.channel_id.parse::<u64>() {
+        Ok(value) => ChannelId::new(value),
+        Err(_) => return Ok(false),
+    };
+
+    if link.guild_id == "@me" {
+        return Ok(current_guild_id.is_none() && target_channel_id == current_channel_id);
+    }
+
+    let target_guild_id = match link.guild_id.parse::<u64>() {
+        Ok(value) => value,
+        Err(_) => return Ok(false),
+    };
+    if current_guild_id != Some(target_guild_id) {
+        return Ok(false);
+    }
+    if target_channel_id == current_channel_id {
+        return Ok(true);
+    }
+
+    match target_channel_id.to_channel(http).await? {
+        serenity::model::channel::Channel::Guild(channel) => {
+            Ok(discord_context_guild_channel_allowed(
+                channel.guild_id.get(),
+                target_guild_id,
+                target_channel_id.get(),
+                channel.thread_metadata.is_some(),
+                channel.parent_id.map(|parent| parent.get()),
+                allow_all_channels,
+                allowed_channels,
+            ))
+        }
+        _ => Ok(false),
+    }
+}
+
+async fn recover_discord_context(
+    http: &Http,
+    message: &Message,
+    config: &ContextRecoveryConfig,
+    allow_all_channels: bool,
+    allowed_channels: &HashSet<u64>,
+) -> Option<RecoveredContext> {
+    if !config.enabled {
+        return None;
+    }
+
+    if config.settle_delay_ms > 0 {
+        tokio::time::sleep(std::time::Duration::from_millis(config.settle_delay_ms)).await;
+    }
+
+    let mut collector = ContextCollector::new(config);
+    let current_guild_id = message.guild_id.map(|guild_id| guild_id.get());
+
+    if let Some(referenced) = message.referenced_message.as_deref() {
+        let reply_link = DiscordMessageLink {
+            guild_id: referenced
+                .guild_id
+                .or(message.guild_id)
+                .map_or_else(|| "@me".to_string(), |guild_id| guild_id.to_string()),
+            channel_id: referenced.channel_id.to_string(),
+            message_id: referenced.id.to_string(),
+        };
+        match discord_context_target_allowed(
+            http,
+            current_guild_id,
+            message.channel_id,
+            &reply_link,
+            allow_all_channels,
+            allowed_channels,
+        )
+        .await
+        {
+            Ok(true) => collector.add(recovered_discord_message(referenced), "native_reply"),
+            Ok(false) => collector.failure(
+                "native_reply",
+                "disallowed_target",
+                Some(format!(
+                    "discord:{}:{}",
+                    referenced.channel_id, referenced.id
+                )),
+            ),
+            Err(error) => {
+                tracing::debug!(
+                    channel_id = %referenced.channel_id,
+                    message_id = %referenced.id,
+                    error = %error,
+                    "Discord context recovery could not inspect embedded reply target"
+                );
+                collector.failure(
+                    "native_reply",
+                    "api_error",
+                    Some(format!(
+                        "discord:{}:{}",
+                        referenced.channel_id, referenced.id
+                    )),
+                );
+            }
+        }
+    } else if let Some(reference) = &message.message_reference {
+        if let Some(message_id) = reference.message_id {
+            let reply_link = DiscordMessageLink {
+                guild_id: reference
+                    .guild_id
+                    .or(message.guild_id)
+                    .map_or_else(|| "@me".to_string(), |guild_id| guild_id.to_string()),
+                channel_id: reference.channel_id.to_string(),
+                message_id: message_id.to_string(),
+            };
+            match discord_context_target_allowed(
+                http,
+                current_guild_id,
+                message.channel_id,
+                &reply_link,
+                allow_all_channels,
+                allowed_channels,
+            )
+            .await
+            {
+                Ok(true) => match reference.channel_id.message(http, message_id).await {
+                    Ok(referenced) => {
+                        collector.add(recovered_discord_message(&referenced), "native_reply")
+                    }
+                    Err(error) => {
+                        tracing::debug!(
+                            channel_id = %reference.channel_id,
+                            message_id = %message_id,
+                            error = %error,
+                            "Discord context recovery could not fetch reply target"
+                        );
+                        collector.failure(
+                            "native_reply",
+                            "api_error",
+                            Some(format!("discord:{}:{}", reference.channel_id, message_id)),
+                        );
+                    }
+                },
+                Ok(false) => collector.failure(
+                    "native_reply",
+                    "disallowed_target",
+                    Some(format!("discord:{}:{}", reference.channel_id, message_id)),
+                ),
+                Err(error) => {
+                    tracing::debug!(
+                        channel_id = %reference.channel_id,
+                        message_id = %message_id,
+                        error = %error,
+                        "Discord context recovery could not inspect reply target"
+                    );
+                    collector.failure(
+                        "native_reply",
+                        "api_error",
+                        Some(format!("discord:{}:{}", reference.channel_id, message_id)),
+                    );
+                }
+            }
+        }
+    }
+
+    match message
+        .channel_id
+        .messages(
+            http,
+            GetMessages::new()
+                .around(message.id)
+                .limit(config.history_limit as u8),
+        )
+        .await
+    {
+        Ok(mut messages) => {
+            messages.sort_unstable_by_key(|candidate| candidate.id);
+            for candidate in messages {
+                if candidate.id != message.id {
+                    collector.add(recovered_discord_message(&candidate), "current_window");
+                }
+            }
+        }
+        Err(error) => {
+            tracing::debug!(
+                channel_id = %message.channel_id,
+                message_id = %message.id,
+                error = %error,
+                "Discord context recovery could not fetch current window"
+            );
+            collector.failure(
+                "current_window",
+                "api_error",
+                Some(format!("discord:{}:{}", message.channel_id, message.id)),
+            );
+        }
+    }
+
+    for link in discord_message_links(&message.content, config.link_limit) {
+        let source_ref = format!("discord:{}:{}", link.channel_id, link.message_id);
+        let target_channel_id = match link.channel_id.parse::<u64>() {
+            Ok(value) => ChannelId::new(value),
+            Err(_) => {
+                collector.failure("linked_target", "invalid_target", Some(source_ref));
+                continue;
+            }
+        };
+        let target_message_id = match link.message_id.parse::<u64>() {
+            Ok(value) => MessageId::new(value),
+            Err(_) => {
+                collector.failure("linked_target", "invalid_target", Some(source_ref));
+                continue;
+            }
+        };
+        if target_channel_id == message.channel_id && target_message_id == message.id {
+            continue;
+        }
+
+        match discord_context_target_allowed(
+            http,
+            current_guild_id,
+            message.channel_id,
+            &link,
+            allow_all_channels,
+            allowed_channels,
+        )
+        .await
+        {
+            Ok(false) => {
+                collector.failure("linked_target", "disallowed_target", Some(source_ref));
+                continue;
+            }
+            Err(error) => {
+                tracing::debug!(
+                    channel_id = %target_channel_id,
+                    message_id = %target_message_id,
+                    error = %error,
+                    "Discord context recovery could not inspect linked target"
+                );
+                collector.failure("linked_target", "api_error", Some(source_ref));
+                continue;
+            }
+            Ok(true) => {}
+        }
+
+        let limit = (1 + config.link_neighbors.saturating_mul(2)).min(100) as u8;
+        match target_channel_id
+            .messages(
+                http,
+                GetMessages::new().around(target_message_id).limit(limit),
+            )
+            .await
+        {
+            Ok(mut messages) => {
+                messages.sort_unstable_by_key(|candidate| candidate.id);
+                let mut found_target = false;
+                for candidate in messages {
+                    let relation = if candidate.id == target_message_id {
+                        found_target = true;
+                        "linked_target"
+                    } else {
+                        "linked_neighbor"
+                    };
+                    collector.add(recovered_discord_message(&candidate), relation);
+                }
+                if !found_target {
+                    match target_channel_id.message(http, target_message_id).await {
+                        Ok(target) => {
+                            collector.add(recovered_discord_message(&target), "linked_target")
+                        }
+                        Err(error) => {
+                            tracing::debug!(
+                                channel_id = %target_channel_id,
+                                message_id = %target_message_id,
+                                error = %error,
+                                "Discord context recovery could not fetch linked target"
+                            );
+                            collector.failure("linked_target", "api_error", Some(source_ref));
+                        }
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::debug!(
+                    channel_id = %target_channel_id,
+                    message_id = %target_message_id,
+                    error = %error,
+                    "Discord context recovery could not fetch linked window"
+                );
+                collector.failure("linked_target", "api_error", Some(source_ref));
+            }
+        }
+    }
+
+    collector.finish()
 }
 
 /// Pure thread detection: determines whether a channel is a Discord thread
@@ -2885,7 +3283,7 @@ mod tests {
     /// Hard limit also carries count for warn-once semantics.
     #[test]
     fn hard_limit_warn_once_semantics() {
-        let mut t = BotTurnTracker::new(HARD_BOT_TURN_LIMIT + 1); // soft > hard so hard fires first
+        let mut t = BotTurnTracker::new(HARD_BOT_TURN_LIMIT);
         for _ in 0..HARD_BOT_TURN_LIMIT - 1 {
             assert_eq!(t.on_bot_message("t1"), TurnResult::Ok);
         }
@@ -3288,6 +3686,45 @@ mod tests {
     fn guild_gate_rejects_unconfigured_guild() {
         let allowed = HashSet::from([1284331895190196234, 1500052145108418592]);
         assert!(!is_allowed_guild(false, &allowed, Some(42)));
+    }
+
+    #[test]
+    fn context_link_rejects_forged_guild_even_when_all_channels_allowed() {
+        assert!(!discord_context_guild_channel_allowed(
+            2,
+            1,
+            20,
+            false,
+            None,
+            true,
+            &HashSet::new(),
+        ));
+    }
+
+    #[test]
+    fn context_link_allows_thread_when_parent_is_allowlisted() {
+        assert!(discord_context_guild_channel_allowed(
+            1,
+            1,
+            20,
+            true,
+            Some(10),
+            false,
+            &HashSet::from([10]),
+        ));
+    }
+
+    #[test]
+    fn context_link_rejects_category_child_when_only_parent_is_allowlisted() {
+        assert!(!discord_context_guild_channel_allowed(
+            1,
+            1,
+            20,
+            false,
+            Some(10),
+            false,
+            &HashSet::from([10]),
+        ));
     }
 
     // --- Thread creation skip tests (regression for #656 DM bug) ---

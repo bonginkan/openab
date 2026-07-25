@@ -59,7 +59,6 @@ working_dir = "/home/node"
 [attachments]
 enabled = true
 allowed_dirs = ["/home/node", "/home/node/.codex/generated_images"]
-max_bytes = 10485760
 max_files = 10
 ```
 
@@ -143,4 +142,4 @@ A: Native outbound attachment relay is currently implemented for Discord. Other 
 A: Yes. Use `[[attach_file:path]]`; see [sendfiles.md](sendfiles.md).
 
 **Q: What image formats are supported?**
-A: PNG, JPEG, GIF, and WebP. The OpenAB default per-file cap is 10 MiB, matching Discord's current default app upload limit.
+A: PNG, JPEG, GIF, and WebP. OpenAB does not impose a per-file byte-size cap, but Discord may reject files above the upload limit for the destination.

@@ -82,11 +82,74 @@ pub struct Config {
     #[serde(default)]
     pub attachments: AttachmentsConfig,
     #[serde(default)]
+    pub inbound_attachments: InboundAttachmentsConfig,
+    #[serde(default)]
     pub cron: CronConfig,
     #[serde(default)]
     pub hooks: HooksConfig,
     #[serde(default)]
     pub steering: SteeringConfig,
+}
+
+/// Bounded, adapter-mediated context recovery for Discord and Slack.
+///
+/// Disabled by default to preserve existing prompt size and API behavior. When
+/// enabled, adapters fetch a small current-message window plus explicit reply
+/// and message-link targets without exposing platform credentials to the agent.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ContextRecoveryConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_context_history_limit")]
+    pub history_limit: usize,
+    #[serde(default = "default_context_link_limit")]
+    pub link_limit: usize,
+    #[serde(default = "default_context_link_neighbors")]
+    pub link_neighbors: usize,
+    #[serde(default = "default_context_message_chars")]
+    pub max_message_chars: usize,
+    #[serde(default = "default_context_total_chars")]
+    pub max_total_chars: usize,
+    #[serde(default = "default_context_settle_delay_ms")]
+    pub settle_delay_ms: u64,
+}
+
+fn default_context_history_limit() -> usize {
+    12
+}
+
+fn default_context_link_limit() -> usize {
+    4
+}
+
+fn default_context_link_neighbors() -> usize {
+    2
+}
+
+fn default_context_message_chars() -> usize {
+    2_000
+}
+
+fn default_context_total_chars() -> usize {
+    12_000
+}
+
+fn default_context_settle_delay_ms() -> u64 {
+    250
+}
+
+impl Default for ContextRecoveryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            history_limit: default_context_history_limit(),
+            link_limit: default_context_link_limit(),
+            link_neighbors: default_context_link_neighbors(),
+            max_message_chars: default_context_message_chars(),
+            max_total_chars: default_context_total_chars(),
+            settle_delay_ms: default_context_settle_delay_ms(),
+        }
+    }
 }
 
 /// Mid-turn steering controls.
@@ -222,13 +285,29 @@ pub struct AttachmentsConfig {
     /// inside `allowed_dirs`. Empty means the first allowed directory.
     #[serde(default)]
     pub auto_stage_dir: Option<String>,
-    /// Max bytes per outbound file. Default matches Discord's default app file
-    /// upload limit.
-    #[serde(default = "default_attachment_max_bytes")]
-    pub max_bytes: u64,
     /// Max outbound files per ACP response.
     #[serde(default = "default_attachment_max_files")]
     pub max_files: usize,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+pub struct InboundAttachmentsConfig {
+    /// Forward inbound attachments into ACP as extra ContentBlocks. Default:
+    /// true to preserve existing image/text/STT attachment behavior.
+    #[serde(default = "default_inbound_attachment_content_blocks")]
+    pub content_blocks: bool,
+}
+
+fn default_inbound_attachment_content_blocks() -> bool {
+    true
+}
+
+impl Default for InboundAttachmentsConfig {
+    fn default() -> Self {
+        Self {
+            content_blocks: default_inbound_attachment_content_blocks(),
+        }
+    }
 }
 
 impl Default for AttachmentsConfig {
@@ -238,7 +317,6 @@ impl Default for AttachmentsConfig {
             allowed_dirs: Vec::new(),
             auto_stage_generated_images: false,
             auto_stage_dir: None,
-            max_bytes: default_attachment_max_bytes(),
             max_files: default_attachment_max_files(),
         }
     }
@@ -264,9 +342,6 @@ fn default_stt_base_url() -> String {
 }
 fn default_echo_transcript() -> bool {
     false
-}
-fn default_attachment_max_bytes() -> u64 {
-    10 * 1024 * 1024
 }
 fn default_attachment_max_files() -> usize {
     10
@@ -323,6 +398,8 @@ pub struct DiscordConfig {
     /// Batched mode only: soft token cap for greedy drain. Default: 24000.
     #[serde(default = "default_max_batch_tokens")]
     pub max_batch_tokens: usize,
+    #[serde(default)]
+    pub context_recovery: ContextRecoveryConfig,
 }
 
 fn default_max_bot_turns() -> u32 {
@@ -402,6 +479,8 @@ pub struct SlackConfig {
     /// Batched mode only: soft token cap for greedy drain. Default: 24000.
     #[serde(default = "default_max_batch_tokens")]
     pub max_batch_tokens: usize,
+    #[serde(default)]
+    pub context_recovery: ContextRecoveryConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -462,18 +541,9 @@ pub struct PoolConfig {
     pub max_sessions: usize,
     #[serde(default = "default_ttl_hours")]
     pub session_ttl_hours: u64,
-    /// Optional hard ceiling for a single prompt (#732). Set to 0 to disable.
-    /// Once exceeded, the broker abandons the in-flight request, sends
-    /// `session/cancel` to the agent, and clears the pending entry so late
-    /// responses cannot leak into the next prompt's subscriber.
-    ///
-    /// Precision: checked every `liveness_check_secs`, so actual cutoff is
-    /// ±`liveness_check_secs` from this value.
-    #[serde(default = "default_prompt_hard_timeout_secs")]
-    pub prompt_hard_timeout_secs: u64,
     /// Polling cadence (seconds) for the recv-loop liveness check (#732).
-    /// Lower = faster reaction to a dead agent / hard ceiling at the cost of
-    /// more wakeups while the agent is streaming normally.
+    /// Lower = faster reaction to a dead agent at the cost of more wakeups
+    /// while the agent is streaming normally.
     #[serde(default = "default_liveness_check_secs")]
     pub liveness_check_secs: u64,
 }
@@ -613,9 +683,6 @@ fn default_max_sessions() -> usize {
 fn default_ttl_hours() -> u64 {
     4
 }
-pub(crate) fn default_prompt_hard_timeout_secs() -> u64 {
-    0
-}
 pub(crate) fn default_liveness_check_secs() -> u64 {
     30
 }
@@ -666,7 +733,6 @@ impl Default for PoolConfig {
         Self {
             max_sessions: default_max_sessions(),
             session_ttl_hours: default_ttl_hours(),
-            prompt_hard_timeout_secs: default_prompt_hard_timeout_secs(),
             liveness_check_secs: default_liveness_check_secs(),
         }
     }
@@ -809,13 +875,48 @@ fn parse_config(raw: &str, source: &str) -> anyhow::Result<Config> {
         "pool.liveness_check_secs must be > 0 (zero would spin the recv loop)"
     );
     anyhow::ensure!(
-        config.attachments.max_bytes > 0,
-        "attachments.max_bytes must be > 0"
-    );
-    anyhow::ensure!(
         config.attachments.max_files > 0,
         "attachments.max_files must be > 0"
     );
+    for (platform, recovery) in [
+        (
+            "discord",
+            config.discord.as_ref().map(|cfg| &cfg.context_recovery),
+        ),
+        (
+            "slack",
+            config.slack.as_ref().map(|cfg| &cfg.context_recovery),
+        ),
+    ] {
+        let Some(recovery) = recovery else {
+            continue;
+        };
+        anyhow::ensure!(
+            (1..=50).contains(&recovery.history_limit),
+            "{platform}.context_recovery.history_limit must be between 1 and 50"
+        );
+        anyhow::ensure!(
+            recovery.link_limit <= 10,
+            "{platform}.context_recovery.link_limit must be <= 10"
+        );
+        anyhow::ensure!(
+            recovery.link_neighbors <= 10,
+            "{platform}.context_recovery.link_neighbors must be <= 10"
+        );
+        anyhow::ensure!(
+            (64..=16_000).contains(&recovery.max_message_chars),
+            "{platform}.context_recovery.max_message_chars must be between 64 and 16000"
+        );
+        anyhow::ensure!(
+            recovery.max_total_chars >= recovery.max_message_chars
+                && recovery.max_total_chars <= 64_000,
+            "{platform}.context_recovery.max_total_chars must be >= max_message_chars and <= 64000"
+        );
+        anyhow::ensure!(
+            recovery.settle_delay_ms <= 2_000,
+            "{platform}.context_recovery.settle_delay_ms must be <= 2000"
+        );
+    }
 
     Ok(config)
 }
@@ -846,11 +947,59 @@ command = "echo"
         ));
         assert_eq!(cfg.agent.command, "echo");
         assert_eq!(cfg.pool.max_sessions, 10);
-        assert_eq!(cfg.pool.prompt_hard_timeout_secs, 0);
         assert!(cfg.reactions.enabled);
         assert!(!cfg.attachments.enabled);
-        assert_eq!(cfg.attachments.max_bytes, 10 * 1024 * 1024);
         assert_eq!(cfg.attachments.max_files, 10);
+        assert!(!discord.context_recovery.enabled);
+        assert_eq!(discord.context_recovery.history_limit, 12);
+        assert_eq!(discord.context_recovery.max_total_chars, 12_000);
+    }
+
+    #[test]
+    fn parse_context_recovery_config() {
+        let toml = r#"
+[discord]
+bot_token = "test-token"
+
+[discord.context_recovery]
+enabled = true
+history_limit = 20
+link_limit = 5
+link_neighbors = 3
+max_message_chars = 4096
+max_total_chars = 16384
+settle_delay_ms = 500
+
+[agent]
+command = "echo"
+"#;
+        let cfg = parse_config(toml, "test").unwrap();
+        let recovery = cfg.discord.unwrap().context_recovery;
+        assert!(recovery.enabled);
+        assert_eq!(recovery.history_limit, 20);
+        assert_eq!(recovery.link_limit, 5);
+        assert_eq!(recovery.link_neighbors, 3);
+        assert_eq!(recovery.max_message_chars, 4096);
+        assert_eq!(recovery.max_total_chars, 16384);
+        assert_eq!(recovery.settle_delay_ms, 500);
+    }
+
+    #[test]
+    fn reject_context_recovery_total_budget_below_message_budget() {
+        let toml = r#"
+[discord]
+bot_token = "test-token"
+
+[discord.context_recovery]
+enabled = true
+max_message_chars = 4096
+max_total_chars = 2048
+
+[agent]
+command = "echo"
+"#;
+        let error = parse_config(toml, "test").unwrap_err().to_string();
+        assert!(error.contains("max_total_chars must be >= max_message_chars"));
     }
 
     #[test]
@@ -892,22 +1041,6 @@ command = "echo"
             discord.allow_all_guilds,
             &discord.allowed_guilds
         ));
-    }
-
-    #[test]
-    fn parse_pool_prompt_hard_timeout_zero() {
-        let toml = r#"
-[discord]
-bot_token = "test-token"
-
-[agent]
-command = "echo"
-
-[pool]
-prompt_hard_timeout_secs = 0
-"#;
-        let cfg = parse_config(toml, "test").unwrap();
-        assert_eq!(cfg.pool.prompt_hard_timeout_secs, 0);
     }
 
     #[test]
@@ -1192,7 +1325,6 @@ enabled = true
 allowed_dirs = ["/workspace/out", "/tmp/openab-images"]
 auto_stage_generated_images = true
 auto_stage_dir = "/workspace/out"
-max_bytes = 1024
 max_files = 2
 "#;
         let cfg = parse_config(toml, "test").unwrap();
@@ -1206,12 +1338,24 @@ max_files = 2
             cfg.attachments.auto_stage_dir.as_deref(),
             Some("/workspace/out")
         );
-        assert_eq!(cfg.attachments.max_bytes, 1024);
         assert_eq!(cfg.attachments.max_files, 2);
     }
 
     #[test]
-    fn attachments_rejects_zero_limits() {
+    fn inbound_attachments_default_to_content_blocks_enabled() {
+        let toml = r#"
+[discord]
+bot_token = "t"
+
+[agent]
+command = "echo"
+"#;
+        let cfg = parse_config(toml, "test").unwrap();
+        assert!(cfg.inbound_attachments.content_blocks);
+    }
+
+    #[test]
+    fn inbound_attachments_content_blocks_can_be_disabled() {
         let toml = r#"
 [discord]
 bot_token = "t"
@@ -1219,11 +1363,15 @@ bot_token = "t"
 [agent]
 command = "echo"
 
-[attachments]
-max_bytes = 0
+[inbound_attachments]
+content_blocks = false
 "#;
-        assert!(parse_config(toml, "test").is_err());
+        let cfg = parse_config(toml, "test").unwrap();
+        assert!(!cfg.inbound_attachments.content_blocks);
+    }
 
+    #[test]
+    fn attachments_rejects_zero_file_count() {
         let toml = r#"
 [discord]
 bot_token = "t"

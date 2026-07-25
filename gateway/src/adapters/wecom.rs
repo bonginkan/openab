@@ -1100,7 +1100,6 @@ pub async fn webhook(
     "success".into_response()
 }
 
-const IMAGE_MAX_DOWNLOAD: u64 = 10 * 1024 * 1024;
 const IMAGE_MAX_DIMENSION_PX: u32 = 1200;
 const IMAGE_JPEG_QUALITY: u8 = 75;
 
@@ -1127,19 +1126,7 @@ async fn download_wecom_image(
         warn!(status = %resp.status(), "wecom image download failed");
         return None;
     }
-    if let Some(cl) = resp.headers().get(reqwest::header::CONTENT_LENGTH) {
-        if let Ok(size) = cl.to_str().unwrap_or("0").parse::<u64>() {
-            if size > IMAGE_MAX_DOWNLOAD {
-                warn!(size, "wecom image exceeds 10MB limit, skipping");
-                return None;
-            }
-        }
-    }
     let bytes = resp.bytes().await.ok()?;
-    if bytes.len() as u64 > IMAGE_MAX_DOWNLOAD {
-        warn!(size = bytes.len(), "wecom image exceeds 10MB limit");
-        return None;
-    }
     let (compressed, mime) = match resize_and_compress(&bytes) {
         Ok(v) => v,
         Err(e) => {
@@ -1158,8 +1145,6 @@ async fn download_wecom_image(
         path: Some(path),
     })
 }
-
-const FILE_MAX_DOWNLOAD: u64 = 20 * 1024 * 1024;
 
 const TEXT_EXTENSIONS: &[&str] = &[
     "txt", "csv", "log", "md", "json", "jsonl", "yaml", "yml", "toml", "xml", "rs", "py", "js",
@@ -1246,19 +1231,7 @@ async fn download_wecom_file(
         warn!(status = %resp.status(), "wecom file download failed");
         return None;
     }
-    if let Some(cl) = resp.headers().get(reqwest::header::CONTENT_LENGTH) {
-        if let Ok(size) = cl.to_str().unwrap_or("0").parse::<u64>() {
-            if size > FILE_MAX_DOWNLOAD {
-                warn!(size, "wecom file exceeds 20MB limit, skipping");
-                return None;
-            }
-        }
-    }
     let bytes = resp.bytes().await.ok()?;
-    if bytes.len() as u64 > FILE_MAX_DOWNLOAD {
-        warn!(size = bytes.len(), "wecom file exceeds 20MB limit");
-        return None;
-    }
 
     if !is_text_file(filename) {
         info!(filename, "wecom: skipping non-text file");

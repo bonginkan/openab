@@ -2,6 +2,7 @@ mod acp;
 mod adapter;
 mod bot_turns;
 mod config;
+mod context_recovery;
 mod cron;
 mod discord;
 mod dispatch;
@@ -9,6 +10,7 @@ mod error_display;
 mod format;
 mod gateway;
 mod hooks;
+mod ingress_audit;
 mod markdown;
 mod media;
 mod reactions;
@@ -152,6 +154,7 @@ async fn main() -> anyhow::Result<()> {
     // `cfg` fields are moved into the per-adapter setup below.
     let immediate_steer = cfg.steering.immediate_steer;
     let agent_working_dir = cfg.agent.working_dir.clone();
+    let inbound_attachment_content_blocks = cfg.inbound_attachments.content_blocks;
 
     let pool = Arc::new(acp::SessionPool::new(cfg.agent, cfg.pool.max_sessions));
     let ttl_secs = cfg.pool.session_ttl_hours * 3600;
@@ -176,7 +179,6 @@ async fn main() -> anyhow::Result<()> {
         pool.clone(),
         cfg.reactions,
         cfg.markdown.tables,
-        cfg.pool.prompt_hard_timeout_secs,
         cfg.pool.liveness_check_secs,
         cfg.attachments,
         agent_working_dir,
@@ -287,6 +289,8 @@ async fn main() -> anyhow::Result<()> {
                 slack_cfg.allow_user_messages,
                 max_bot_turns,
                 stt,
+                slack_cfg.context_recovery,
+                inbound_attachment_content_blocks,
                 slack_shutdown_rx,
                 slack_dispatcher,
             )
@@ -336,6 +340,7 @@ async fn main() -> anyhow::Result<()> {
             allowed_users: gw_cfg.allowed_users,
             streaming: gw_cfg.streaming,
             stt: cfg.stt.clone(),
+            inbound_attachment_content_blocks,
         };
         let gw_router = router.clone();
         Some(tokio::spawn(async move {
@@ -489,6 +494,8 @@ async fn main() -> anyhow::Result<()> {
             allowed_channels,
             allowed_users,
             stt_config: cfg.stt.clone(),
+            context_recovery: discord_cfg.context_recovery.clone(),
+            inbound_attachment_content_blocks,
             adapter: std::sync::OnceLock::new(),
             allow_bot_messages: discord_cfg.allow_bot_messages,
             trusted_bot_ids,

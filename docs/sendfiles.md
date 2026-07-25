@@ -74,7 +74,6 @@ working_dir = "/home/node"
 [attachments]
 enabled = true
 allowed_dirs = ["/home/node", "/home/node/reports"]
-max_bytes = 10485760
 max_files = 10
 ```
 
@@ -278,8 +277,8 @@ Ensure your bot has these permissions in the [Discord Developer Portal](https://
 **Q: Can OpenAB relay files natively?**
 A: Not currently. OpenAB streams text via ACP JSON-RPC. File sending is done out-of-band by the agent.
 
-**Q: What if the file is too large?**
-A: Use the [Large Files & Enterprise Best Practice](#large-files--enterprise-best-practice) pattern — upload to S3/R2/Google Drive, generate a temporary link, and send the URL in the message.
+**Q: What if the destination rejects a large file?**
+A: OpenAB does not impose its own byte-size cap, but destination platforms still enforce upload limits. Use the [Large Files & Enterprise Best Practice](#large-files--enterprise-best-practice) pattern when the platform rejects the upload.
 
 **Q: Does this work with Slack / Telegram / LINE?**
-A: Same concept — call the platform's file upload API using the channel ID from `sender_context`. API details differ per platform. For Slack, use [`files.upload`](https://api.slack.com/methods/files.upload). For Telegram, use [`sendDocument`](https://core.telegram.org/bots/api#senddocument).
+A: Same concept — call the platform's file upload API using the channel ID from `sender_context`. API details differ per platform. OpenAB supports Slack via [`files.getUploadURLExternal`](https://docs.slack.dev/reference/methods/files.getUploadURLExternal/) followed by [`files.completeUploadExternal`](https://docs.slack.dev/reference/methods/files.completeUploadExternal/). For Telegram, use [`sendDocument`](https://core.telegram.org/bots/api#senddocument).

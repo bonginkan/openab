@@ -5,7 +5,6 @@ use std::collections::HashMap;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::sync::Mutex;
 use tracing::{error, warn};
 
@@ -432,6 +431,11 @@ pub struct SenderContext {
     /// Enables agents to identify themselves when multiple agents share the same backend.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub receiver_id: Option<String>,
+    /// Bounded platform context recovered by the adapter. Platform credentials
+    /// remain inside OpenAB; downstream agents receive only normalized messages
+    /// and sanitized failure reasons.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recovered_context: Option<crate::context_recovery::RecoveredContext>,
 }
 
 // --- ChatAdapter trait ---
@@ -525,7 +529,6 @@ struct OutboundAttachments {
     auto_stage_generated_images: bool,
     auto_stage_dir: Option<PathBuf>,
     agent_working_dir: PathBuf,
-    max_bytes: u64,
     max_files: usize,
 }
 
@@ -558,7 +561,6 @@ impl OutboundAttachments {
             auto_stage_generated_images: config.auto_stage_generated_images,
             auto_stage_dir: config.auto_stage_dir.map(PathBuf::from),
             agent_working_dir,
-            max_bytes: config.max_bytes,
             max_files: config.max_files,
         }
     }
@@ -636,20 +638,8 @@ impl OutboundAttachments {
 
         let metadata = tokio::fs::metadata(&canonical).await?;
         anyhow::ensure!(metadata.is_file(), "path is not a regular file");
-        anyhow::ensure!(
-            metadata.len() <= self.max_bytes,
-            "file is {} bytes, over the {} byte limit",
-            metadata.len(),
-            self.max_bytes
-        );
 
         let data = tokio::fs::read(&canonical).await?;
-        anyhow::ensure!(
-            data.len() as u64 <= self.max_bytes,
-            "file is {} bytes, over the {} byte limit",
-            data.len(),
-            self.max_bytes
-        );
         if matches!(kind, OutboundAttachmentKind::Image) {
             ensure_supported_image(&data)?;
         }
@@ -689,20 +679,8 @@ impl OutboundAttachments {
 
         let metadata = tokio::fs::metadata(canonical_file).await?;
         anyhow::ensure!(metadata.is_file(), "path is not a regular file");
-        anyhow::ensure!(
-            metadata.len() <= self.max_bytes,
-            "file is {} bytes, over the {} byte limit",
-            metadata.len(),
-            self.max_bytes
-        );
 
         let data = tokio::fs::read(canonical_file).await?;
-        anyhow::ensure!(
-            data.len() as u64 <= self.max_bytes,
-            "file is {} bytes, over the {} byte limit",
-            data.len(),
-            self.max_bytes
-        );
         ensure_supported_image(&data)?;
 
         let stage_dir = self.resolve_auto_stage_dir().await?;
@@ -899,7 +877,6 @@ pub struct AdapterRouter {
     pool: Arc<SessionPool>,
     reactions_config: ReactionsConfig,
     table_mode: TableMode,
-    prompt_hard_timeout: Option<Duration>,
     /// Polling cadence for the recv-loop liveness check (#732).
     liveness_check_interval: std::time::Duration,
     /// Session keys with an accepted mid-turn steer awaiting its first post-steer
@@ -908,10 +885,6 @@ pub struct AdapterRouter {
     /// (below the user's steer message) headed by the steer content.
     pending_steer_separators: Arc<Mutex<HashMap<String, String>>>,
     outbound_attachments: OutboundAttachments,
-}
-
-fn prompt_hard_timeout_from_secs(secs: u64) -> Option<Duration> {
-    (secs > 0).then(|| Duration::from_secs(secs))
 }
 
 struct StreamingPostInner {
@@ -1031,26 +1004,14 @@ impl AdapterRouter {
         pool: Arc<SessionPool>,
         reactions_config: ReactionsConfig,
         table_mode: TableMode,
-        prompt_hard_timeout_secs: u64,
         liveness_check_secs: u64,
         attachments_config: AttachmentsConfig,
         agent_working_dir: String,
     ) -> Self {
-        let prompt_hard_timeout = prompt_hard_timeout_from_secs(prompt_hard_timeout_secs);
-        if prompt_hard_timeout.is_some() && liveness_check_secs >= prompt_hard_timeout_secs {
-            warn!(
-                liveness_check_secs,
-                prompt_hard_timeout_secs,
-                "pool.liveness_check_secs >= pool.prompt_hard_timeout_secs; \
-                 the hard ceiling will only fire after the next liveness tick \
-                 and may be effectively bypassed. Lower liveness_check_secs."
-            );
-        }
         Self {
             pool,
             reactions_config,
             table_mode,
-            prompt_hard_timeout,
             liveness_check_interval: std::time::Duration::from_secs(liveness_check_secs),
             pending_steer_separators: Arc::new(Mutex::new(HashMap::new())),
             outbound_attachments: OutboundAttachments::new(attachments_config, agent_working_dir),
@@ -1256,7 +1217,6 @@ impl AdapterRouter {
         }
         let table_mode = self.table_mode;
         let tool_display = self.reactions_config.tool_display;
-        let prompt_hard_timeout = self.prompt_hard_timeout;
         let liveness_check_interval = self.liveness_check_interval;
         let pending_steer_separators = self.pending_steer_separators.clone();
         let thread_key_for_separator = thread_key.to_string();
@@ -1337,16 +1297,6 @@ impl AdapterRouter {
                                     response_error = Some("Agent process died".into());
                                     conn.abandon_request(request_id).await;
                                     break;
-                                }
-                                if let Some(prompt_hard_timeout) = prompt_hard_timeout {
-                                    if prompt_start.elapsed() > prompt_hard_timeout {
-                                        response_error = Some(format!(
-                                            "Agent exceeded hard timeout ({}s)",
-                                            prompt_hard_timeout.as_secs(),
-                                        ));
-                                        conn.abandon_request(request_id).await;
-                                        break;
-                                    }
                                 }
                                 continue;
                             }
@@ -1780,13 +1730,48 @@ fn steer_prompt_text(blocks: &[ContentBlock]) -> String {
     blocks
         .iter()
         .filter_map(|b| match b {
-            ContentBlock::Text { text } => Some(text.as_str()),
+            ContentBlock::Text { text } if !is_sender_context_block(text) => Some(text.as_str()),
             _ => None,
         })
         .collect::<Vec<_>>()
         .join("\n")
         .trim()
         .to_string()
+}
+
+fn is_sender_context_block(text: &str) -> bool {
+    let trimmed = text.trim();
+    trimmed.starts_with("<sender_context>") && trimmed.contains("</sender_context>")
+}
+
+/// Make mention syntax inert inside a quoted steer prompt while keeping the
+/// original text readable. Normal response mentions are left untouched.
+fn neutralize_steer_mentions(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut previous = None;
+    let mut chars = text.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        output.push(ch);
+        if ch == '@' {
+            let mention_body = chars.peek().is_some_and(|next| {
+                next.is_ascii_alphanumeric() || matches!(next, '_' | '!' | '&')
+            });
+            let mention_boundary = previous.is_none_or(|prev: char| {
+                !prev.is_ascii_alphanumeric() && !matches!(prev, '_' | '.' | '-')
+            });
+            if mention_body && mention_boundary {
+                output.push('\u{200b}');
+            }
+        }
+        previous = Some(ch);
+    }
+
+    output
+        .replace("<!here>", "<!\u{200b}here>")
+        .replace("<!channel>", "<!\u{200b}channel>")
+        .replace("<!everyone>", "<!\u{200b}everyone>")
+        .replace("<!subteam^", "<!\u{200b}subteam^")
 }
 
 /// Render the steer content as the header of the continuation post — a Markdown
@@ -1796,7 +1781,8 @@ fn render_steer_header(steer_text: &str) -> String {
     if trimmed.is_empty() {
         return "↪ **Steer**".to_string();
     }
-    let quoted = trimmed
+    let neutralized = neutralize_steer_mentions(trimmed);
+    let quoted = neutralized
         .lines()
         .map(|l| format!("> {l}"))
         .collect::<Vec<_>>()
@@ -1921,10 +1907,7 @@ fn is_inside_inline_code_span(text: &str) -> bool {
 }
 
 fn is_sentence_terminal(ch: char) -> bool {
-    matches!(
-        ch,
-        '.' | '!' | '?' | ':' | ';' | '。' | '！' | '？' | '：' | '；'
-    )
+    ch == '。'
 }
 
 fn is_text_start(ch: char) -> bool {
@@ -2137,15 +2120,6 @@ mod tests {
     }
 
     #[test]
-    fn prompt_hard_timeout_zero_is_disabled() {
-        assert_eq!(prompt_hard_timeout_from_secs(0), None);
-        assert_eq!(
-            prompt_hard_timeout_from_secs(1),
-            Some(std::time::Duration::from_secs(1))
-        );
-    }
-
-    #[test]
     fn origin_event_id_excluded_from_eq() {
         let a = ChannelRef {
             platform: "line".into(),
@@ -2300,10 +2274,23 @@ mod tests {
     }
 
     #[test]
-    fn append_text_chunk_separates_after_closed_inline_code() {
+    fn append_text_chunk_does_not_separate_after_ascii_period() {
         let mut text = "Use `foo`.".to_string();
         append_text_chunk(&mut text, "Next step.", false);
-        assert_eq!(text, "Use `foo`.\nNext step.");
+        assert_eq!(text, "Use `foo`.Next step.");
+    }
+
+    #[test]
+    fn append_text_chunk_only_separates_after_japanese_full_stop() {
+        for terminal in ['.', '!', '?', ':', ';', '！', '？', '：', '；'] {
+            let mut text = format!("first{terminal}");
+            append_text_chunk(&mut text, "second", false);
+            assert_eq!(text, format!("first{terminal}second"));
+        }
+
+        let mut text = "first。".to_string();
+        append_text_chunk(&mut text, "second", false);
+        assert_eq!(text, "first。\nsecond");
     }
 
     #[test]
@@ -2358,7 +2345,23 @@ mod tests {
                 text: "and add a test  ".to_string(),
             },
         ];
-        assert_eq!(steer_prompt_text(&blocks), "use bun instead\nand add a test");
+        assert_eq!(
+            steer_prompt_text(&blocks),
+            "use bun instead\nand add a test"
+        );
+    }
+
+    #[test]
+    fn steer_prompt_text_omits_sender_context_block() {
+        let blocks = vec![
+            ContentBlock::Text {
+                text: "<sender_context>\n{\"sender_id\":\"U1\"}\n</sender_context>\n\n".to_string(),
+            },
+            ContentBlock::Text {
+                text: "  run the task  ".to_string(),
+            },
+        ];
+        assert_eq!(steer_prompt_text(&blocks), "run the task");
     }
 
     #[test]
@@ -2370,6 +2373,27 @@ mod tests {
     #[test]
     fn render_steer_header_empty_falls_back_to_label() {
         assert_eq!(render_steer_header("   "), "↪ **Steer**");
+    }
+
+    #[test]
+    fn render_steer_header_neutralizes_cross_platform_mentions() {
+        let header = render_steer_header(
+            "ask <@123456789> <@!234567890> <@U123ABC|alice> @telegram_user\nnotify <@&345678901> @everyone @here <!here> <!channel> <!everyone> <!subteam^S123>",
+        );
+        assert_eq!(
+            header,
+            "↪ **Steer**\n> ask <@\u{200b}123456789> <@\u{200b}!234567890> <@\u{200b}U123ABC|alice> @\u{200b}telegram_user\n> notify <@\u{200b}&345678901> @\u{200b}everyone @\u{200b}here <!\u{200b}here> <!\u{200b}channel> <!\u{200b}everyone> <!\u{200b}subteam^S123>"
+        );
+        assert!(!contains_mention(&header));
+    }
+
+    #[test]
+    fn render_steer_header_preserves_email_and_channel_reference() {
+        let header = render_steer_header("email dev@example.com; keep <#123456789> unchanged");
+        assert_eq!(
+            header,
+            "↪ **Steer**\n> email dev@example.com; keep <#123456789> unchanged"
+        );
     }
 
     #[test]
@@ -2427,7 +2451,6 @@ mod tests {
             allowed_dirs: vec![dir.path().to_string_lossy().to_string()],
             auto_stage_generated_images: false,
             auto_stage_dir: None,
-            max_bytes: 1024 * 1024,
             max_files: 10,
         };
         let outbound = OutboundAttachments::new(cfg, dir.path().to_string_lossy().to_string());
@@ -2452,7 +2475,6 @@ mod tests {
             allowed_dirs: vec![dir.path().to_string_lossy().to_string()],
             auto_stage_generated_images: false,
             auto_stage_dir: None,
-            max_bytes: 1024 * 1024,
             max_files: 10,
         };
         let outbound = OutboundAttachments::new(cfg, dir.path().to_string_lossy().to_string());
@@ -2468,6 +2490,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn outbound_attachments_do_not_apply_a_byte_size_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("large-report.bin");
+        let data = vec![0x5a; 10 * 1024 * 1024 + 1];
+        std::fs::write(&file_path, &data).unwrap();
+        let cfg = AttachmentsConfig {
+            enabled: true,
+            allowed_dirs: vec![dir.path().to_string_lossy().to_string()],
+            auto_stage_generated_images: false,
+            auto_stage_dir: None,
+            max_files: 10,
+        };
+        let outbound = OutboundAttachments::new(cfg, dir.path().to_string_lossy().to_string());
+
+        let (files, warnings) = outbound
+            .load_attachments(&[], &[file_path.to_string_lossy().to_string()])
+            .await;
+
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].data.len(), data.len());
+    }
+
+    #[tokio::test]
     async fn outbound_attachments_rejects_non_image_for_attach_image() {
         let dir = tempfile::tempdir().unwrap();
         let file_path = dir.path().join("delivery-note.docx");
@@ -2477,7 +2523,6 @@ mod tests {
             allowed_dirs: vec![dir.path().to_string_lossy().to_string()],
             auto_stage_generated_images: false,
             auto_stage_dir: None,
-            max_bytes: 1024 * 1024,
             max_files: 10,
         };
         let outbound = OutboundAttachments::new(cfg, dir.path().to_string_lossy().to_string());
@@ -2502,7 +2547,6 @@ mod tests {
             allowed_dirs: vec![allowed.path().to_string_lossy().to_string()],
             auto_stage_generated_images: false,
             auto_stage_dir: None,
-            max_bytes: 1024 * 1024,
             max_files: 10,
         };
         let outbound = OutboundAttachments::new(cfg, allowed.path().to_string_lossy().to_string());
@@ -2529,7 +2573,6 @@ mod tests {
             allowed_dirs: vec![allowed.path().to_string_lossy().to_string()],
             auto_stage_generated_images: true,
             auto_stage_dir: Some(allowed.path().to_string_lossy().to_string()),
-            max_bytes: 1024 * 1024,
             max_files: 10,
         };
         let outbound = OutboundAttachments::new(cfg, allowed.path().to_string_lossy().to_string());
@@ -2556,7 +2599,6 @@ mod tests {
             allowed_dirs: vec![allowed.path().to_string_lossy().to_string()],
             auto_stage_generated_images: true,
             auto_stage_dir: Some(allowed.path().to_string_lossy().to_string()),
-            max_bytes: 1024 * 1024,
             max_files: 10,
         };
         let outbound = OutboundAttachments::new(cfg, allowed.path().to_string_lossy().to_string());
@@ -2580,7 +2622,6 @@ mod tests {
             allowed_dirs: Vec::new(),
             auto_stage_generated_images: false,
             auto_stage_dir: None,
-            max_bytes: 1024 * 1024,
             max_files: 10,
         };
         let outbound = OutboundAttachments::new(cfg, dir.path().to_string_lossy().to_string());
@@ -2602,7 +2643,6 @@ mod tests {
             allowed_dirs: vec![dir.path().to_string_lossy().to_string()],
             auto_stage_generated_images: false,
             auto_stage_dir: None,
-            max_bytes: 1024 * 1024,
             max_files: 10,
         };
         let outbound = OutboundAttachments::new(cfg, dir.path().to_string_lossy().to_string());

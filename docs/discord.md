@@ -228,7 +228,7 @@ for the agent. Supported types (checked in order):
 | Type | Detection | Agent receives |
 |------|-----------|----------------|
 | Audio | MIME `audio/*` | Transcribed text via STT (if enabled) |
-| Text files | Extension list (`.txt`, `.md`, `.json`, etc.) | File content inlined (up to 5 files, 1 MB total) |
+| Text files | Extension list (`.txt`, `.md`, `.json`, etc.) | File content inlined (up to 5 files) |
 | Images | MIME `image/*` or image extensions | Base64-encoded image block |
 | Video | MIME `video/*` or extensions (`.mp4`, `.mov`, `.webm`, `.mkv`, `.m4v`, `.avi`) | Text block with filename, content type, size, and Discord CDN URL |
 

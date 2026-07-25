@@ -82,6 +82,32 @@ data:
     {{- if hasKey ($cfg.discord | default dict) "maxBatchTokens" }}
     max_batch_tokens = {{ ($cfg.discord).maxBatchTokens | int }}
     {{- end }}
+    {{- if hasKey ($cfg.discord | default dict) "contextRecovery" }}
+
+    [discord.context_recovery]
+    {{- $recovery := ($cfg.discord).contextRecovery | default dict }}
+    {{- if hasKey $recovery "enabled" }}
+    enabled = {{ $recovery.enabled }}
+    {{- end }}
+    {{- if hasKey $recovery "historyLimit" }}
+    history_limit = {{ $recovery.historyLimit | int }}
+    {{- end }}
+    {{- if hasKey $recovery "linkLimit" }}
+    link_limit = {{ $recovery.linkLimit | int }}
+    {{- end }}
+    {{- if hasKey $recovery "linkNeighbors" }}
+    link_neighbors = {{ $recovery.linkNeighbors | int }}
+    {{- end }}
+    {{- if hasKey $recovery "maxMessageChars" }}
+    max_message_chars = {{ $recovery.maxMessageChars | int }}
+    {{- end }}
+    {{- if hasKey $recovery "maxTotalChars" }}
+    max_total_chars = {{ $recovery.maxTotalChars | int }}
+    {{- end }}
+    {{- if hasKey $recovery "settleDelayMs" }}
+    settle_delay_ms = {{ $recovery.settleDelayMs | int }}
+    {{- end }}
+    {{- end }}
     {{- end }}
 
     {{- if and ($cfg.slack).enabled }}
@@ -134,6 +160,32 @@ data:
     {{- if hasKey ($cfg.slack | default dict) "maxBatchTokens" }}
     max_batch_tokens = {{ ($cfg.slack).maxBatchTokens | int }}
     {{- end }}
+    {{- if hasKey ($cfg.slack | default dict) "contextRecovery" }}
+
+    [slack.context_recovery]
+    {{- $recovery := ($cfg.slack).contextRecovery | default dict }}
+    {{- if hasKey $recovery "enabled" }}
+    enabled = {{ $recovery.enabled }}
+    {{- end }}
+    {{- if hasKey $recovery "historyLimit" }}
+    history_limit = {{ $recovery.historyLimit | int }}
+    {{- end }}
+    {{- if hasKey $recovery "linkLimit" }}
+    link_limit = {{ $recovery.linkLimit | int }}
+    {{- end }}
+    {{- if hasKey $recovery "linkNeighbors" }}
+    link_neighbors = {{ $recovery.linkNeighbors | int }}
+    {{- end }}
+    {{- if hasKey $recovery "maxMessageChars" }}
+    max_message_chars = {{ $recovery.maxMessageChars | int }}
+    {{- end }}
+    {{- if hasKey $recovery "maxTotalChars" }}
+    max_total_chars = {{ $recovery.maxTotalChars | int }}
+    {{- end }}
+    {{- if hasKey $recovery "settleDelayMs" }}
+    settle_delay_ms = {{ $recovery.settleDelayMs | int }}
+    {{- end }}
+    {{- end }}
     {{- end }}
 
     [agent]
@@ -163,7 +215,6 @@ data:
     {{- if ($cfg.attachments).autoStageDir }}
     auto_stage_dir = {{ ($cfg.attachments).autoStageDir | quote }}
     {{- end }}
-    max_bytes = {{ ($cfg.attachments).maxBytes | default 10485760 | int }}
     max_files = {{ ($cfg.attachments).maxFiles | default 10 | int }}
     {{- end }}
 

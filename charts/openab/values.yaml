@@ -273,6 +273,14 @@ agents:
       # maxBufferedMessages: 10
       # maxBatchTokens: soft token cap per ACP turn for batching modes (default 24000)
       # maxBatchTokens: 24000
+      # contextRecovery:
+      #   enabled: false
+      #   historyLimit: 12
+      #   linkLimit: 4
+      #   linkNeighbors: 2
+      #   maxMessageChars: 2000
+      #   maxTotalChars: 12000
+      #   settleDelayMs: 250
     slack:
       enabled: false
       botToken: ""       # Bot User OAuth Token (xoxb-...)
@@ -314,6 +322,14 @@ agents:
       # maxBufferedMessages: 10
       # maxBatchTokens: soft token cap per ACP turn for batching modes (default 24000)
       # maxBatchTokens: 24000
+      # contextRecovery:
+      #   enabled: false
+      #   historyLimit: 12
+      #   linkLimit: 4
+      #   linkNeighbors: 2
+      #   maxMessageChars: 2000
+      #   maxTotalChars: 12000
+      #   settleDelayMs: 250
     workingDir: /home/agent
     attachments:
       enabled: false
@@ -324,7 +340,6 @@ agents:
       # autoStageDir must resolve inside allowedDirs.
       autoStageGeneratedImages: false
       autoStageDir: ""
-      maxBytes: 10485760
       maxFiles: 10
     env: {}
     # Load env vars from existing Secrets or ConfigMaps, e.g. GH_TOKEN.

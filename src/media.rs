@@ -31,8 +31,6 @@ pub enum MediaFetchError {
     UnsupportedResponseType { actual: Option<String> },
     /// Response body magic bytes don't match a supported image format.
     InvalidImageBody { magic_prefix_hex: String },
-    /// File exceeds the configured size limit.
-    SizeExceeded { actual: u64, limit: u64 },
     /// Network-level error (send or body-read).
     Network(reqwest::Error),
     /// Server returned a non-success HTTP status.
@@ -58,9 +56,6 @@ impl std::fmt::Display for MediaFetchError {
                 f,
                 "response body is not a valid image (first 8 bytes: {magic_prefix_hex})"
             ),
-            Self::SizeExceeded { actual, limit } => {
-                write!(f, "file size {actual} exceeds limit {limit}")
-            }
             Self::Network(e) => write!(f, "network error: {e}"),
             Self::HttpStatus(s) => write!(f, "HTTP {s}"),
             Self::ProcessingFailed(e) => write!(f, "image processing failed: {e}"),
@@ -156,10 +151,8 @@ fn validate_gif_body(raw: &[u8]) -> image::ImageResult<()> {
 /// Download an image from a URL, resize/compress it, and return as a ContentBlock.
 ///
 /// Returns `Err(MediaFetchError::NotAnImage)` when the URL or MIME hint don't
-/// indicate an image — callers should skip silently.  Returns
-/// `Err(MediaFetchError::SizeExceeded)` when the declared `size` exceeds the limit
-/// before any request is made, or when the downloaded body exceeds the limit.  Returns
-/// other `Err` variants (`Network`, `HttpStatus`, `UnsupportedResponseType`,
+/// indicate an image — callers should skip silently. Returns other `Err` variants
+/// (`Network`, `HttpStatus`, `UnsupportedResponseType`,
 /// `InvalidImageBody`) after a request attempt — callers should surface these to the user.  Returns
 /// `Err(MediaFetchError::ProcessingFailed)` when the body is a valid image but
 /// resize/compression fails — callers should warn the user and skip.
@@ -169,11 +162,9 @@ pub async fn download_and_encode_image(
     url: &str,
     mime_hint: Option<&str>,
     filename: &str,
-    size: u64,
+    _size: u64,
     auth_token: Option<&str>,
 ) -> Result<ContentBlock, MediaFetchError> {
-    const MAX_SIZE: u64 = 10 * 1024 * 1024; // 10 MB
-
     if url.is_empty() {
         return Err(MediaFetchError::NotAnImage);
     }
@@ -199,14 +190,6 @@ pub async fn download_and_encode_image(
     if !mime.starts_with("image/") {
         debug!(filename, mime, "skipping non-image attachment");
         return Err(MediaFetchError::NotAnImage);
-    }
-
-    if size > MAX_SIZE {
-        error!(filename, size, "image exceeds 10MB limit");
-        return Err(MediaFetchError::SizeExceeded {
-            actual: size,
-            limit: MAX_SIZE,
-        });
     }
 
     let mut req = HTTP_CLIENT.get(url);
@@ -240,18 +223,6 @@ pub async fn download_and_encode_image(
             return Err(MediaFetchError::Network(e));
         }
     };
-
-    if bytes.len() as u64 > MAX_SIZE {
-        error!(
-            filename,
-            size = bytes.len(),
-            "downloaded image exceeds limit"
-        );
-        return Err(MediaFetchError::SizeExceeded {
-            actual: bytes.len() as u64,
-            limit: MAX_SIZE,
-        });
-    }
 
     // Guard against HTTP 200 responses that are error pages (e.g. Slack auth redirect
     // when files:read scope is missing), and against corrupted or mislabeled bodies.
@@ -300,17 +271,10 @@ pub async fn download_and_transcribe(
     url: &str,
     filename: &str,
     mime_type: &str,
-    size: u64,
+    _size: u64,
     stt_config: &SttConfig,
     auth_token: Option<&str>,
 ) -> Option<String> {
-    const MAX_SIZE: u64 = 25 * 1024 * 1024; // 25 MB (Whisper API limit)
-
-    if size > MAX_SIZE {
-        error!(filename, size, "audio exceeds 25MB limit");
-        return None;
-    }
-
     let mut req = HTTP_CLIENT.get(url);
     if let Some(token) = auth_token {
         req = req.header("Authorization", format!("Bearer {token}"));
@@ -334,15 +298,6 @@ pub async fn download_and_transcribe(
             return None;
         }
     };
-
-    if bytes.len() as u64 > MAX_SIZE {
-        error!(
-            filename,
-            size = bytes.len(),
-            "downloaded audio exceeds 25MB limit"
-        );
-        return None;
-    }
 
     crate::stt::transcribe(
         &HTTP_CLIENT,
@@ -462,26 +417,13 @@ pub fn is_text_file(filename: &str, content_type: Option<&str>) -> bool {
 }
 
 /// Download a text-based file and return it as a ContentBlock::Text.
-/// Files larger than 512 KB are skipped to avoid bloating the prompt.
-///
 /// Pass `auth_token` for platforms that require authentication (e.g. Slack private files).
-///
-/// Note: the caller already guards total size via a total cap; the per-file
-/// MAX_SIZE check here is intentional defense-in-depth so this function remains
-/// self-contained and safe when called from other contexts.
 pub async fn download_and_read_text_file(
     url: &str,
     filename: &str,
-    size: u64,
+    _size: u64,
     auth_token: Option<&str>,
 ) -> Option<(ContentBlock, u64)> {
-    const MAX_SIZE: u64 = 512 * 1024; // 512 KB
-
-    if size > MAX_SIZE {
-        tracing::warn!(filename, size, "text file exceeds 512KB limit, skipping");
-        return None;
-    }
-
     let mut req = HTTP_CLIENT.get(url);
     if let Some(token) = auth_token {
         req = req.header("Authorization", format!("Bearer {token}"));
@@ -506,16 +448,6 @@ pub async fn download_and_read_text_file(
         }
     };
     let actual_size = bytes.len() as u64;
-
-    // Defense-in-depth: verify actual download size
-    if actual_size > MAX_SIZE {
-        tracing::warn!(
-            filename,
-            size = actual_size,
-            "downloaded text file exceeds 512KB limit, skipping"
-        );
-        return None;
-    }
 
     // from_utf8_lossy returns Cow::Borrowed for valid UTF-8 (zero-copy)
     let text = String::from_utf8_lossy(&bytes).into_owned();
@@ -807,11 +739,6 @@ mod tests {
         assert!(s.contains("none"), "None branch should render as 'none'");
         let _ = MediaFetchError::InvalidImageBody {
             magic_prefix_hex: "3c21444f43545950".into(),
-        }
-        .to_string();
-        let _ = MediaFetchError::SizeExceeded {
-            actual: 11_000_000,
-            limit: 10_000_000,
         }
         .to_string();
         let _ = MediaFetchError::HttpStatus(reqwest::StatusCode::UNAUTHORIZED).to_string();

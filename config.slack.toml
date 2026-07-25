@@ -8,7 +8,7 @@ allowed_users = ["U0AN2L7FQLE"]
 allow_bot_messages = "mentions"
 trusted_bot_ids = []
 allow_user_messages = "multibot-mentions"
-max_bot_turns = 100
+max_bot_turns = 10000
 
 [agent]
 # Local patched fork of codex-acp with mid-turn steering (bonginkan/codex-acp).
@@ -33,13 +33,11 @@ allowed_dirs = [
   "/Users/thepioneer/Documents/GitHub",
   "/Users/thepioneer/.codex/generated_images",
 ]
-max_bytes = 10485760
 max_files = 10
 
 [pool]
 max_sessions = 10
 session_ttl_hours = 24
-prompt_hard_timeout_secs = 0
 liveness_check_secs = 30
 
 [markdown]

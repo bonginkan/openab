@@ -24,10 +24,6 @@ use uuid::Uuid;
 ///   connection — never exposed externally. If gateway and core are separated in the
 ///   future, switch to HTTP media proxy with internal-only binding.
 ///
-/// - **Size limits enforced before write**: Callers must validate file size against
-///   IMAGE_MAX_DOWNLOAD / AUDIO_MAX_DOWNLOAD / FILE_MAX_DOWNLOAD before calling
-///   `store_media()`. This module does NOT re-validate — it trusts the caller.
-///
 /// - **No executable content**: Stored files are raw bytes (images, audio, text).
 ///   Core reads them as data only — never executed. The `mime_type` in the event
 ///   payload determines processing path, not the file content or name.
@@ -46,17 +42,9 @@ pub async fn media_dir() -> PathBuf {
     dir
 }
 
-/// Maximum file size accepted by store (defense-in-depth, callers should pre-check).
-const MAX_STORE_SIZE: usize = 20 * 1024 * 1024; // 20 MB (matches AUDIO_MAX_DOWNLOAD)
-
 /// Store media bytes to disk, return the absolute file path.
 /// Filename is UUID only (no extension) — MIME type is carried in the event payload.
-/// Rejects files exceeding MAX_STORE_SIZE as a defense-in-depth measure.
 pub async fn store_media(bytes: &[u8]) -> Option<String> {
-    if bytes.len() > MAX_STORE_SIZE {
-        error!(size = bytes.len(), max = MAX_STORE_SIZE, "store_media rejected: exceeds size limit");
-        return None;
-    }
     let dir = media_dir().await;
     let filename = Uuid::new_v4().to_string();
     let path = dir.join(&filename);

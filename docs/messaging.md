@@ -10,6 +10,55 @@ This document explains the five messaging patterns in OpenAB, each building on t
 
 ---
 
+## Bounded context recovery
+
+When `[discord.context_recovery]` or `[slack.context_recovery]` is enabled,
+OpenAB recovers a bounded context set before dispatching an incoming message:
+
+- nearby messages in the current channel or thread;
+- the native Discord reply target or Slack thread root;
+- explicitly pasted Discord message links or Slack permalinks, plus configured
+  neighbors.
+
+Recovered messages are added to the existing sender envelope under
+`recovered_context` using schema `openab.recovered-context.v1`. Each message
+has one or more relations (`current_window`, `native_reply`, `thread_root`,
+`linked_target`, or `linked_neighbor`). The user's incoming prompt remains
+verbatim.
+
+OpenAB applies guild/workspace and channel allowlists before following links.
+Credentials stay inside the adapter. If recovery is denied, truncated, or
+unavailable, the envelope reports `incomplete: true` with sanitized failure
+codes instead of silently claiming complete context. See
+[Configuration Reference](config-reference.md#adapter-context-recovery).
+
+---
+
+## Ingress routing audit
+
+OpenAB emits one metadata-only `openab::ingress_audit` event for every inbound
+Discord message and Slack `message` or `app_mention` event. Its structured
+fields use schema `openab.ingress-audit.v1` and include platform,
+event/channel/thread/scope identifiers, source timestamp, sender ID and bot
+flag, event kind, content character count, attachment count, and the terminal
+routing decision.
+
+Message content, prompts, attachment bytes, credentials, and tokens are never
+included. An early return that has not been assigned a known policy decision is
+recorded as `unclassified_drop`, so a newly introduced silent path is visible
+instead of disappearing from the audit trail. Dispatch failures are distinct
+from policy denials and normal duplicate suppression.
+
+The record reports observable routing effects only. For example,
+`sender_is_bot: true` with `bot_policy_denied` or `bot_untrusted` can be reviewed
+as an agent-access restriction, but OpenAB does not infer motive, classify
+people or viewpoints, or apply sanctions from message content. Existing log
+access and retention controls remain authoritative. The default
+`openab=info` filter includes these events; deployments that override
+`RUST_LOG` must retain `openab::ingress_audit=info` to preserve the trail.
+
+---
+
 ## 0. Human → Bot in DM
 
 Users can interact with the bot privately via direct message. DMs are **opt-in** — disabled by default to prevent unexpected resource usage.
