@@ -148,6 +148,32 @@ trusted_bot_ids = ["123456789012345678"]  # only this bot's messages pass throug
 
 Empty (default) = any bot can pass through (subject to the mode check).
 
+For several local Agent configs, keep one newline-delimited registry and load it
+from every config:
+
+```toml
+trusted_bot_ids = []
+trusted_bot_ids_file = "config/trusted-discord-agents.txt"
+```
+
+Relative paths resolve from the config file. Static IDs and file IDs are
+merged and deduplicated. A configured file that is missing, empty, or contains
+an invalid Discord snowflake stops startup instead of widening trust. Remote
+config URLs cannot reference local registry files.
+
+An HTTPS registry projection can be used instead:
+
+```toml
+trusted_bot_ids_url = "https://agent-office.example/api/discord/trusted-bots"
+trusted_bot_ids_url_bearer_token = "${AGENT_TRUST_REGISTRY_SECRET}"
+```
+
+The response uses the same line format, is capped at 32 IDs and 64 KiB, and is
+read at process startup. Fetch, authentication, HTTP, UTF-8, empty-registry, or
+ID validation failures stop startup. Restart the process after registry changes.
+Keep trusted collaborators that are not registered Agent Office identities in
+`trusted_bot_ids`; URL entries merge with those explicit exceptions.
+
 ### `allowed_role_ids`
 
 Role IDs that trigger the bot, same as a direct @mention. This enables users to invoke multiple bots simultaneously with a single role mention (e.g. `@AllBots review this`).

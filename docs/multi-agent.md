@@ -127,3 +127,27 @@ trusted_bot_ids = ["123456789012345678"]  # only this bot's messages pass throug
 ```
 
 When `trusted_bot_ids` is empty (default), any bot can pass through (subject to the mode check). When set, only listed bots are accepted — all others are silently ignored.
+
+When multiple local Agent configs share the same trust boundary, use one
+fail-closed registry instead of copying the list:
+
+```toml
+[discord]
+allow_bot_messages = "mentions"
+trusted_bot_ids = []
+trusted_bot_ids_file = "config/trusted-discord-agents.txt"
+```
+
+The file contains one Discord bot user ID per line and may include blank lines
+or `#` comments. Its entries merge with `trusted_bot_ids`.
+
+For the authenticated Agent Office projection, configure:
+
+```toml
+trusted_bot_ids = ["1517895542213181480"] # trusted non-Agent exception
+trusted_bot_ids_url = "https://agent-office.example/api/discord/trusted-bots"
+trusted_bot_ids_url_bearer_token = "${AGENT_TRUST_REGISTRY_SECRET}"
+```
+
+The URL is read at startup and is capped at 32 IDs. Restart after the registry
+changes. The Bearer token is required whenever bot messages are enabled.
