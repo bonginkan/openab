@@ -165,10 +165,14 @@ An HTTPS registry projection can be used instead:
 
 ```toml
 trusted_bot_ids_url = "https://agent-office.example/api/discord/trusted-bots"
+trusted_bot_ids_url_bearer_token = "${AGENT_TRUST_REGISTRY_SECRET}"
 ```
 
-The response uses the same line format and has a 64 KiB limit. Fetch, HTTP,
-UTF-8, empty-registry, or ID validation failures stop startup.
+The response uses the same line format, is capped at 32 IDs and 64 KiB, and is
+read at process startup. Fetch, authentication, HTTP, UTF-8, empty-registry, or
+ID validation failures stop startup. Restart the process after registry changes.
+Keep trusted collaborators that are not registered Agent Office identities in
+`trusted_bot_ids`; URL entries merge with those explicit exceptions.
 
 ### `allowed_role_ids`
 

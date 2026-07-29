@@ -308,6 +308,9 @@ pub struct DiscordConfig {
     /// Optional HTTPS endpoint returning the same newline-delimited registry.
     /// Fetch or validation failure stops startup.
     pub trusted_bot_ids_url: Option<String>,
+    /// Bearer token sent only to `trusted_bot_ids_url`. Required when the URL
+    /// is configured and bot messages are enabled.
+    pub trusted_bot_ids_url_bearer_token: Option<String>,
     #[serde(default)]
     pub allow_user_messages: AllowUsers,
     /// Max consecutive bot turns (without human intervention) before throttling.
@@ -826,6 +829,11 @@ fn merge_trusted_bot_registry(
         !registry_ids.is_empty(),
         "Discord trusted bot registry {source} contains no bot IDs"
     );
+    const MAX_TRUSTED_BOT_IDS: usize = 32;
+    anyhow::ensure!(
+        registry_ids.len() <= MAX_TRUSTED_BOT_IDS,
+        "Discord trusted bot registry {source} exceeds {MAX_TRUSTED_BOT_IDS} IDs"
+    );
     for id in &registry_ids {
         anyhow::ensure!(
             id.bytes().all(|byte| byte.is_ascii_digit())
@@ -846,9 +854,22 @@ pub async fn merge_trusted_bot_ids_url(config: &mut Config) -> anyhow::Result<()
     let Some(discord) = config.discord.as_mut() else {
         return Ok(());
     };
+    if discord.allow_bot_messages == AllowBots::Off {
+        return Ok(());
+    }
     let Some(registry_url) = discord.trusted_bot_ids_url.clone() else {
         return Ok(());
     };
+    let bearer_token = discord
+        .trusted_bot_ids_url_bearer_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "discord.trusted_bot_ids_url_bearer_token is required when trusted_bot_ids_url is configured"
+            )
+        })?;
     let parsed = reqwest::Url::parse(&registry_url)
         .map_err(|e| anyhow::anyhow!("invalid discord.trusted_bot_ids_url: {e}"))?;
     anyhow::ensure!(
@@ -859,6 +880,7 @@ pub async fn merge_trusted_bot_ids_url(config: &mut Config) -> anyhow::Result<()
         .timeout(std::time::Duration::from_secs(10))
         .build()?
         .get(parsed)
+        .bearer_auth(bearer_token)
         .send()
         .await
         .map_err(|e| anyhow::anyhow!("failed to fetch discord.trusted_bot_ids_url: {e}"))?;
@@ -878,7 +900,16 @@ pub async fn merge_trusted_bot_ids_url(config: &mut Config) -> anyhow::Result<()
     );
     let raw = std::str::from_utf8(&bytes)
         .map_err(|e| anyhow::anyhow!("discord.trusted_bot_ids_url is not valid UTF-8: {e}"))?;
-    merge_trusted_bot_registry(discord, raw, &registry_url)
+    let previous_count = discord.trusted_bot_ids.len();
+    merge_trusted_bot_registry(discord, raw, &registry_url)?;
+    tracing::info!(
+        registry_url = %registry_url,
+        static_ids = previous_count,
+        added_ids = discord.trusted_bot_ids.len().saturating_sub(previous_count),
+        total_ids = discord.trusted_bot_ids.len(),
+        "merged authenticated Discord trusted bot registry"
+    );
+    Ok(())
 }
 
 fn parse_config(raw: &str, source: &str) -> anyhow::Result<Config> {
@@ -1166,7 +1197,9 @@ command = "echo"
             r#"
 [discord]
 bot_token = "test-token"
+allow_bot_messages = "mentions"
 trusted_bot_ids_url = "http://agent-office.example/trusted-bots"
+trusted_bot_ids_url_bearer_token = "test-secret"
 
 [agent]
 command = "echo"
@@ -1180,6 +1213,43 @@ command = "echo"
             .unwrap_err()
             .to_string()
             .contains("must use HTTPS"));
+    }
+
+    #[tokio::test]
+    async fn trusted_bot_registry_url_requires_bearer_token_before_fetch() {
+        let mut cfg = parse_config(
+            r#"
+[discord]
+bot_token = "test-token"
+allow_bot_messages = "mentions"
+trusted_bot_ids_url = "https://agent-office.example/trusted-bots"
+
+[agent]
+command = "echo"
+"#,
+            "test",
+        )
+        .unwrap();
+
+        assert!(merge_trusted_bot_ids_url(&mut cfg)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("trusted_bot_ids_url_bearer_token is required"));
+    }
+
+    #[test]
+    fn trusted_bot_registry_rejects_more_than_32_ids() {
+        let mut cfg = parse_config(MINIMAL_TOML, "test").unwrap();
+        let raw = (1..=33)
+            .map(|id| format!("153071749697215{id:04}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let error =
+            merge_trusted_bot_registry(cfg.discord.as_mut().unwrap(), &raw, "test registry")
+                .unwrap_err();
+
+        assert!(error.to_string().contains("exceeds 32 IDs"));
     }
 
     #[tokio::test]
