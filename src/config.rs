@@ -1,7 +1,7 @@
 use crate::markdown::TableMode;
 use regex::Regex;
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 /// Controls how incoming messages are dispatched to ACP turns.
@@ -299,6 +299,12 @@ pub struct DiscordConfig {
     /// ignored when `"off"` since all bot messages are rejected before this check.
     #[serde(default)]
     pub trusted_bot_ids: Vec<String>,
+    /// Optional newline-delimited Discord bot ID registry. Relative paths are
+    /// resolved from the local config file. Entries are merged with
+    /// `trusted_bot_ids`; blank lines and `#` comments are ignored.
+    ///
+    /// Remote configs cannot reference local registry files.
+    pub trusted_bot_ids_file: Option<String>,
     #[serde(default)]
     pub allow_user_messages: AllowUsers,
     /// Max consecutive bot turns (without human intervention) before throttling.
@@ -737,7 +743,9 @@ fn expand_env_vars(raw: &str) -> String {
 pub fn load_config(path: &Path) -> anyhow::Result<Config> {
     let raw = std::fs::read_to_string(path)
         .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", path.display()))?;
-    parse_config(&raw, path.display().to_string().as_str())
+    let mut config = parse_config(&raw, path.display().to_string().as_str())?;
+    merge_trusted_bot_ids_file(&mut config, path.parent().unwrap_or_else(|| Path::new(".")))?;
+    Ok(config)
 }
 
 pub async fn load_config_from_url(url: &str) -> anyhow::Result<Config> {
@@ -766,7 +774,63 @@ pub async fn load_config_from_url(url: &str) -> anyhow::Result<Config> {
     }
     let raw = String::from_utf8(bytes.to_vec())
         .map_err(|e| anyhow::anyhow!("remote config from {url} is not valid UTF-8: {e}"))?;
-    parse_config(&raw, url)
+    let config = parse_config(&raw, url)?;
+    if config
+        .discord
+        .as_ref()
+        .and_then(|discord| discord.trusted_bot_ids_file.as_ref())
+        .is_some()
+    {
+        anyhow::bail!("discord.trusted_bot_ids_file is only supported by local config files");
+    }
+    Ok(config)
+}
+
+fn merge_trusted_bot_ids_file(config: &mut Config, config_dir: &Path) -> anyhow::Result<()> {
+    let Some(discord) = config.discord.as_mut() else {
+        return Ok(());
+    };
+    let Some(registry) = discord.trusted_bot_ids_file.as_deref() else {
+        return Ok(());
+    };
+    let registry_path = Path::new(registry);
+    let registry_path = if registry_path.is_absolute() {
+        registry_path.to_path_buf()
+    } else {
+        config_dir.join(registry_path)
+    };
+    let raw = std::fs::read_to_string(&registry_path).map_err(|e| {
+        anyhow::anyhow!(
+            "failed to read discord.trusted_bot_ids_file {}: {e}",
+            registry_path.display()
+        )
+    })?;
+    let registry_ids: Vec<String> = raw
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(str::to_owned)
+        .collect();
+    anyhow::ensure!(
+        !registry_ids.is_empty(),
+        "discord.trusted_bot_ids_file {} contains no bot IDs",
+        registry_path.display()
+    );
+    for id in &registry_ids {
+        anyhow::ensure!(
+            id.bytes().all(|byte| byte.is_ascii_digit())
+                && id.parse::<u64>().is_ok_and(|value| value > 0),
+            "discord.trusted_bot_ids_file {} contains invalid Discord bot ID {id:?}",
+            registry_path.display()
+        );
+    }
+    let mut seen: HashSet<String> = discord.trusted_bot_ids.iter().cloned().collect();
+    for id in registry_ids {
+        if seen.insert(id.clone()) {
+            discord.trusted_bot_ids.push(id);
+        }
+    }
+    Ok(())
 }
 
 fn parse_config(raw: &str, source: &str) -> anyhow::Result<Config> {
@@ -962,6 +1026,90 @@ command = "echo"
         write!(tmp, "{}", MINIMAL_TOML).unwrap();
         let cfg = load_config(tmp.path()).unwrap();
         assert_eq!(cfg.discord.unwrap().bot_token, "test-token");
+    }
+
+    #[test]
+    fn load_config_merges_relative_trusted_bot_registry() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("trusted-bots.txt"),
+            "# command emitter\n1530717496972152842\n\n1516725819517567077\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            r#"
+[discord]
+bot_token = "test-token"
+trusted_bot_ids = ["1516725819517567077", "1522754903250833539"]
+trusted_bot_ids_file = "trusted-bots.txt"
+
+[agent]
+command = "echo"
+"#,
+        )
+        .unwrap();
+
+        let cfg = load_config(&dir.path().join("config.toml")).unwrap();
+        assert_eq!(
+            cfg.discord.unwrap().trusted_bot_ids,
+            vec![
+                "1516725819517567077",
+                "1522754903250833539",
+                "1530717496972152842"
+            ]
+        );
+    }
+
+    #[test]
+    fn load_config_rejects_missing_or_empty_trusted_bot_registry() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[discord]
+bot_token = "test-token"
+trusted_bot_ids_file = "trusted-bots.txt"
+
+[agent]
+command = "echo"
+"#,
+        )
+        .unwrap();
+        assert!(load_config(&config_path)
+            .unwrap_err()
+            .to_string()
+            .contains("failed to read discord.trusted_bot_ids_file"));
+
+        std::fs::write(dir.path().join("trusted-bots.txt"), "# comments only\n").unwrap();
+        assert!(load_config(&config_path)
+            .unwrap_err()
+            .to_string()
+            .contains("contains no bot IDs"));
+    }
+
+    #[test]
+    fn load_config_rejects_invalid_trusted_bot_registry_id() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("trusted-bots.txt"), "not-a-snowflake\n").unwrap();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            r#"
+[discord]
+bot_token = "test-token"
+trusted_bot_ids_file = "trusted-bots.txt"
+
+[agent]
+command = "echo"
+"#,
+        )
+        .unwrap();
+
+        assert!(load_config(&dir.path().join("config.toml"))
+            .unwrap_err()
+            .to_string()
+            .contains("contains invalid Discord bot ID"));
     }
 
     #[tokio::test]

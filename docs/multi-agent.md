@@ -127,3 +127,16 @@ trusted_bot_ids = ["123456789012345678"]  # only this bot's messages pass throug
 ```
 
 When `trusted_bot_ids` is empty (default), any bot can pass through (subject to the mode check). When set, only listed bots are accepted — all others are silently ignored.
+
+When multiple local Agent configs share the same trust boundary, use one
+fail-closed registry instead of copying the list:
+
+```toml
+[discord]
+allow_bot_messages = "mentions"
+trusted_bot_ids = []
+trusted_bot_ids_file = "config/trusted-discord-agents.txt"
+```
+
+The file contains one Discord bot user ID per line and may include blank lines
+or `#` comments. Its entries merge with `trusted_bot_ids`.
