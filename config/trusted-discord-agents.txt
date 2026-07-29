@@ -16,3 +16,14 @@
 
 # Registered Helix collaborator
 1517895542213181480
+
+# Channel webhooks used by マリアル to reach the agents.
+# The author id of a webhook message is the webhook's own id, not the poster's,
+# so each webhook has to be listed here or allow_bot_messages="mentions" drops it.
+# One id per line: a trailing comment on the same line fails to parse.
+# maria依頼
+1532151644647718954
+# 開発会議
+1532151862223048776
+# core連絡
+1532151982901559366
