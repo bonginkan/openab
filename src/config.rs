@@ -305,6 +305,9 @@ pub struct DiscordConfig {
     ///
     /// Remote configs cannot reference local registry files.
     pub trusted_bot_ids_file: Option<String>,
+    /// Optional HTTPS endpoint returning the same newline-delimited registry.
+    /// Fetch or validation failure stops startup.
+    pub trusted_bot_ids_url: Option<String>,
     #[serde(default)]
     pub allow_user_messages: AllowUsers,
     /// Max consecutive bot turns (without human intervention) before throttling.
@@ -805,6 +808,14 @@ fn merge_trusted_bot_ids_file(config: &mut Config, config_dir: &Path) -> anyhow:
             registry_path.display()
         )
     })?;
+    merge_trusted_bot_registry(discord, &raw, &registry_path.display().to_string())
+}
+
+fn merge_trusted_bot_registry(
+    discord: &mut DiscordConfig,
+    raw: &str,
+    source: &str,
+) -> anyhow::Result<()> {
     let registry_ids: Vec<String> = raw
         .lines()
         .map(str::trim)
@@ -813,15 +824,13 @@ fn merge_trusted_bot_ids_file(config: &mut Config, config_dir: &Path) -> anyhow:
         .collect();
     anyhow::ensure!(
         !registry_ids.is_empty(),
-        "discord.trusted_bot_ids_file {} contains no bot IDs",
-        registry_path.display()
+        "Discord trusted bot registry {source} contains no bot IDs"
     );
     for id in &registry_ids {
         anyhow::ensure!(
             id.bytes().all(|byte| byte.is_ascii_digit())
                 && id.parse::<u64>().is_ok_and(|value| value > 0),
-            "discord.trusted_bot_ids_file {} contains invalid Discord bot ID {id:?}",
-            registry_path.display()
+            "Discord trusted bot registry {source} contains invalid Discord bot ID {id:?}"
         );
     }
     let mut seen: HashSet<String> = discord.trusted_bot_ids.iter().cloned().collect();
@@ -831,6 +840,45 @@ fn merge_trusted_bot_ids_file(config: &mut Config, config_dir: &Path) -> anyhow:
         }
     }
     Ok(())
+}
+
+pub async fn merge_trusted_bot_ids_url(config: &mut Config) -> anyhow::Result<()> {
+    let Some(discord) = config.discord.as_mut() else {
+        return Ok(());
+    };
+    let Some(registry_url) = discord.trusted_bot_ids_url.clone() else {
+        return Ok(());
+    };
+    let parsed = reqwest::Url::parse(&registry_url)
+        .map_err(|e| anyhow::anyhow!("invalid discord.trusted_bot_ids_url: {e}"))?;
+    anyhow::ensure!(
+        parsed.scheme() == "https",
+        "discord.trusted_bot_ids_url must use HTTPS"
+    );
+    let response = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()?
+        .get(parsed)
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to fetch discord.trusted_bot_ids_url: {e}"))?;
+    let status = response.status();
+    anyhow::ensure!(
+        status.is_success(),
+        "discord.trusted_bot_ids_url returned HTTP {status}"
+    );
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to read discord.trusted_bot_ids_url: {e}"))?;
+    const MAX_TRUST_REGISTRY_BYTES: usize = 64 * 1024;
+    anyhow::ensure!(
+        bytes.len() <= MAX_TRUST_REGISTRY_BYTES,
+        "discord.trusted_bot_ids_url exceeds 64 KiB limit"
+    );
+    let raw = std::str::from_utf8(&bytes)
+        .map_err(|e| anyhow::anyhow!("discord.trusted_bot_ids_url is not valid UTF-8: {e}"))?;
+    merge_trusted_bot_registry(discord, raw, &registry_url)
 }
 
 fn parse_config(raw: &str, source: &str) -> anyhow::Result<Config> {
@@ -1110,6 +1158,28 @@ command = "echo"
             .unwrap_err()
             .to_string()
             .contains("contains invalid Discord bot ID"));
+    }
+
+    #[tokio::test]
+    async fn trusted_bot_registry_url_requires_https_before_fetch() {
+        let mut cfg = parse_config(
+            r#"
+[discord]
+bot_token = "test-token"
+trusted_bot_ids_url = "http://agent-office.example/trusted-bots"
+
+[agent]
+command = "echo"
+"#,
+            "test",
+        )
+        .unwrap();
+
+        assert!(merge_trusted_bot_ids_url(&mut cfg)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("must use HTTPS"));
     }
 
     #[tokio::test]

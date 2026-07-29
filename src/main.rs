@@ -123,6 +123,7 @@ async fn main() -> anyhow::Result<()> {
     } else {
         config::load_config(&PathBuf::from(&config_source))?
     };
+    config::merge_trusted_bot_ids_url(&mut cfg).await?;
     info!(
         agent_cmd = %cfg.agent.command,
         pool_max = cfg.pool.max_sessions,

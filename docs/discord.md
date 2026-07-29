@@ -161,6 +161,15 @@ merged and deduplicated. A configured file that is missing, empty, or contains
 an invalid Discord snowflake stops startup instead of widening trust. Remote
 config URLs cannot reference local registry files.
 
+An HTTPS registry projection can be used instead:
+
+```toml
+trusted_bot_ids_url = "https://agent-office.example/api/discord/trusted-bots"
+```
+
+The response uses the same line format and has a 64 KiB limit. Fetch, HTTP,
+UTF-8, empty-registry, or ID validation failures stop startup.
+
 ### `allowed_role_ids`
 
 Role IDs that trigger the bot, same as a direct @mention. This enables users to invoke multiple bots simultaneously with a single role mention (e.g. `@AllBots review this`).
