@@ -187,7 +187,7 @@ BotA in thread: here's my analysis
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `allow_bot_messages` | string | `"off"` | `"off"` — ignore bot messages. `"mentions"` — only process bot messages that @mention this bot. `"all"` — process all bot messages (capped by `max_bot_turns`). |
-| `trusted_bot_ids` | string[] | `[]` | Whitelist of bot IDs. For Slack, entries may be Bot User IDs (`U...`) or Bot IDs (`B...`); `U...` matching requires `users:read` so OpenAB can call `bots.info`. Empty = any bot (mode permitting). **Admission override:** a trusted bot that @mentions this bot bypasses `allow_bot_messages` mode entirely (treated as human @mention). |
+| `trusted_bot_ids` | string[] | `[]` | Whitelist of bot IDs. For Slack, entries may be Bot User IDs (`U...`) or Bot IDs (`B...`); `U...` matching requires `users:read` so OpenAB can call `bots.info`. Empty = any bot (mode permitting). **Admission override:** a trusted bot that @mentions this bot bypasses `allow_bot_messages` mode entirely (treated as human @mention). Discord also grants this override to bot authors trusted by `trusted_bot_role_ids`. |
 | `max_bot_turns` | u32 | `20` | Max consecutive bot turns per thread before throttling. A human message resets the counter. |
 
 > **Safety:** When `allow_bot_messages = "all"`, a separate hardcoded cap of 10 consecutive bot turns applies regardless of `max_bot_turns`.
@@ -267,7 +267,7 @@ All message routing in OpenAB is guarded by the **involvement gate** — a pre-d
 
 ### Design principle
 
-**Humans are the gatekeepers.** A bot cannot participate in a thread until a human explicitly pulls it in via @mention. Bots cannot pull other bots into threads — only humans can, **unless** the sending bot is in the target bot's `trusted_bot_ids` (see [Trusted bot admission override](#trusted-bot-admission-override) below).
+**Humans are the gatekeepers.** A bot cannot participate in a thread until a human explicitly pulls it in via @mention. Bots cannot pull other bots into threads — only humans can, **unless** the sending bot is trusted by the target bot's `trusted_bot_ids` or, on Discord, `trusted_bot_role_ids` (see [Trusted bot admission override](#trusted-bot-admission-override) below).
 
 ### How a bot becomes involved
 
@@ -326,7 +326,7 @@ This is an intentional safety constraint:
 
 ### Trusted bot admission override
 
-When a bot is listed in another bot's `trusted_bot_ids` and explicitly @mentions that bot, the mention is treated identically to a human @mention:
+When a bot is listed in another bot's `trusted_bot_ids`, or holds one of its Discord `trusted_bot_role_ids`, and explicitly @mentions that bot, the mention is treated identically to a human @mention:
 
 - The target bot becomes **involved** in the thread
 - The `allow_bot_messages` mode check is **bypassed** entirely

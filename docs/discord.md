@@ -149,7 +149,7 @@ trusted_bot_ids = ["123456789012345678"]  # only this bot's messages pass throug
 
 Empty (default) = any bot can pass through (subject to the mode check).
 
-**Admission override:** A trusted bot that explicitly @mentions this bot bypasses the `allow_bot_messages` mode entirely — the mention is treated the same as a human @mention. This allows trusted bots to pull this bot into threads even when `allow_bot_messages = "off"`. Messages from trusted bots *without* @mention still follow normal gating.
+**Admission override:** A bot trusted by `trusted_bot_ids` or `trusted_bot_role_ids` that explicitly @mentions this bot bypasses the `allow_bot_messages` mode entirely — the mention is treated the same as a human @mention. This allows trusted bots to pull this bot into threads even when `allow_bot_messages = "off"`. Messages from trusted bots *without* @mention still follow normal gating. Role trust checks the sender's roles; mentioning a trusted role is not a trigger.
 
 ### `allowed_role_ids`
 
@@ -323,7 +323,7 @@ In a multi-bot setup, every bot enforces an **involvement gate** before processi
 
 **Rule:** A bot must be **involved** (thread owner or has previously replied) before it will process any message in that thread.
 
-**Key constraint:** Only a human @mention — or a @mention from a bot in `trusted_bot_ids` — can pull a bot into a thread for the first time. A @mention from an untrusted bot will be **silently dropped**.
+**Key constraint:** Only a human @mention — or a @mention from a bot trusted by `trusted_bot_ids` or `trusted_bot_role_ids` — can pull a bot into a thread for the first time. A @mention from an untrusted bot will be **silently dropped**.
 
 ```
 Bot A's thread (Bot B not yet involved, Bot A NOT in Bot B's trusted_bot_ids):
