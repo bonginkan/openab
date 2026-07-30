@@ -655,7 +655,7 @@ pub struct ReactionsConfig {
     pub activity_heartbeat: ActivityHeartbeatConfig,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct ActivityHeartbeatConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -771,16 +771,6 @@ impl Default for ReactionsConfig {
             emojis: ReactionEmojis::default(),
             timing: ReactionTiming::default(),
             activity_heartbeat: ActivityHeartbeatConfig::default(),
-        }
-    }
-}
-
-impl Default for ActivityHeartbeatConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            channel: String::new(),
-            label: String::new(),
         }
     }
 }
