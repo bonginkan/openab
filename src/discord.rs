@@ -549,7 +549,8 @@ impl EventHandler for Handler {
                         return;
                     }
                 }
-            } else if matches!(msg.kind, MessageType::Regular | MessageType::InlineReply)
+            } else if !msg.author.bot
+                && matches!(msg.kind, MessageType::Regular | MessageType::InlineReply)
                 && !msg.content.is_empty()
             {
                 tracker.on_human_message(&thread_key);
