@@ -176,15 +176,6 @@ async fn main() -> anyhow::Result<()> {
         info!(model = %cfg.stt.model, base_url = %cfg.stt.base_url, "STT enabled");
     }
 
-    let router = Arc::new(AdapterRouter::new(
-        pool.clone(),
-        cfg.reactions,
-        cfg.markdown.tables,
-        cfg.pool.liveness_check_secs,
-        cfg.attachments,
-        agent_working_dir,
-    ));
-
     // Shutdown signal for Slack adapter
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
@@ -223,6 +214,19 @@ async fn main() -> anyhow::Result<()> {
             s.allow_bot_messages,
         ))
     });
+    let activity_heartbeat = reactions::ActivityHeartbeatManager::new(
+        &cfg.reactions.activity_heartbeat,
+        shared_discord_adapter.clone(),
+    );
+    let router = Arc::new(AdapterRouter::new(
+        pool.clone(),
+        cfg.reactions,
+        cfg.markdown.tables,
+        cfg.pool.liveness_check_secs,
+        cfg.attachments,
+        agent_working_dir,
+        activity_heartbeat,
+    ));
 
     // Validate cronjob config at startup (fail-fast on bad cron expressions or timezones)
     let mut configured_platforms: Vec<&str> = Vec::new();

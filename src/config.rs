@@ -650,6 +650,19 @@ pub struct ReactionsConfig {
     pub emojis: ReactionEmojis,
     #[serde(default)]
     pub timing: ReactionTiming,
+    /// Optional out-of-band activity heartbeat sent while an ACP turn runs.
+    #[serde(default)]
+    pub activity_heartbeat: ActivityHeartbeatConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ActivityHeartbeatConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub channel: String,
+    #[serde(default)]
+    pub label: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -739,7 +752,6 @@ fn default_done_hold_ms() -> u64 {
 fn default_error_hold_ms() -> u64 {
     2_500
 }
-
 impl Default for PoolConfig {
     fn default() -> Self {
         Self {
@@ -758,6 +770,17 @@ impl Default for ReactionsConfig {
             tool_display: ToolDisplay::default(),
             emojis: ReactionEmojis::default(),
             timing: ReactionTiming::default(),
+            activity_heartbeat: ActivityHeartbeatConfig::default(),
+        }
+    }
+}
+
+impl Default for ActivityHeartbeatConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            channel: String::new(),
+            label: String::new(),
         }
     }
 }
@@ -1021,6 +1044,33 @@ fn parse_config(raw: &str, source: &str) -> anyhow::Result<Config> {
         config.attachments.max_files > 0,
         "attachments.max_files must be > 0"
     );
+    if config.reactions.activity_heartbeat.enabled {
+        anyhow::ensure!(
+            config.reactions.activity_heartbeat.channel.len() >= 17
+                && config.reactions.activity_heartbeat.channel.len() <= 20
+                && config
+                    .reactions
+                    .activity_heartbeat
+                    .channel
+                    .chars()
+                    .all(|ch| ch.is_ascii_digit()),
+            "reactions.activity_heartbeat.channel must be a Discord channel ID"
+        );
+        anyhow::ensure!(
+            !config.reactions.activity_heartbeat.label.trim().is_empty(),
+            "reactions.activity_heartbeat.label is required when enabled"
+        );
+        anyhow::ensure!(
+            config.reactions.activity_heartbeat.label.len() <= 32
+                && config
+                    .reactions
+                    .activity_heartbeat
+                    .label
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_'),
+            "reactions.activity_heartbeat.label must be a 1-32 character public slug"
+        );
+    }
     for (platform, recovery) in [
         (
             "discord",
@@ -1091,11 +1141,59 @@ command = "echo"
         assert_eq!(cfg.agent.command, "echo");
         assert_eq!(cfg.pool.max_sessions, 10);
         assert!(cfg.reactions.enabled);
+        assert!(!cfg.reactions.activity_heartbeat.enabled);
         assert!(!cfg.attachments.enabled);
         assert_eq!(cfg.attachments.max_files, 10);
         assert!(!discord.context_recovery.enabled);
         assert_eq!(discord.context_recovery.history_limit, 12);
         assert_eq!(discord.context_recovery.max_total_chars, 12_000);
+    }
+
+    #[test]
+    fn parse_activity_heartbeat_config() {
+        let cfg = parse_config(
+            r#"
+[discord]
+bot_token = "test-token"
+
+[agent]
+command = "echo"
+
+[reactions.activity_heartbeat]
+enabled = true
+channel = "1530491625351151616"
+label = "takodex"
+"#,
+            "test",
+        )
+        .unwrap();
+
+        assert!(cfg.reactions.activity_heartbeat.enabled);
+        assert_eq!(
+            cfg.reactions.activity_heartbeat.channel,
+            "1530491625351151616"
+        );
+        assert_eq!(cfg.reactions.activity_heartbeat.label, "takodex");
+    }
+
+    #[test]
+    fn enabled_activity_heartbeat_requires_channel_and_label() {
+        let error = parse_config(
+            r#"
+[discord]
+bot_token = "test-token"
+
+[agent]
+command = "echo"
+
+[reactions.activity_heartbeat]
+enabled = true
+"#,
+            "test",
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("activity_heartbeat.channel"));
     }
 
     #[test]

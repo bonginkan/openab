@@ -1,6 +1,7 @@
 use crate::adapter::{ChatAdapter, MessageRef};
-use crate::config::{ReactionEmojis, ReactionTiming};
+use crate::config::{ActivityHeartbeatConfig, ReactionEmojis, ReactionTiming};
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use tokio::sync::Mutex;
 use tokio::time::Duration;
 
@@ -12,6 +13,95 @@ const WEB_TOKENS: &[&str] = &[
     "web-fetch",
     "browser",
 ];
+const ACTIVITY_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(600);
+
+struct ActivityHeartbeatState {
+    active_turns: usize,
+    handle: Option<tokio::task::JoinHandle<()>>,
+}
+
+pub struct ActivityHeartbeatManager {
+    adapter: Option<Arc<dyn ChatAdapter>>,
+    channel: String,
+    content: String,
+    interval: Duration,
+    state: StdMutex<ActivityHeartbeatState>,
+}
+
+pub struct ActivityHeartbeatLease {
+    manager: Arc<ActivityHeartbeatManager>,
+}
+
+impl Drop for ActivityHeartbeatLease {
+    fn drop(&mut self) {
+        self.manager.end_turn();
+    }
+}
+
+impl ActivityHeartbeatManager {
+    pub fn new(
+        config: &ActivityHeartbeatConfig,
+        discord_adapter: Option<Arc<dyn ChatAdapter>>,
+    ) -> Arc<Self> {
+        Self::with_interval(config, discord_adapter, ACTIVITY_HEARTBEAT_INTERVAL)
+    }
+
+    fn with_interval(
+        config: &ActivityHeartbeatConfig,
+        discord_adapter: Option<Arc<dyn ChatAdapter>>,
+        interval: Duration,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            adapter: config.enabled.then_some(discord_adapter).flatten(),
+            channel: config.channel.clone(),
+            content: format!("[{}] 作業中: ACPセッション処理中", config.label),
+            interval,
+            state: StdMutex::new(ActivityHeartbeatState {
+                active_turns: 0,
+                handle: None,
+            }),
+        })
+    }
+
+    pub fn begin_turn(self: &Arc<Self>) -> ActivityHeartbeatLease {
+        let mut state = self.state.lock().expect("heartbeat state mutex poisoned");
+        state.active_turns += 1;
+        if state.active_turns == 1 {
+            if let Some(adapter) = self.adapter.clone() {
+                let channel = crate::adapter::ChannelRef {
+                    platform: "discord".to_string(),
+                    channel_id: self.channel.clone(),
+                    thread_id: None,
+                    parent_id: None,
+                    origin_event_id: None,
+                };
+                let content = self.content.clone();
+                let interval = self.interval;
+                state.handle = Some(tokio::spawn(async move {
+                    loop {
+                        if let Err(error) = adapter.send_message(&channel, &content).await {
+                            tracing::warn!(%error, "activity heartbeat send failed");
+                        }
+                        tokio::time::sleep(interval).await;
+                    }
+                }));
+            }
+        }
+        ActivityHeartbeatLease {
+            manager: self.clone(),
+        }
+    }
+
+    fn end_turn(&self) {
+        let mut state = self.state.lock().expect("heartbeat state mutex poisoned");
+        state.active_turns = state.active_turns.saturating_sub(1);
+        if state.active_turns == 0 {
+            if let Some(handle) = state.handle.take() {
+                handle.abort();
+            }
+        }
+    }
+}
 
 fn classify_tool<'a>(name: &str, emojis: &'a ReactionEmojis) -> &'a str {
     let n = name.to_lowercase();
@@ -327,6 +417,7 @@ mod tests {
 
     struct RecordingAdapter {
         events: Arc<Mutex<Vec<(String, String, String)>>>,
+        messages: Arc<Mutex<Vec<(String, String)>>>,
     }
 
     #[async_trait]
@@ -339,7 +430,11 @@ mod tests {
             2000
         }
 
-        async fn send_message(&self, channel: &ChannelRef, _content: &str) -> Result<MessageRef> {
+        async fn send_message(&self, channel: &ChannelRef, content: &str) -> Result<MessageRef> {
+            self.messages
+                .lock()
+                .await
+                .push((channel.channel_id.clone(), content.to_string()));
             Ok(MessageRef {
                 channel: channel.clone(),
                 message_id: "sent".into(),
@@ -400,6 +495,7 @@ mod tests {
         let events = Arc::new(Mutex::new(Vec::new()));
         let adapter: Arc<dyn ChatAdapter> = Arc::new(RecordingAdapter {
             events: events.clone(),
+            messages: Arc::new(Mutex::new(Vec::new())),
         });
         let ctrl = StatusReactionController::new(
             true,
@@ -421,5 +517,43 @@ mod tests {
                 ("remove".to_string(), "old".to_string(), "👀".to_string()),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn activity_heartbeat_is_shared_and_stops_after_last_turn() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let messages = Arc::new(Mutex::new(Vec::new()));
+        let adapter: Arc<dyn ChatAdapter> = Arc::new(RecordingAdapter {
+            events,
+            messages: messages.clone(),
+        });
+        let manager = ActivityHeartbeatManager::with_interval(
+            &ActivityHeartbeatConfig {
+                enabled: true,
+                channel: "1530491625351151616".into(),
+                label: "takodex".into(),
+            },
+            Some(adapter),
+            Duration::from_millis(100),
+        );
+
+        let first = manager.begin_turn();
+        let second = manager.begin_turn();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            messages.lock().await.as_slice(),
+            &[(
+                "1530491625351151616".to_string(),
+                "[takodex] 作業中: ACPセッション処理中".to_string(),
+            )]
+        );
+
+        drop(first);
+        tokio::time::sleep(Duration::from_millis(110)).await;
+        assert_eq!(messages.lock().await.len(), 2);
+
+        drop(second);
+        tokio::time::sleep(Duration::from_millis(110)).await;
+        assert_eq!(messages.lock().await.len(), 2);
     }
 }

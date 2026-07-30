@@ -13,7 +13,7 @@ use crate::config::{AttachmentsConfig, ReactionsConfig, ToolDisplay};
 use crate::error_display::{format_coded_error, format_user_error};
 use crate::format;
 use crate::markdown::{self, TableMode};
-use crate::reactions::StatusReactionController;
+use crate::reactions::{ActivityHeartbeatManager, StatusReactionController};
 
 // --- Output directive parsing ---
 
@@ -885,6 +885,7 @@ pub struct AdapterRouter {
     /// (below the user's steer message) headed by the steer content.
     pending_steer_separators: Arc<Mutex<HashMap<String, String>>>,
     outbound_attachments: OutboundAttachments,
+    activity_heartbeat: Arc<ActivityHeartbeatManager>,
 }
 
 struct StreamingPostInner {
@@ -1007,6 +1008,7 @@ impl AdapterRouter {
         liveness_check_secs: u64,
         attachments_config: AttachmentsConfig,
         agent_working_dir: String,
+        activity_heartbeat: Arc<ActivityHeartbeatManager>,
     ) -> Self {
         Self {
             pool,
@@ -1015,6 +1017,7 @@ impl AdapterRouter {
             liveness_check_interval: std::time::Duration::from_secs(liveness_check_secs),
             pending_steer_separators: Arc::new(Mutex::new(HashMap::new())),
             outbound_attachments: OutboundAttachments::new(attachments_config, agent_working_dir),
+            activity_heartbeat,
         }
     }
 
@@ -1026,6 +1029,10 @@ impl AdapterRouter {
     /// Access the reactions config (used by dispatch.rs).
     pub fn reactions_config(&self) -> &ReactionsConfig {
         &self.reactions_config
+    }
+
+    pub fn activity_heartbeat(&self) -> &Arc<ActivityHeartbeatManager> {
+        &self.activity_heartbeat
     }
 
     /// Pack one arrival event into ContentBlocks. Per-arrival layout:
@@ -1102,6 +1109,7 @@ impl AdapterRouter {
             self.reactions_config.timing.clone(),
         ));
         reactions.set_queued().await;
+        let _activity_heartbeat = self.activity_heartbeat.begin_turn();
 
         let result = self
             .stream_prompt(

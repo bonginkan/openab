@@ -21,7 +21,7 @@ use crate::acp::ContentBlock;
 use crate::adapter::{AdapterRouter, ChannelRef, ChatAdapter, MessageRef};
 use crate::config::ReactionsConfig;
 use crate::error_display::format_user_error;
-use crate::reactions::StatusReactionController;
+use crate::reactions::{ActivityHeartbeatManager, StatusReactionController};
 
 type InFlightSet = std::collections::HashSet<String>;
 type ActiveReactions = HashMap<String, Arc<StatusReactionController>>;
@@ -119,6 +119,7 @@ impl ThreadHandle {
 #[async_trait]
 pub trait DispatchTarget: Send + Sync + 'static {
     fn reactions_config(&self) -> &ReactionsConfig;
+    fn activity_heartbeat(&self) -> &Arc<ActivityHeartbeatManager>;
 
     /// Ensure the ACP session for `session_key` exists (idempotent).
     async fn ensure_session(&self, session_key: &str) -> Result<()>;
@@ -148,6 +149,10 @@ pub trait DispatchTarget: Send + Sync + 'static {
 impl DispatchTarget for AdapterRouter {
     fn reactions_config(&self) -> &ReactionsConfig {
         AdapterRouter::reactions_config(self)
+    }
+
+    fn activity_heartbeat(&self) -> &Arc<ActivityHeartbeatManager> {
+        AdapterRouter::activity_heartbeat(self)
     }
 
     async fn ensure_session(&self, session_key: &str) -> Result<()> {
@@ -828,6 +833,7 @@ async fn dispatch_batch(
     reactions.track_existing_queued().await;
     let _active_reactions_guard =
         ActiveReactionGuard::enter(active_reactions, session_key.clone(), reactions.clone());
+    let _activity_heartbeat = target.activity_heartbeat().begin_turn();
 
     let result = target
         .stream_prompt_blocks(
@@ -1277,6 +1283,7 @@ mod tests {
             crate::config::default_liveness_check_secs(),
             crate::config::AttachmentsConfig::default(),
             "/tmp".into(),
+            ActivityHeartbeatManager::new(&Default::default(), None),
         ));
         Dispatcher::with_idle_timeout(router, 10, 24_000, grouping, DEFAULT_CONSUMER_IDLE_TIMEOUT)
     }
@@ -1438,6 +1445,7 @@ mod tests {
     /// Mock `DispatchTarget` — records calls; never touches a real session pool.
     struct MockDispatchTarget {
         reactions: ReactionsConfig,
+        activity_heartbeat: Arc<ActivityHeartbeatManager>,
         calls: Mutex<Vec<RecordedDispatch>>,
         /// Block counts of recorded `steer_prompt_blocks` invocations.
         steers: Mutex<Vec<usize>>,
@@ -1453,6 +1461,7 @@ mod tests {
         fn new() -> Self {
             Self {
                 reactions: ReactionsConfig::default(),
+                activity_heartbeat: ActivityHeartbeatManager::new(&Default::default(), None),
                 calls: Mutex::new(Vec::new()),
                 steers: Mutex::new(Vec::new()),
                 ensure_err: Mutex::new(None),
@@ -1474,6 +1483,10 @@ mod tests {
     impl DispatchTarget for MockDispatchTarget {
         fn reactions_config(&self) -> &ReactionsConfig {
             &self.reactions
+        }
+
+        fn activity_heartbeat(&self) -> &Arc<ActivityHeartbeatManager> {
+            &self.activity_heartbeat
         }
 
         async fn ensure_session(&self, _session_key: &str) -> Result<()> {

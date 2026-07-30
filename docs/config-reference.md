@@ -374,6 +374,20 @@ Fine-tune reaction timing behavior (milliseconds).
 | `done_hold_ms` | `1500` | How long to show the done emoji before removing (if `remove_after_reply`). |
 | `error_hold_ms` | `2500` | How long to show the error emoji before removing. |
 
+### `[reactions.activity_heartbeat]`
+
+Optional out-of-band activity heartbeat for presence dashboards. It is disabled by default,
+starts when the first ACP turn begins, and stops when the last concurrent turn completes or is
+dropped. It always uses the configured Discord bot adapter, independent of the input platform.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | bool | `false` | Enable activity heartbeat posting. |
+| `channel` | string | `""` | Target channel ID; required when enabled. |
+| `label` | string | `""` | Public ASCII slug, for example `takodex`; required when enabled. |
+
+An initial heartbeat is sent immediately and repeats every 10 minutes. The interval is fixed to protect Discord rate limits.
+
 ---
 
 ## `[stt]`

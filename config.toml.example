@@ -204,6 +204,13 @@ stall_hard_ms = 30000
 done_hold_ms = 1500
 error_hold_ms = 2500
 
+# Optional Agent Office presence heartbeat. Each OpenAB instance posts with
+# its own Discord bot identity only while an ACP turn is actively running.
+# [reactions.activity_heartbeat]
+# enabled = true
+# channel = "1530491625351151616"
+# label = "takodex"
+
 # --- Scheduled messages (config-driven cron) ---
 # Everything cron-related lives under [cron].
 
