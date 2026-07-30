@@ -1036,6 +1036,16 @@ fn parse_config(raw: &str, source: &str) -> anyhow::Result<Config> {
     );
     if config.reactions.activity_heartbeat.enabled {
         anyhow::ensure!(
+            config.discord.is_some(),
+            "reactions.activity_heartbeat requires a configured Discord adapter"
+        );
+        let heartbeat_channel_id = config
+            .reactions
+            .activity_heartbeat
+            .channel
+            .parse::<u64>()
+            .unwrap_or_default();
+        anyhow::ensure!(
             config.reactions.activity_heartbeat.channel.len() >= 17
                 && config.reactions.activity_heartbeat.channel.len() <= 20
                 && config
@@ -1043,7 +1053,8 @@ fn parse_config(raw: &str, source: &str) -> anyhow::Result<Config> {
                     .activity_heartbeat
                     .channel
                     .chars()
-                    .all(|ch| ch.is_ascii_digit()),
+                    .all(|ch| ch.is_ascii_digit())
+                && heartbeat_channel_id > 0,
             "reactions.activity_heartbeat.channel must be a Discord channel ID"
         );
         anyhow::ensure!(
@@ -1184,6 +1195,46 @@ enabled = true
         .unwrap_err();
 
         assert!(error.to_string().contains("activity_heartbeat.channel"));
+    }
+
+    #[test]
+    fn enabled_activity_heartbeat_requires_discord_and_valid_channel_id() {
+        let without_discord = parse_config(
+            r#"
+[slack]
+bot_token = "test-token"
+app_token = "test-app-token"
+
+[agent]
+command = "echo"
+
+[reactions.activity_heartbeat]
+enabled = true
+channel = "1530491625351151616"
+label = "takodex"
+"#,
+            "test",
+        )
+        .unwrap_err();
+        assert!(without_discord.to_string().contains("Discord adapter"));
+
+        let invalid_id = parse_config(
+            r#"
+[discord]
+bot_token = "test-token"
+
+[agent]
+command = "echo"
+
+[reactions.activity_heartbeat]
+enabled = true
+channel = "00000000000000000"
+label = "takodex"
+"#,
+            "test",
+        )
+        .unwrap_err();
+        assert!(invalid_id.to_string().contains("Discord channel ID"));
     }
 
     #[test]
