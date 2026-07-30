@@ -308,6 +308,8 @@ pub struct Handler {
     pub filestore: Option<Arc<crate::filestore::Filestore>>,
     pub allow_bot_messages: AllowBots,
     pub trusted_bot_ids: HashSet<u64>,
+    /// Bot authors with any of these guild roles are trusted senders.
+    pub trusted_bot_role_ids: HashSet<u64>,
     pub allow_user_messages: AllowUsers,
     /// Role IDs that trigger the bot (same as direct @mention).
     pub allowed_role_ids: HashSet<u64>,
@@ -611,12 +613,19 @@ impl EventHandler for Handler {
             // action, equivalent to a human pulling the bot into a conversation.
             //
             // Safety: requires both (1) explicit @mention AND (2) sender in
-            // trusted_bot_ids. Messages from trusted bots without @mention still
-            // follow normal gating. Empty trusted_bot_ids (default) disables this
-            // entirely — no behavioral change for existing deployments.
-            let trusted_mention = is_mentioned
-                && !self.trusted_bot_ids.is_empty()
-                && self.trusted_bot_ids.contains(&msg.author.id.get());
+            // trusted_bot_ids or holding a trusted_bot_role_ids role. Messages from
+            // trusted bots without @mention still follow normal gating. Both lists
+            // empty (default) disables this entirely, preserving existing behavior.
+            let trusted_sender = is_trusted_bot_sender(
+                &self.trusted_bot_ids,
+                &self.trusted_bot_role_ids,
+                msg.author.id.get(),
+                msg.member
+                    .as_ref()
+                    .map(|member| member.roles.as_slice())
+                    .unwrap_or_default(),
+            );
+            let trusted_mention = is_mentioned && trusted_sender;
 
             if !trusted_mention {
                 match self.allow_bot_messages {
@@ -676,10 +685,10 @@ impl EventHandler for Handler {
                     }
                 }
 
-                if !self.trusted_bot_ids.is_empty()
-                    && !self.trusted_bot_ids.contains(&msg.author.id.get())
+                if (!self.trusted_bot_ids.is_empty() || !self.trusted_bot_role_ids.is_empty())
+                    && !trusted_sender
                 {
-                    tracing::debug!(bot_id = %msg.author.id, "bot not in trusted_bot_ids, ignoring");
+                    tracing::debug!(bot_id = %msg.author.id, "bot is not a trusted ID or role member, ignoring");
                     return;
                 }
             }
@@ -3206,6 +3215,18 @@ fn is_denied_user(
     !is_bot && !allow_all_users && !allowed_users.contains(&user_id)
 }
 
+fn is_trusted_bot_sender(
+    trusted_bot_ids: &HashSet<u64>,
+    trusted_bot_role_ids: &HashSet<u64>,
+    author_id: u64,
+    author_roles: &[serenity::model::id::RoleId],
+) -> bool {
+    trusted_bot_ids.contains(&author_id)
+        || author_roles
+            .iter()
+            .any(|role| trusted_bot_role_ids.contains(&role.get()))
+}
+
 /// Returns `true` if a bot message should bypass the `allow_bot_messages` mode check.
 /// A trusted bot that @mentions this bot is treated the same as a human @mention —
 /// it can pull the bot into a thread regardless of the `allow_bot_messages` setting.
@@ -4361,6 +4382,35 @@ mod tests {
     fn empty_trusted_ids_no_bypass() {
         let trusted: HashSet<u64> = HashSet::new();
         assert!(!is_trusted_bot_mention(true, &trusted, 42));
+    }
+
+    #[test]
+    fn trusted_bot_sender_accepts_matching_id_or_role() {
+        let trusted_ids = HashSet::from([42]);
+        let trusted_roles = HashSet::from([100]);
+        let role_100 = serenity::model::id::RoleId::new(100);
+
+        assert!(is_trusted_bot_sender(&trusted_ids, &trusted_roles, 42, &[]));
+        assert!(is_trusted_bot_sender(
+            &trusted_ids,
+            &trusted_roles,
+            99,
+            &[role_100]
+        ));
+    }
+
+    #[test]
+    fn trusted_bot_sender_rejects_unlisted_id_and_role() {
+        let trusted_ids = HashSet::from([42]);
+        let trusted_roles = HashSet::from([100]);
+        let role_200 = serenity::model::id::RoleId::new(200);
+
+        assert!(!is_trusted_bot_sender(
+            &trusted_ids,
+            &trusted_roles,
+            99,
+            &[role_200]
+        ));
     }
 
     // --- Trusted bot admission integration tests ---

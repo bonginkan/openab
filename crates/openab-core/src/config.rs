@@ -568,6 +568,11 @@ pub struct DiscordConfig {
     /// This allows trusted bots to pull this bot into threads regardless of mode.
     #[serde(default)]
     pub trusted_bot_ids: Vec<String>,
+    /// Discord role IDs whose bot members are trusted senders.
+    /// This checks the sending bot's member roles; it does not treat a role
+    /// mention as a trigger (use `allowed_role_ids` for that).
+    #[serde(default)]
+    pub trusted_bot_role_ids: Vec<String>,
     #[serde(default)]
     pub allow_user_messages: AllowUsers,
     /// Max consecutive bot turns (without human intervention) before throttling.
@@ -3236,6 +3241,7 @@ command = "echo"
         let discord = cfg.discord.unwrap();
         assert_eq!(discord.bot_token, "test-token");
         assert!(discord.allowed_guilds.is_empty());
+        assert!(discord.trusted_bot_role_ids.is_empty());
         assert!(discord.allow_all_guilds.is_none());
         assert!(resolve_allow_all(
             discord.allow_all_guilds,
@@ -3289,6 +3295,24 @@ command = "echo"
             discord.allow_all_guilds,
             &discord.allowed_guilds
         ));
+    }
+
+    #[test]
+    fn parse_discord_trusted_bot_role_ids() {
+        let toml = r#"
+[discord]
+bot_token = "test-token"
+trusted_bot_role_ids = ["1286849096925188106"]
+
+[agent]
+command = "echo"
+"#;
+        let cfg = parse_config(toml, "test").unwrap();
+        let discord = cfg.discord.unwrap();
+        assert_eq!(
+            discord.trusted_bot_role_ids,
+            vec!["1286849096925188106"]
+        );
     }
 
     #[test]

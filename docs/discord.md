@@ -79,6 +79,7 @@ allowed_users = ["987654321"]         # user ID allowlist (empty = all)
 allow_bot_messages = "off"            # off | mentions | all
 allow_user_messages = "multibot-mentions"      # multibot-mentions | involved | mentions
 trusted_bot_ids = []                  # bot user IDs allowed through (empty = any)
+trusted_bot_role_ids = []             # trust bot authors holding these roles
 ```
 
 ### `allowed_guilds`
