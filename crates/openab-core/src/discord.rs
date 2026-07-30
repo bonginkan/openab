@@ -1205,6 +1205,16 @@ impl EventHandler for Handler {
             .as_ref()
             .map(|m| m.user.bot)
             .unwrap_or(false);
+        let reactor_is_trusted = is_trusted_bot_sender(
+            &self.trusted_bot_ids,
+            &self.trusted_bot_role_ids,
+            user_id.get(),
+            reaction
+                .member
+                .as_ref()
+                .map(|member| member.roles.as_slice())
+                .unwrap_or_default(),
+        );
 
         // Bot gating: apply same allow_bot_messages policy as message().
         if is_reactor_bot {
@@ -1213,9 +1223,9 @@ impl EventHandler for Handler {
                 // For reactions there is no @mention concept — treat as "not mentioned".
                 AllowBots::Mentions => return,
                 AllowBots::All => {
-                    // When trusted_bot_ids is configured, only those bots are allowed.
-                    if !self.trusted_bot_ids.is_empty()
-                        && !self.trusted_bot_ids.contains(&user_id.get())
+                    if (!self.trusted_bot_ids.is_empty()
+                        || !self.trusted_bot_role_ids.is_empty())
+                        && !reactor_is_trusted
                     {
                         return;
                     }
@@ -1265,6 +1275,7 @@ impl EventHandler for Handler {
         let allow_user_messages = self.allow_user_messages;
         let allow_bot_messages = self.allow_bot_messages;
         let trusted_bot_ids = self.trusted_bot_ids.clone();
+        let trusted_bot_role_ids = self.trusted_bot_role_ids.clone();
         let dispatcher = self.dispatcher.clone();
         let http = ctx.http.clone();
 
@@ -1287,7 +1298,13 @@ impl EventHandler for Handler {
                 match allow_bot_messages {
                     AllowBots::Off | AllowBots::Mentions => return,
                     AllowBots::All => {
-                        if !trusted_bot_ids.is_empty() && !trusted_bot_ids.contains(&user_id.get())
+                        if (!trusted_bot_ids.is_empty() || !trusted_bot_role_ids.is_empty())
+                            && !is_trusted_bot_sender(
+                                &trusted_bot_ids,
+                                &trusted_bot_role_ids,
+                                user_id.get(),
+                                &[],
+                            )
                         {
                             return;
                         }
