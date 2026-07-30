@@ -92,6 +92,12 @@ impl ActivityHeartbeatManager {
         }
     }
 
+    pub fn is_heartbeat_message(&self, channel_id: u64, content: &str) -> bool {
+        self.adapter.is_some()
+            && self.channel == channel_id.to_string()
+            && is_activity_heartbeat_content(content)
+    }
+
     fn end_turn(&self) {
         let mut state = self.state.lock().expect("heartbeat state mutex poisoned");
         state.active_turns = state.active_turns.saturating_sub(1);
@@ -101,6 +107,21 @@ impl ActivityHeartbeatManager {
             }
         }
     }
+}
+
+fn is_activity_heartbeat_content(content: &str) -> bool {
+    let Some(label) = content
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix("] 作業中: ACPセッション処理中"))
+    else {
+        return false;
+    };
+
+    !label.is_empty()
+        && label.len() <= 32
+        && label
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
 fn classify_tool<'a>(name: &str, emojis: &'a ReactionEmojis) -> &'a str {
@@ -555,5 +576,22 @@ mod tests {
         drop(second);
         tokio::time::sleep(Duration::from_millis(110)).await;
         assert_eq!(messages.lock().await.len(), 2);
+    }
+
+    #[test]
+    fn activity_heartbeat_content_requires_canonical_public_slug() {
+        assert!(is_activity_heartbeat_content(
+            "[takodex] 作業中: ACPセッション処理中"
+        ));
+        assert!(is_activity_heartbeat_content(
+            "[taklaude_2] 作業中: ACPセッション処理中"
+        ));
+        assert!(!is_activity_heartbeat_content(
+            "takodex 作業中: ACPセッション処理中"
+        ));
+        assert!(!is_activity_heartbeat_content("[takodex] 作業中: 別の処理"));
+        assert!(!is_activity_heartbeat_content(
+            "[表示名] 作業中: ACPセッション処理中"
+        ));
     }
 }

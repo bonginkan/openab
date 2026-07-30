@@ -442,14 +442,23 @@ impl EventHandler for Handler {
             }
         }
 
-        // Bot turn counting: runs before self-check so ALL bot messages
+        // Activity heartbeat messages are control-plane telemetry, not bot
+        // conversation turns. Excluding them prevents a shared presence channel
+        // from permanently exhausting the bot-turn budget.
+        let is_activity_heartbeat = msg.author.bot
+            && self
+                .router
+                .activity_heartbeat()
+                .is_heartbeat_message(msg.channel_id.get(), &msg.content);
+
+        // Bot turn counting: runs before self-check so ALL conversational bot messages
         // (including own) count toward the per-thread limit. This means
         // soft_limit=20 = 20 total bot messages in the thread (~10 per bot
         // in a two-bot ping-pong). (#483)
         {
             let thread_key = msg.channel_id.to_string();
             let mut tracker = self.bot_turns.lock().await;
-            if msg.author.bot {
+            if msg.author.bot && !is_activity_heartbeat {
                 match tracker.classify_bot_message(&thread_key) {
                     TurnAction::Continue => {}
                     TurnAction::SilentStop => {
