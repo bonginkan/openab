@@ -1475,10 +1475,15 @@ impl AdapterRouter {
                     } else {
                         markdown::convert_tables(&final_content, table_mode)
                     };
+                    // 最終送信も同じ上限で抑える。ここを外すと、streaming で
+                    // 打ち切っても最後に全量が流れ直す。
                     let chunks = if final_content.is_empty() {
                         Vec::new()
                     } else {
-                        format::split_message(&final_content, message_limit)
+                        cap_stream_chunks(
+                            format::split_message(&final_content, message_limit),
+                            MAX_STREAM_MESSAGES,
+                        )
                     };
                     if let Some(post) = placeholder_post {
                         if let Some(ref reply_id) = directives.reply_to {
@@ -1703,11 +1708,45 @@ async fn send_outbound_attachments(
     Ok(())
 }
 
+/// How many Discord messages one turn may occupy.
+///
+/// A model that degenerates into a repetition loop produces tens of kilobytes
+/// of identical text. Before this cap, every 2000 characters became one more
+/// Discord message: on 2026-08-01 a single turn posted 31 messages of
+/// `court:\n\n` repeated, 1998 characters each, in 30 seconds. Nothing in the
+/// send path bounded the count, so the channel filled until the model stopped.
+///
+/// The cap is on the *number of messages*, not the content. A long, legitimate
+/// answer still gets through — up to this many parts — and anything past it is
+/// replaced by one notice saying how much was dropped. Losing the tail of a
+/// runaway is the point; losing the tail of a real answer is visible and
+/// recoverable, whereas a flooded channel is neither.
+pub const MAX_STREAM_MESSAGES: usize = 5;
+
+/// Keep the head, replace the rest with a notice. Returns the input unchanged
+/// when it already fits.
+fn cap_stream_chunks(chunks: Vec<String>, max: usize) -> Vec<String> {
+    if max == 0 || chunks.len() <= max {
+        return chunks;
+    }
+    let dropped: usize = chunks.iter().skip(max - 1).map(|c| c.chars().count()).sum();
+    let dropped_messages = chunks.len() - (max - 1);
+    let mut capped: Vec<String> = chunks.into_iter().take(max - 1).collect();
+    capped.push(format!(
+        "⚠️ 出力が長すぎるため打ち切りました（残り {dropped_messages} 件 / 約 {dropped} 文字）。\n\
+         同じ内容の繰り返しが続く場合はモデル側の異常です。"
+    ));
+    capped
+}
+
 fn split_streaming_display(content: &str, message_limit: usize) -> Vec<String> {
     if content.is_empty() {
         return vec!["\u{200b}".to_string()];
     }
-    let chunks = format::split_message(content, message_limit);
+    let chunks = cap_stream_chunks(
+        format::split_message(content, message_limit),
+        MAX_STREAM_MESSAGES,
+    );
     if chunks.is_empty() {
         vec!["\u{200b}".to_string()]
     } else {
@@ -2315,6 +2354,59 @@ mod tests {
         let mut text = "first response".to_string();
         append_text_chunk(&mut text, "\nsecond response", true);
         assert_eq!(text, "first response\nsecond response");
+    }
+
+    #[test]
+    fn a_runaway_turn_is_capped_to_a_few_messages() {
+        // 2026-08-01 の実障害。モデルが `court:` の反復に落ち、1998文字 x 31通を
+        // 30秒で投稿した。上限が無いのが原因で、内容の問題ではない。
+        let runaway = "court:\n\n".repeat(8000);
+        let chunks = split_streaming_display(&runaway, 2000);
+        assert!(
+            chunks.len() <= MAX_STREAM_MESSAGES,
+            "runaway turn produced {} messages",
+            chunks.len()
+        );
+        assert!(
+            chunks.last().unwrap().contains("打ち切りました"),
+            "truncation must be visible to the reader"
+        );
+    }
+
+    #[test]
+    fn a_normal_long_answer_is_not_capped() {
+        // 上限は「長い回答」を殺すためのものではない。上限内なら素通しする。
+        let text = "本文".repeat(1500); // 2 messages at limit 2000
+        let chunks = split_streaming_display(&text, 2000);
+        assert!(chunks.len() > 1, "expected a multi-part answer");
+        assert!(chunks.len() <= MAX_STREAM_MESSAGES);
+        assert!(chunks.iter().all(|c| !c.contains("打ち切りました")));
+    }
+
+    #[test]
+    fn capping_keeps_the_head_of_the_output() {
+        // 先頭を残す。異常な繰り返しの末尾より、最初の方に意味がある。
+        let mut text = String::from("最初の重要な行\n");
+        text.push_str(&"x".repeat(60_000));
+        let chunks = split_streaming_display(&text, 2000);
+        assert!(chunks[0].starts_with("最初の重要な行"));
+        assert!(chunks.len() <= MAX_STREAM_MESSAGES);
+    }
+
+    #[test]
+    fn cap_of_zero_disables_the_limit() {
+        let chunks = vec!["a".to_string(); 40];
+        assert_eq!(cap_stream_chunks(chunks.clone(), 0).len(), 40);
+    }
+
+    #[test]
+    fn the_notice_reports_how_much_was_dropped() {
+        let chunks: Vec<String> = (0..10).map(|_| "y".repeat(2000)).collect();
+        let capped = cap_stream_chunks(chunks, 3);
+        assert_eq!(capped.len(), 3);
+        let notice = capped.last().unwrap();
+        assert!(notice.contains("8 件"), "notice was: {notice}");
+        assert!(notice.contains("16000"), "notice was: {notice}");
     }
 
     #[test]
