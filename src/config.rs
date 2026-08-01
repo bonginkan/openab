@@ -76,6 +76,8 @@ pub struct Config {
     #[serde(default)]
     pub reactions: ReactionsConfig,
     #[serde(default)]
+    pub live_status: LiveStatusConfig,
+    #[serde(default)]
     pub stt: SttConfig,
     #[serde(default)]
     pub markdown: MarkdownConfig,
@@ -670,6 +672,34 @@ pub struct ReactionEmojis {
     pub error: String,
 }
 
+/// The live status line shown while a turn is in flight.
+///
+/// Off by default: it posts a message, and a bot that posts an extra message
+/// per turn is a behaviour change every deployment should opt into.
+#[derive(Debug, Clone, Deserialize)]
+pub struct LiveStatusConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// How often the line is refreshed. Discord rate-limits edits per message,
+    /// so this is not lowered to one second without measuring first.
+    #[serde(default = "default_live_status_tick_ms")]
+    pub tick_ms: u64,
+    /// No event for this long and the line says so, instead of continuing to
+    /// display the last activity as though it were still happening.
+    #[serde(default = "default_live_status_silence_ms")]
+    pub silence_after_ms: u64,
+}
+
+impl Default for LiveStatusConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            tick_ms: default_live_status_tick_ms(),
+            silence_after_ms: default_live_status_silence_ms(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ReactionTiming {
     #[serde(default = "default_debounce_ms")]
@@ -685,6 +715,13 @@ pub struct ReactionTiming {
 }
 
 // --- defaults ---
+
+fn default_live_status_tick_ms() -> u64 {
+    2_000
+}
+fn default_live_status_silence_ms() -> u64 {
+    10_000
+}
 
 fn default_working_dir() -> String {
     "/tmp".into()

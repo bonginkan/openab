@@ -11,6 +11,7 @@ mod format;
 mod gateway;
 mod hooks;
 mod ingress_audit;
+mod live_status;
 mod markdown;
 mod media;
 mod reactions;
@@ -179,6 +180,7 @@ async fn main() -> anyhow::Result<()> {
     let router = Arc::new(AdapterRouter::new(
         pool.clone(),
         cfg.reactions,
+        cfg.live_status,
         cfg.markdown.tables,
         cfg.pool.liveness_check_secs,
         cfg.attachments,

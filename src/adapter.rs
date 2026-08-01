@@ -9,7 +9,8 @@ use tokio::sync::Mutex;
 use tracing::{error, warn};
 
 use crate::acp::{classify_notification, AcpEvent, ContentBlock, SessionPool};
-use crate::config::{AttachmentsConfig, ReactionsConfig, ToolDisplay};
+use crate::config::{AttachmentsConfig, LiveStatusConfig, ReactionsConfig, ToolDisplay};
+use crate::live_status::StatusEvent as LiveStatusEvent;
 use crate::error_display::{format_coded_error, format_user_error};
 use crate::format;
 use crate::markdown::{self, TableMode};
@@ -876,6 +877,7 @@ async fn move_file(source: &Path, destination: &Path) -> Result<()> {
 pub struct AdapterRouter {
     pool: Arc<SessionPool>,
     reactions_config: ReactionsConfig,
+    live_status_config: LiveStatusConfig,
     table_mode: TableMode,
     /// Polling cadence for the recv-loop liveness check (#732).
     liveness_check_interval: std::time::Duration,
@@ -1003,6 +1005,7 @@ impl AdapterRouter {
     pub fn new(
         pool: Arc<SessionPool>,
         reactions_config: ReactionsConfig,
+        live_status_config: LiveStatusConfig,
         table_mode: TableMode,
         liveness_check_secs: u64,
         attachments_config: AttachmentsConfig,
@@ -1011,6 +1014,7 @@ impl AdapterRouter {
         Self {
             pool,
             reactions_config,
+            live_status_config,
             table_mode,
             liveness_check_interval: std::time::Duration::from_secs(liveness_check_secs),
             pending_steer_separators: Arc::new(Mutex::new(HashMap::new())),
@@ -1221,6 +1225,7 @@ impl AdapterRouter {
         let pending_steer_separators = self.pending_steer_separators.clone();
         let thread_key_for_separator = thread_key.to_string();
         let outbound_attachments = self.outbound_attachments.clone();
+        let live_status_cfg = self.live_status_config.clone();
 
         self.pool
             .with_connection(thread_key, |conn| {
@@ -1240,11 +1245,22 @@ impl AdapterRouter {
                     }
 
                     // Streaming edit: send placeholder, spawn edit loop
+                    let mut live_status = crate::live_status::LiveStatusHandle::disabled();
+                    let silence_after =
+                        std::time::Duration::from_millis(live_status_cfg.silence_after_ms);
                     let (buf_tx, placeholder_post) = if streaming {
-                        let initial = if reset {
-                            "⚠️ _Session expired, starting fresh..._\n\n…".to_string()
+                        // A bare "…" for the whole wait is indistinguishable from
+                        // a broken bot -- and local models make that wait tens of
+                        // seconds. Open with what is actually true so far.
+                        let opening = if live_status_cfg.enabled {
+                            crate::live_status::initial_line(silence_after)
                         } else {
                             "…".to_string()
+                        };
+                        let initial = if reset {
+                            format!("⚠️ _Session expired, starting fresh..._\n\n{opening}")
+                        } else {
+                            opening
                         };
                         let msg = adapter.send_message(&thread_channel, &initial).await?;
                         let (tx, rx) = tokio::sync::watch::channel(initial);
@@ -1258,6 +1274,13 @@ impl AdapterRouter {
                         // The recv loop keeps `placeholder_post` (same controller) to
                         // seal+roll the post on a mid-turn steer and to finalize.
                         let placeholder_post = post.clone();
+                        if live_status_cfg.enabled {
+                            live_status = crate::live_status::spawn(
+                                tx.clone(),
+                                std::time::Duration::from_millis(live_status_cfg.tick_ms),
+                                silence_after,
+                            );
+                        }
                         let mut buf_rx = rx;
                         tokio::spawn(async move {
                             let mut last = String::new();
@@ -1324,6 +1347,9 @@ impl AdapterRouter {
                         if let Some(event) = classify_notification(&notification) {
                             match event {
                                 AcpEvent::Text(t) => {
+                                    // Before anything is composed: the answer owns
+                                    // the message from here on.
+                                    live_status.send(LiveStatusEvent::TextStarted);
                                     let steer = {
                                         let mut pending = pending_steer_separators.lock().await;
                                         pending.remove(&thread_key_for_separator)
@@ -1367,9 +1393,14 @@ impl AdapterRouter {
                                 }
                                 AcpEvent::Thinking => {
                                     reactions.set_thinking().await;
+                                    live_status.send(LiveStatusEvent::Thinking);
                                 }
                                 AcpEvent::ToolStart { id, title } if !title.is_empty() => {
                                     reactions.set_tool(&title).await;
+                                    live_status.send(LiveStatusEvent::ToolStart {
+                                        id: id.clone(),
+                                        title: title.clone(),
+                                    });
                                     let title = sanitize_title(&title);
                                     if let Some(slot) = tool_lines.iter_mut().find(|e| e.id == id) {
                                         slot.title = title;
@@ -1391,6 +1422,10 @@ impl AdapterRouter {
                                 }
                                 AcpEvent::ToolDone { id, title, status } => {
                                     reactions.set_thinking().await;
+                                    live_status.send(LiveStatusEvent::ToolDone {
+                                        id: id.clone(),
+                                        succeeded: status == "completed",
+                                    });
                                     let new_state = if status == "completed" {
                                         ToolState::Completed
                                     } else {
@@ -1795,6 +1830,10 @@ fn render_steer_header(steer_text: &str) -> String {
 fn is_placeholder_display(display: &str) -> bool {
     let t = display.trim();
     if t.is_empty() || t == "…" || t == "\u{200b}" {
+        return true;
+    }
+    // The live status line is scaffolding too -- there is no agent output in it.
+    if crate::live_status::is_status_line(t) {
         return true;
     }
     let stripped = t
@@ -2405,6 +2444,11 @@ mod tests {
             "⚠️ _Session expired, starting fresh..._\n\n…"
         ));
         assert!(!is_placeholder_display("real pre-steer output"));
+        // The live status line is scaffolding: a steer must not preserve it as
+        // though it were agent output.
+        assert!(is_placeholder_display(&crate::live_status::initial_line(
+            std::time::Duration::from_secs(10)
+        )));
     }
 
     #[test]
