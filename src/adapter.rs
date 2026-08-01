@@ -1479,6 +1479,8 @@ impl AdapterRouter {
                     // 打ち切っても最後に全量が流れ直す。
                     let chunks = if final_content.is_empty() {
                         Vec::new()
+                    } else if let Some(collapsed) = collapse_degenerate(&final_content) {
+                        format::split_message(&collapsed, message_limit)
                     } else {
                         cap_stream_chunks(
                             format::split_message(&final_content, message_limit),
@@ -1739,9 +1741,60 @@ fn cap_stream_chunks(chunks: Vec<String>, max: usize) -> Vec<String> {
     capped
 }
 
+/// Below this the text is too short to judge; a runaway is never this small.
+const DEGENERATE_MIN_CHARS: usize = 4_000;
+/// A real answer of this many lines is never built from one or two distinct ones.
+const DEGENERATE_MIN_LINES: usize = 20;
+/// How many distinct non-empty lines a degenerate output may have.
+const DEGENERATE_MAX_DISTINCT: usize = 2;
+
+/// Collapse output that is one short line repeated to fill the buffer.
+///
+/// Capping the number of messages stopped the flood, but the surviving messages
+/// were still nothing but `court:` repeated — 2026-08-01 showed four of them
+/// before the truncation notice. The reader gains nothing from seeing the same
+/// line 2000 times; they need to know *what* repeated and *how much*.
+///
+/// The test is deliberately narrow: long output, many lines, and at most a
+/// couple of distinct ones. A genuine answer with twenty lines has more variety
+/// than that, so normal replies pass through untouched.
+fn collapse_degenerate(content: &str) -> Option<String> {
+    if content.chars().count() < DEGENERATE_MIN_CHARS {
+        return None;
+    }
+    let lines: Vec<&str> = content
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    if lines.len() < DEGENERATE_MIN_LINES {
+        return None;
+    }
+    let mut distinct: Vec<&str> = Vec::new();
+    for line in &lines {
+        if !distinct.contains(line) {
+            distinct.push(line);
+            if distinct.len() > DEGENERATE_MAX_DISTINCT {
+                return None;
+            }
+        }
+    }
+    let unit = distinct.first()?;
+    Some(format!(
+        "⚠️ 同じ出力の繰り返しを検出したため畳みました（{} 行 / 約 {} 文字）。\n\
+         モデル側が繰り返しループに入っています。内容は次の1行の反復です。\n\n{}",
+        lines.len(),
+        content.chars().count(),
+        unit
+    ))
+}
+
 fn split_streaming_display(content: &str, message_limit: usize) -> Vec<String> {
     if content.is_empty() {
         return vec!["\u{200b}".to_string()];
+    }
+    if let Some(collapsed) = collapse_degenerate(content) {
+        return format::split_message(&collapsed, message_limit);
     }
     let chunks = cap_stream_chunks(
         format::split_message(content, message_limit),
@@ -2357,10 +2410,65 @@ mod tests {
     }
 
     #[test]
-    fn a_runaway_turn_is_capped_to_a_few_messages() {
-        // 2026-08-01 の実障害。モデルが `court:` の反復に落ち、1998文字 x 31通を
-        // 30秒で投稿した。上限が無いのが原因で、内容の問題ではない。
-        let runaway = "court:\n\n".repeat(8000);
+    fn the_court_runaway_collapses_to_one_notice() {
+        // 2026-08-01 の実物。上限だけでは `court:` が4通残った。読み手が要るのは
+        // 「何が」「どれだけ」繰り返されたかで、繰り返しそのものではない。
+        let runaway = "court:\n\n".repeat(24_000);
+        let chunks = split_streaming_display(&runaway, 2000);
+        assert_eq!(chunks.len(), 1, "collapsed output must fit one message");
+        let only = &chunks[0];
+        assert!(only.contains("繰り返しを検出"));
+        assert!(only.contains("court:"), "what repeated must still be shown");
+        assert_eq!(
+            only.matches("court:").count(),
+            1,
+            "the repeated line must appear exactly once"
+        );
+    }
+
+    #[test]
+    fn a_varied_answer_is_never_collapsed() {
+        // 通常の長い回答を畳まない。ここが緩いと本文が消える。
+        let mut text = String::new();
+        for i in 0..400 {
+            text.push_str(&format!("{i} 行目の説明です。内容はそれぞれ違います。\n"));
+        }
+        assert!(text.chars().count() > DEGENERATE_MIN_CHARS);
+        assert!(collapse_degenerate(&text).is_none());
+    }
+
+    #[test]
+    fn a_short_repetition_is_not_collapsed() {
+        // 短い繰り返しは異常と断定しない。箇条書きの重複などがある。
+        let text = "はい\n".repeat(30);
+        assert!(text.chars().count() < DEGENERATE_MIN_CHARS);
+        assert!(collapse_degenerate(&text).is_none());
+    }
+
+    #[test]
+    fn two_alternating_lines_still_collapse() {
+        // `a\nb\na\nb...` の交互も繰り返しループ。1種類に限定しない。
+        let text = "court:\nsummary:\n".repeat(2_000);
+        let collapsed = collapse_degenerate(&text);
+        assert!(collapsed.is_some());
+    }
+
+    #[test]
+    fn three_distinct_lines_are_left_alone() {
+        // 3種類あれば構造がある。畳まない側へ倒す。
+        let text = "a\nb\nc\n".repeat(2_000);
+        assert!(collapse_degenerate(&text).is_none());
+    }
+
+    #[test]
+    fn a_very_long_varied_turn_is_capped_to_a_few_messages() {
+        // 畳み込みに当たらない「ただ長い」出力は、件数上限で抑える。
+        // 2026-08-01 の実障害は繰り返しだったので畳み込み側が受けるが、
+        // 繰り返しでない暴走も同じだけチャンネルを埋める。
+        let mut runaway = String::new();
+        for i in 0..4000 {
+            runaway.push_str(&format!("{i} 行目はそれぞれ異なる内容の説明です。\n"));
+        }
         let chunks = split_streaming_display(&runaway, 2000);
         assert!(
             chunks.len() <= MAX_STREAM_MESSAGES,
