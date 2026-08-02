@@ -759,6 +759,48 @@ fn ack_pickup(spool: &Option<Arc<QueueSpool>>, msg: &BufferedMessage) {
     }
 }
 
+/// Build the next dispatch batch from `first` plus whatever is already queued,
+/// honoring `max_batch` and `max_tokens`.
+///
+/// Each message is acked off the spool only as it enters the batch, because at
+/// that point it is about to be dispatched. A message that would exceed the
+/// token cap is returned as `pending` WITHOUT acking: it has not entered any
+/// batch, so its spool entry must survive a restart and replay. It is acked
+/// later, when it becomes the `first` of the next batch. Acking it here (before
+/// the cap check) would drop the disk entry for a message that is neither
+/// dispatched nor buffered anywhere durable — a kill before the next batch would
+/// lose it, defeating the durable spool.
+fn drain_batch(
+    first: BufferedMessage,
+    rx: &mut tokio::sync::mpsc::Receiver<BufferedMessage>,
+    spool: &Option<Arc<QueueSpool>>,
+    max_batch: usize,
+    max_tokens: usize,
+) -> (Vec<BufferedMessage>, Option<BufferedMessage>) {
+    ack_pickup(spool, &first);
+    let mut cumulative_tokens = first.estimated_tokens;
+    let mut batch = vec![first];
+    let mut pending = None;
+
+    while batch.len() < max_batch {
+        match rx.try_recv() {
+            Ok(more) => {
+                if cumulative_tokens + more.estimated_tokens > max_tokens {
+                    // Token cap — carry to the next batch (FIFO preserved). Left
+                    // on the spool until it is actually dispatched.
+                    pending = Some(more);
+                    break;
+                }
+                ack_pickup(spool, &more);
+                cumulative_tokens += more.estimated_tokens;
+                batch.push(more);
+            }
+            Err(_) => break,
+        }
+    }
+    (batch, pending)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn consumer_loop(
     thread_key: String,
@@ -786,10 +828,10 @@ async fn consumer_loop(
         let first = match pending.take() {
             Some(msg) => msg,
             None => match tokio::time::timeout(idle_timeout, rx.recv()).await {
-                Ok(Some(msg)) => {
-                    ack_pickup(&spool, &msg);
-                    msg
-                }
+                // Acked inside `drain_batch` as it enters the batch, not here —
+                // otherwise a token-capped follow-up would be acked before we
+                // know it is dispatched.
+                Ok(Some(msg)) => msg,
                 Ok(None) => {
                     // All senders dropped → shutdown() or cancel_buffered_thread().
                     break;
@@ -805,25 +847,11 @@ async fn consumer_loop(
             },
         };
 
-        // Greedy drain up to max_batch messages or max_tokens.
-        let mut batch = vec![first];
-        let mut cumulative_tokens = batch[0].estimated_tokens;
-
-        while batch.len() < max_batch {
-            match rx.try_recv() {
-                Ok(more) => {
-                    ack_pickup(&spool, &more);
-                    if cumulative_tokens + more.estimated_tokens > max_tokens {
-                        // Token cap — save for next turn (FIFO preserved).
-                        pending = Some(more);
-                        break;
-                    }
-                    cumulative_tokens += more.estimated_tokens;
-                    batch.push(more);
-                }
-                Err(_) => break,
-            }
-        }
+        // Greedy drain up to max_batch messages or max_tokens. A token-capped
+        // message comes back as `pending` still on the spool, so a restart before
+        // its batch replays it.
+        let (batch, next_pending) = drain_batch(first, &mut rx, &spool, max_batch, max_tokens);
+        pending = next_pending;
 
         // §2.6: read the freshest snapshot in the batch (batch is non-empty).
         let bot_present = batch.last().unwrap().other_bot_present;
@@ -1672,6 +1700,33 @@ mod tests {
         }
     }
 
+    /// Persist a spool entry mirroring `msg` and return its id, so a
+    /// `BufferedMessage` and its durable entry share a `spool_id`.
+    fn persist_msg(spool: &QueueSpool, msg: &BufferedMessage) -> u64 {
+        spool.append(PersistedMessage {
+            id: 0,
+            thread_key: "mock:T".to_string(),
+            thread_channel: make_channel("T"),
+            adapter_kind: "mock".to_string(),
+            sender_json: msg.sender_json.clone(),
+            sender_name: msg.sender_name.clone(),
+            prompt: msg.prompt.clone(),
+            extra_blocks: msg.extra_blocks.clone(),
+            trigger_msg: msg.trigger_msg.clone(),
+            estimated_tokens: msg.estimated_tokens,
+            other_bot_present: msg.other_bot_present,
+            enqueued_at_ms: now_ms(),
+        })
+    }
+
+    fn spool_temp_path(tag: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!("openab-dispatch-{tag}-{nanos}.json"))
+    }
+
     /// Pre-load `msgs` into a fresh mpsc, drop the sender, and run
     /// `consumer_loop` to completion. Returns the recorded dispatches.
     async fn run_consumer_with_messages(
@@ -1740,6 +1795,96 @@ mod tests {
         // Each batch holds one arrival → delimiter + prompt = 2 blocks.
         assert_eq!(calls[0].block_count, 2);
         assert_eq!(calls[1].block_count, 2);
+    }
+
+    #[tokio::test]
+    async fn token_capped_pending_survives_on_the_spool_until_dispatched() {
+        // A message the token cap carries to the next batch must NOT be acked off
+        // the spool while pending: a restart before it is dispatched has to
+        // replay it (MISAMI blocker on #15).
+        let path = spool_temp_path("pending");
+        let spool = Arc::new(QueueSpool::open_at(path.clone()));
+
+        // Two 80-token messages, cap 100 → the second is token-capped to pending.
+        let mut m1 = make_msg("a", 80);
+        m1.spool_id = Some(persist_msg(&spool, &m1));
+        let mut m2 = make_msg("b", 80);
+        m2.spool_id = Some(persist_msg(&spool, &m2));
+        assert_eq!(spool.len(), 2);
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<BufferedMessage>(4);
+        tx.send(m2).await.unwrap();
+        drop(tx);
+
+        let spool_opt = Some(spool.clone());
+        let (batch, pending) = drain_batch(m1, &mut rx, &spool_opt, 10, 100);
+
+        assert_eq!(batch.len(), 1, "token cap keeps the second message out of the batch");
+        assert!(pending.is_some(), "the second message is carried over as pending");
+
+        // m1 dispatched → acked off the spool; m2 pending → still persisted.
+        let survivors: Vec<String> = spool.entries().iter().map(|p| p.prompt.clone()).collect();
+        assert_eq!(
+            survivors,
+            vec!["b".to_string()],
+            "pending message must survive on the spool"
+        );
+
+        // Restart: reopen the same file; the pending message replays.
+        drop(pending);
+        drop(spool_opt);
+        drop(spool);
+        let reopened = QueueSpool::open_at(path.clone());
+        assert_eq!(reopened.len(), 1);
+        assert_eq!(reopened.entries()[0].prompt, "b");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn token_capped_message_is_acked_after_it_is_finally_dispatched() {
+        // Moving the ack out of the cap path must not leak: once the pending
+        // message becomes the first of the next batch it is acked, so a clean run
+        // leaves nothing to replay.
+        let path = spool_temp_path("acked");
+        let spool = Arc::new(QueueSpool::open_at(path.clone()));
+        let mut m1 = make_msg("a", 80);
+        m1.spool_id = Some(persist_msg(&spool, &m1));
+        let mut m2 = make_msg("b", 80);
+        m2.spool_id = Some(persist_msg(&spool, &m2));
+        assert_eq!(spool.len(), 2);
+
+        let mock = Arc::new(MockDispatchTarget::new());
+        let target: Arc<dyn DispatchTarget> = mock.clone();
+        let adapter: Arc<dyn ChatAdapter> = Arc::new(MockChatAdapter);
+        let (tx, rx) = tokio::sync::mpsc::channel::<BufferedMessage>(4);
+        tx.send(m1).await.unwrap();
+        tx.send(m2).await.unwrap();
+        drop(tx);
+
+        consumer_loop(
+            "mock:T".into(),
+            make_channel("T"),
+            rx,
+            target,
+            adapter,
+            10,
+            100,
+            Duration::from_secs(60),
+            Arc::new(Mutex::new(InFlightSet::new())),
+            Arc::new(Mutex::new(ActiveReactions::new())),
+            Some(spool.clone()),
+        )
+        .await;
+
+        assert_eq!(mock.calls().len(), 2, "token cap split into two batches");
+        assert_eq!(
+            spool.len(),
+            0,
+            "nothing should remain to replay after a clean run"
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[tokio::test]
