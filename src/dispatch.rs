@@ -1273,6 +1273,7 @@ mod tests {
         let router = Arc::new(AdapterRouter::new(
             pool,
             crate::config::ReactionsConfig::default(),
+            crate::config::LiveStatusConfig::default(),
             crate::markdown::TableMode::Off,
             crate::config::default_liveness_check_secs(),
             crate::config::AttachmentsConfig::default(),
