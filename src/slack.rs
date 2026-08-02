@@ -631,6 +631,7 @@ pub async fn run_slack_adapter(
     trusted_bot_ids: HashSet<String>,
     allow_user_messages: AllowUsers,
     max_bot_turns: u32,
+    bot_turn_window_secs: u64,
     stt_config: SttConfig,
     context_recovery: ContextRecoveryConfig,
     inbound_attachment_content_blocks: bool,
@@ -638,7 +639,10 @@ pub async fn run_slack_adapter(
     dispatcher: Arc<crate::dispatch::Dispatcher>,
 ) -> Result<()> {
     let bot_token = adapter.bot_token().to_string();
-    let bot_turns = Arc::new(tokio::sync::Mutex::new(BotTurnTracker::new(max_bot_turns)));
+    let bot_turns = Arc::new(tokio::sync::Mutex::new(BotTurnTracker::with_window(
+        max_bot_turns,
+        std::time::Duration::from_secs(bot_turn_window_secs),
+    )));
     let mut seen_events: HashMap<String, std::time::Instant> = HashMap::new();
 
     loop {

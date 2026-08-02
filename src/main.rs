@@ -258,6 +258,7 @@ async fn main() -> anyhow::Result<()> {
         let router = router.clone();
         let stt = cfg.stt.clone();
         let max_bot_turns = slack_cfg.max_bot_turns;
+        let bot_turn_window_secs = slack_cfg.bot_turn_window_secs;
         let slack_shutdown_rx = shutdown_rx.clone();
         let adapter = shared_slack_adapter
             .clone()
@@ -292,6 +293,7 @@ async fn main() -> anyhow::Result<()> {
                 slack_cfg.trusted_bot_ids.into_iter().collect(),
                 slack_cfg.allow_user_messages,
                 max_bot_turns,
+                bot_turn_window_secs,
                 stt,
                 slack_cfg.context_recovery,
                 inbound_attachment_content_blocks,
@@ -520,8 +522,9 @@ async fn main() -> anyhow::Result<()> {
             multibot_threads: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             session_ttl: std::time::Duration::from_secs(ttl_secs),
             max_bot_turns: discord_cfg.max_bot_turns,
-            bot_turns: tokio::sync::Mutex::new(bot_turns::BotTurnTracker::new(
+            bot_turns: tokio::sync::Mutex::new(bot_turns::BotTurnTracker::with_window(
                 discord_cfg.max_bot_turns,
+                std::time::Duration::from_secs(discord_cfg.bot_turn_window_secs),
             )),
             allow_dm: discord_cfg.allow_dm,
             dispatcher: discord_dispatcher,
