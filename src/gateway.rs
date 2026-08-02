@@ -893,6 +893,7 @@ pub async fn run_gateway_adapter(
                                             estimated_tokens,
                                             // TODO: implement gateway multibot detection
                                             other_bot_present: false,
+                                            spool_id: None,
                                         };
                                         if let Err(e) = dispatcher
                                             .submit(thread_key, thread_channel, adapter, buf_msg)
