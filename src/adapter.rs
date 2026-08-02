@@ -1510,10 +1510,17 @@ impl AdapterRouter {
                     } else {
                         markdown::convert_tables(&final_content, table_mode)
                     };
+                    // 最終送信も同じ上限で抑える。ここを外すと、streaming で
+                    // 打ち切っても最後に全量が流れ直す。
                     let chunks = if final_content.is_empty() {
                         Vec::new()
+                    } else if let Some(collapsed) = collapse_degenerate(&final_content) {
+                        format::split_message(&collapsed, message_limit)
                     } else {
-                        format::split_message(&final_content, message_limit)
+                        cap_stream_chunks(
+                            format::split_message(&final_content, message_limit),
+                            MAX_STREAM_MESSAGES,
+                        )
                     };
                     if let Some(post) = placeholder_post {
                         if let Some(ref reply_id) = directives.reply_to {
@@ -1578,23 +1585,18 @@ impl AdapterRouter {
                             // Discord does not notify on edits, so a mention folded
                             // into the edited post would never notify the target.
                             if !final_content.is_empty() {
-                                let (body, mentions) =
-                                    split_off_mention_paragraphs(&final_content);
-                                if mentions.is_empty() {
-                                    post.edit(&final_content).await;
-                                } else {
-                                    if body.is_empty() {
-                                        post.delete_current_messages().await;
-                                    } else {
-                                        post.edit(&body).await;
-                                    }
-                                    for chunk in
-                                        format::split_message(&mentions, message_limit)
-                                    {
-                                        let _ = adapter
-                                            .send_message(&thread_channel, &chunk)
-                                            .await;
-                                    }
+                                let delivery = plan_streaming_delivery(
+                                    &final_content,
+                                    message_limit,
+                                );
+                                match delivery.body {
+                                    Some(body) => post.edit(&body).await,
+                                    None => post.delete_current_messages().await,
+                                }
+                                for chunk in delivery.mentions {
+                                    let _ = adapter
+                                        .send_message(&thread_channel, &chunk)
+                                        .await;
                                 }
                             }
                             if !attachments.is_empty() {
@@ -1738,11 +1740,101 @@ async fn send_outbound_attachments(
     Ok(())
 }
 
+/// How many Discord messages one turn may occupy.
+///
+/// A model that degenerates into a repetition loop produces tens of kilobytes
+/// of identical text. Before this cap, every 2000 characters became one more
+/// Discord message: on 2026-08-01 a single turn posted 31 messages of
+/// `court:\n\n` repeated, 1998 characters each, in 30 seconds. Nothing in the
+/// send path bounded the count, so the channel filled until the model stopped.
+///
+/// The cap is on the *number of messages*, not the content. A long, legitimate
+/// answer still gets through — up to this many parts — and anything past it is
+/// replaced by one notice saying how much was dropped. Losing the tail of a
+/// runaway is the point; losing the tail of a real answer is visible and
+/// recoverable, whereas a flooded channel is neither.
+pub const MAX_STREAM_MESSAGES: usize = 5;
+
+/// Keep the head, replace the rest with a notice. Returns the input unchanged
+/// when it already fits.
+fn cap_stream_chunks(chunks: Vec<String>, max: usize) -> Vec<String> {
+    if max == 0 || chunks.len() <= max {
+        return chunks;
+    }
+    let dropped: usize = chunks.iter().skip(max - 1).map(|c| c.chars().count()).sum();
+    let dropped_messages = chunks.len() - (max - 1);
+    let mut capped: Vec<String> = chunks.into_iter().take(max - 1).collect();
+    capped.push(format!(
+        "⚠️ 出力が長すぎるため打ち切りました（残り {dropped_messages} 件 / 約 {dropped} 文字）。\n\
+         同じ内容の繰り返しが続く場合はモデル側の異常です。"
+    ));
+    capped
+}
+
+/// Below this the text is too short to judge; a runaway is never this small.
+const DEGENERATE_MIN_CHARS: usize = 4_000;
+/// A real answer of this many lines is never built from one or two distinct ones.
+const DEGENERATE_MIN_LINES: usize = 20;
+/// How many distinct non-empty lines a degenerate output may have.
+const DEGENERATE_MAX_DISTINCT: usize = 2;
+
+/// Collapse output that is one short line repeated to fill the buffer.
+///
+/// Capping the number of messages stopped the flood, but the surviving messages
+/// were still nothing but `court:` repeated — 2026-08-01 showed four of them
+/// before the truncation notice. The reader gains nothing from seeing the same
+/// line 2000 times; they need to know *what* repeated and *how much*.
+///
+/// The test is deliberately narrow: long output, many lines, and at most a
+/// couple of distinct ones. A genuine answer with twenty lines has more variety
+/// than that, so normal replies pass through untouched.
+fn collapse_degenerate(content: &str) -> Option<String> {
+    if content.chars().count() < DEGENERATE_MIN_CHARS {
+        return None;
+    }
+    let lines: Vec<&str> = content
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    if lines.len() < DEGENERATE_MIN_LINES {
+        return None;
+    }
+    let mut distinct: Vec<&str> = Vec::new();
+    for line in &lines {
+        if !distinct.contains(line) {
+            distinct.push(line);
+            if distinct.len() > DEGENERATE_MAX_DISTINCT {
+                return None;
+            }
+        }
+    }
+    if distinct.is_empty() {
+        return None;
+    }
+    // Preserve every distinct line of the repeating unit. With two alternating
+    // lines (`a\nb\na\nb…`) showing only the first silently drops the other.
+    let unit = distinct.join("\n");
+    Some(format!(
+        "⚠️ 同じ出力の繰り返しを検出したため畳みました（{} 行 / 約 {} 文字）。\n\
+         モデル側が繰り返しループに入っています。繰り返している内容は次のとおりです。\n\n{}",
+        lines.len(),
+        content.chars().count(),
+        unit
+    ))
+}
+
 fn split_streaming_display(content: &str, message_limit: usize) -> Vec<String> {
     if content.is_empty() {
         return vec!["\u{200b}".to_string()];
     }
-    let chunks = format::split_message(content, message_limit);
+    if let Some(collapsed) = collapse_degenerate(content) {
+        return format::split_message(&collapsed, message_limit);
+    }
+    let chunks = cap_stream_chunks(
+        format::split_message(content, message_limit),
+        MAX_STREAM_MESSAGES,
+    );
     if chunks.is_empty() {
         vec!["\u{200b}".to_string()]
     } else {
@@ -1883,6 +1975,56 @@ fn split_off_mention_paragraphs(content: &str) -> (String, String) {
         body.join("\n\n").trim().to_string(),
         mentions.join("\n\n").trim().to_string(),
     )
+}
+
+/// How a streaming final is delivered to the placeholder. The body is edited
+/// into the placeholder; mention paragraphs are re-posted as fresh messages so
+/// the ping fires (Discord does not notify on edits).
+struct StreamingDelivery {
+    /// Content to edit into the placeholder, or `None` to delete it.
+    body: Option<String>,
+    /// Fresh messages to send after the edit; each one notifies.
+    mentions: Vec<String>,
+}
+
+/// Plan the final delivery so body edit + mention posts share the
+/// `MAX_STREAM_MESSAGES` budget. Without this, a long mention-bearing output
+/// splits the mentions unbounded and re-posts 6+ messages in one turn, bypassing
+/// the runaway cap the edited path already enforces.
+fn plan_streaming_delivery(final_content: &str, message_limit: usize) -> StreamingDelivery {
+    // Degenerate runaway collapses in place; its repetitions must not fan out as
+    // mention pings.
+    if let Some(collapsed) = collapse_degenerate(final_content) {
+        return StreamingDelivery {
+            body: Some(collapsed),
+            mentions: Vec::new(),
+        };
+    }
+    let (body, mentions) = split_off_mention_paragraphs(final_content);
+    if mentions.is_empty() {
+        return StreamingDelivery {
+            body: Some(final_content.to_string()),
+            mentions: Vec::new(),
+        };
+    }
+    // Reserve one slot for the body when present so it is never fully crowded
+    // out, then bound the mention posts to what remains of the cap.
+    let mention_budget = MAX_STREAM_MESSAGES.saturating_sub(if body.is_empty() { 0 } else { 1 });
+    let mentions = cap_stream_chunks(
+        format::split_message(&mentions, message_limit),
+        mention_budget,
+    );
+    let body = if body.is_empty() {
+        None
+    } else {
+        let body_budget = MAX_STREAM_MESSAGES.saturating_sub(mentions.len());
+        // Whole `split_message` chunks are kept verbatim, so re-joining and
+        // re-editing yields the same capped count.
+        Some(
+            cap_stream_chunks(format::split_message(&body, message_limit), body_budget).join(""),
+        )
+    };
+    StreamingDelivery { body, mentions }
 }
 
 fn should_separate_stream_chunk(text_buf: &str, chunk: &str) -> bool {
@@ -2354,6 +2496,178 @@ mod tests {
         let mut text = "first response".to_string();
         append_text_chunk(&mut text, "\nsecond response", true);
         assert_eq!(text, "first response\nsecond response");
+    }
+
+    #[test]
+    fn the_court_runaway_collapses_to_one_notice() {
+        // 2026-08-01 の実物。上限だけでは `court:` が4通残った。読み手が要るのは
+        // 「何が」「どれだけ」繰り返されたかで、繰り返しそのものではない。
+        let runaway = "court:\n\n".repeat(24_000);
+        let chunks = split_streaming_display(&runaway, 2000);
+        assert_eq!(chunks.len(), 1, "collapsed output must fit one message");
+        let only = &chunks[0];
+        assert!(only.contains("繰り返しを検出"));
+        assert!(only.contains("court:"), "what repeated must still be shown");
+        assert_eq!(
+            only.matches("court:").count(),
+            1,
+            "the repeated line must appear exactly once"
+        );
+    }
+
+    #[test]
+    fn a_varied_answer_is_never_collapsed() {
+        // 通常の長い回答を畳まない。ここが緩いと本文が消える。
+        let mut text = String::new();
+        for i in 0..400 {
+            text.push_str(&format!("{i} 行目の説明です。内容はそれぞれ違います。\n"));
+        }
+        assert!(text.chars().count() > DEGENERATE_MIN_CHARS);
+        assert!(collapse_degenerate(&text).is_none());
+    }
+
+    #[test]
+    fn a_short_repetition_is_not_collapsed() {
+        // 短い繰り返しは異常と断定しない。箇条書きの重複などがある。
+        let text = "はい\n".repeat(30);
+        assert!(text.chars().count() < DEGENERATE_MIN_CHARS);
+        assert!(collapse_degenerate(&text).is_none());
+    }
+
+    #[test]
+    fn two_alternating_lines_still_collapse() {
+        // `a\nb\na\nb...` の交互も繰り返しループ。1種類に限定しない。
+        let text = "court:\nsummary:\n".repeat(2_000);
+        let collapsed = collapse_degenerate(&text).expect("alternating repetition collapses");
+        // 反復単位の両方を残す。片方を黙って捨てない。
+        assert!(collapsed.contains("court:"), "first repeated line must survive");
+        assert!(collapsed.contains("summary:"), "second repeated line must survive");
+    }
+
+    #[test]
+    fn a_mention_flood_stays_within_the_cap() {
+        // 長大な mention 出力が別経路の全件送信で件数上限を迂回しない。
+        let mut content = String::new();
+        for i in 0..4000 {
+            content.push_str(&format!(
+                "<@123456789> 依頼 {i}: それぞれ異なる内容の指示です。\n\n"
+            ));
+        }
+        let plan = plan_streaming_delivery(&content, 2000);
+        let body_msgs = plan
+            .body
+            .as_deref()
+            .map_or(0, |b| split_streaming_display(b, 2000).len());
+        let total = body_msgs + plan.mentions.len();
+        assert!(
+            total <= MAX_STREAM_MESSAGES,
+            "mention turn produced {total} messages"
+        );
+        // ping は生かす。少なくとも1通の mention が新規postとして残る。
+        assert!(
+            plan.mentions.iter().any(|m| m.contains("<@123456789>")),
+            "the mention must survive so the ping fires"
+        );
+    }
+
+    #[test]
+    fn a_body_plus_mention_turn_is_capped_together() {
+        // 長大な body + 末尾の mention 段落。body の edit と mention の送信が
+        // 同じ上限を共有する。
+        let mut content = String::new();
+        for i in 0..4000 {
+            content.push_str(&format!("{i} 行目はそれぞれ異なる説明です。\n"));
+        }
+        content.push_str("\n\n<@123456789> レビューお願いします。");
+        let plan = plan_streaming_delivery(&content, 2000);
+        let body_msgs = plan
+            .body
+            .as_deref()
+            .map_or(0, |b| split_streaming_display(b, 2000).len());
+        let total = body_msgs + plan.mentions.len();
+        assert!(total <= MAX_STREAM_MESSAGES, "produced {total} messages");
+        assert!(
+            plan.mentions.iter().any(|m| m.contains("<@123456789>")),
+            "the mention must survive so the ping fires"
+        );
+    }
+
+    #[test]
+    fn a_degenerate_mention_flood_collapses_without_pinging() {
+        // mention 行の暴走反復は、数百の ping を撃たず in-place で畳む。
+        let content = "<@123456789> court:\n\n".repeat(24_000);
+        let plan = plan_streaming_delivery(&content, 2000);
+        assert!(
+            plan.mentions.is_empty(),
+            "degenerate flood must not fan out pings"
+        );
+        let body = plan.body.expect("collapsed notice");
+        assert!(body.contains("繰り返しを検出"));
+        assert_eq!(split_streaming_display(&body, 2000).len(), 1);
+    }
+
+    #[test]
+    fn three_distinct_lines_are_left_alone() {
+        // 3種類あれば構造がある。畳まない側へ倒す。
+        let text = "a\nb\nc\n".repeat(2_000);
+        assert!(collapse_degenerate(&text).is_none());
+    }
+
+    #[test]
+    fn a_very_long_varied_turn_is_capped_to_a_few_messages() {
+        // 畳み込みに当たらない「ただ長い」出力は、件数上限で抑える。
+        // 2026-08-01 の実障害は繰り返しだったので畳み込み側が受けるが、
+        // 繰り返しでない暴走も同じだけチャンネルを埋める。
+        let mut runaway = String::new();
+        for i in 0..4000 {
+            runaway.push_str(&format!("{i} 行目はそれぞれ異なる内容の説明です。\n"));
+        }
+        let chunks = split_streaming_display(&runaway, 2000);
+        assert!(
+            chunks.len() <= MAX_STREAM_MESSAGES,
+            "runaway turn produced {} messages",
+            chunks.len()
+        );
+        assert!(
+            chunks.last().unwrap().contains("打ち切りました"),
+            "truncation must be visible to the reader"
+        );
+    }
+
+    #[test]
+    fn a_normal_long_answer_is_not_capped() {
+        // 上限は「長い回答」を殺すためのものではない。上限内なら素通しする。
+        let text = "本文".repeat(1500); // 2 messages at limit 2000
+        let chunks = split_streaming_display(&text, 2000);
+        assert!(chunks.len() > 1, "expected a multi-part answer");
+        assert!(chunks.len() <= MAX_STREAM_MESSAGES);
+        assert!(chunks.iter().all(|c| !c.contains("打ち切りました")));
+    }
+
+    #[test]
+    fn capping_keeps_the_head_of_the_output() {
+        // 先頭を残す。異常な繰り返しの末尾より、最初の方に意味がある。
+        let mut text = String::from("最初の重要な行\n");
+        text.push_str(&"x".repeat(60_000));
+        let chunks = split_streaming_display(&text, 2000);
+        assert!(chunks[0].starts_with("最初の重要な行"));
+        assert!(chunks.len() <= MAX_STREAM_MESSAGES);
+    }
+
+    #[test]
+    fn cap_of_zero_disables_the_limit() {
+        let chunks = vec!["a".to_string(); 40];
+        assert_eq!(cap_stream_chunks(chunks.clone(), 0).len(), 40);
+    }
+
+    #[test]
+    fn the_notice_reports_how_much_was_dropped() {
+        let chunks: Vec<String> = (0..10).map(|_| "y".repeat(2000)).collect();
+        let capped = cap_stream_chunks(chunks, 3);
+        assert_eq!(capped.len(), 3);
+        let notice = capped.last().unwrap();
+        assert!(notice.contains("8 件"), "notice was: {notice}");
+        assert!(notice.contains("16000"), "notice was: {notice}");
     }
 
     #[test]
