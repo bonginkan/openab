@@ -390,10 +390,16 @@ pub struct DiscordConfig {
     pub trusted_bot_ids_url_bearer_token: Option<String>,
     #[serde(default)]
     pub allow_user_messages: AllowUsers,
-    /// Max consecutive bot turns (without human intervention) before throttling.
-    /// Human message resets the counter. Default: 100.
+    /// Max bot turns **within `bot_turn_window_secs`** before throttling.
+    ///
+    /// A rate, not a total: a deliberate multi-hour loop reaches any fixed
+    /// total eventually and would then stop dead. A human message clears it
+    /// immediately either way. Default: 100.
     #[serde(default = "default_max_bot_turns")]
     pub max_bot_turns: u32,
+    /// How far back `max_bot_turns` counts. Default: 600 (10 minutes).
+    #[serde(default = "default_bot_turn_window_secs")]
+    pub bot_turn_window_secs: u64,
     /// Role IDs that trigger the bot (same as direct @mention).
     /// When a message mentions a role in this list, it is treated as a bot trigger.
     /// Empty (default) = role mentions do not trigger the bot.
@@ -418,6 +424,10 @@ pub struct DiscordConfig {
 
 fn default_max_bot_turns() -> u32 {
     100
+}
+fn default_bot_turn_window_secs() -> u64 {
+    // 既定は1箇所で決める。ここに数値を書くと、実装側の窓と静かにずれる。
+    crate::bot_turns::DEFAULT_WINDOW.as_secs()
 }
 fn default_max_buffered_messages() -> usize {
     10
@@ -484,6 +494,9 @@ pub struct SlackConfig {
     /// Human message resets the counter. Default: 100.
     #[serde(default = "default_max_bot_turns")]
     pub max_bot_turns: u32,
+    /// How far back `max_bot_turns` counts. Default: 600 (10 minutes).
+    #[serde(default = "default_bot_turn_window_secs")]
+    pub bot_turn_window_secs: u64,
     /// Message dispatch mode. Default: per-message.
     #[serde(default)]
     pub message_processing_mode: MessageProcessingMode,
