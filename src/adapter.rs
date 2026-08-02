@@ -1550,23 +1550,18 @@ impl AdapterRouter {
                             // Discord does not notify on edits, so a mention folded
                             // into the edited post would never notify the target.
                             if !final_content.is_empty() {
-                                let (body, mentions) =
-                                    split_off_mention_paragraphs(&final_content);
-                                if mentions.is_empty() {
-                                    post.edit(&final_content).await;
-                                } else {
-                                    if body.is_empty() {
-                                        post.delete_current_messages().await;
-                                    } else {
-                                        post.edit(&body).await;
-                                    }
-                                    for chunk in
-                                        format::split_message(&mentions, message_limit)
-                                    {
-                                        let _ = adapter
-                                            .send_message(&thread_channel, &chunk)
-                                            .await;
-                                    }
+                                let delivery = plan_streaming_delivery(
+                                    &final_content,
+                                    message_limit,
+                                );
+                                match delivery.body {
+                                    Some(body) => post.edit(&body).await,
+                                    None => post.delete_current_messages().await,
+                                }
+                                for chunk in delivery.mentions {
+                                    let _ = adapter
+                                        .send_message(&thread_channel, &chunk)
+                                        .await;
                                 }
                             }
                             if !attachments.is_empty() {
@@ -1779,10 +1774,15 @@ fn collapse_degenerate(content: &str) -> Option<String> {
             }
         }
     }
-    let unit = distinct.first()?;
+    if distinct.is_empty() {
+        return None;
+    }
+    // Preserve every distinct line of the repeating unit. With two alternating
+    // lines (`a\nb\na\nb…`) showing only the first silently drops the other.
+    let unit = distinct.join("\n");
     Some(format!(
         "⚠️ 同じ出力の繰り返しを検出したため畳みました（{} 行 / 約 {} 文字）。\n\
-         モデル側が繰り返しループに入っています。内容は次の1行の反復です。\n\n{}",
+         モデル側が繰り返しループに入っています。繰り返している内容は次のとおりです。\n\n{}",
         lines.len(),
         content.chars().count(),
         unit
@@ -1936,6 +1936,56 @@ fn split_off_mention_paragraphs(content: &str) -> (String, String) {
         body.join("\n\n").trim().to_string(),
         mentions.join("\n\n").trim().to_string(),
     )
+}
+
+/// How a streaming final is delivered to the placeholder. The body is edited
+/// into the placeholder; mention paragraphs are re-posted as fresh messages so
+/// the ping fires (Discord does not notify on edits).
+struct StreamingDelivery {
+    /// Content to edit into the placeholder, or `None` to delete it.
+    body: Option<String>,
+    /// Fresh messages to send after the edit; each one notifies.
+    mentions: Vec<String>,
+}
+
+/// Plan the final delivery so body edit + mention posts share the
+/// `MAX_STREAM_MESSAGES` budget. Without this, a long mention-bearing output
+/// splits the mentions unbounded and re-posts 6+ messages in one turn, bypassing
+/// the runaway cap the edited path already enforces.
+fn plan_streaming_delivery(final_content: &str, message_limit: usize) -> StreamingDelivery {
+    // Degenerate runaway collapses in place; its repetitions must not fan out as
+    // mention pings.
+    if let Some(collapsed) = collapse_degenerate(final_content) {
+        return StreamingDelivery {
+            body: Some(collapsed),
+            mentions: Vec::new(),
+        };
+    }
+    let (body, mentions) = split_off_mention_paragraphs(final_content);
+    if mentions.is_empty() {
+        return StreamingDelivery {
+            body: Some(final_content.to_string()),
+            mentions: Vec::new(),
+        };
+    }
+    // Reserve one slot for the body when present so it is never fully crowded
+    // out, then bound the mention posts to what remains of the cap.
+    let mention_budget = MAX_STREAM_MESSAGES.saturating_sub(if body.is_empty() { 0 } else { 1 });
+    let mentions = cap_stream_chunks(
+        format::split_message(&mentions, message_limit),
+        mention_budget,
+    );
+    let body = if body.is_empty() {
+        None
+    } else {
+        let body_budget = MAX_STREAM_MESSAGES.saturating_sub(mentions.len());
+        // Whole `split_message` chunks are kept verbatim, so re-joining and
+        // re-editing yields the same capped count.
+        Some(
+            cap_stream_chunks(format::split_message(&body, message_limit), body_budget).join(""),
+        )
+    };
+    StreamingDelivery { body, mentions }
 }
 
 fn should_separate_stream_chunk(text_buf: &str, chunk: &str) -> bool {
@@ -2449,8 +2499,72 @@ mod tests {
     fn two_alternating_lines_still_collapse() {
         // `a\nb\na\nb...` の交互も繰り返しループ。1種類に限定しない。
         let text = "court:\nsummary:\n".repeat(2_000);
-        let collapsed = collapse_degenerate(&text);
-        assert!(collapsed.is_some());
+        let collapsed = collapse_degenerate(&text).expect("alternating repetition collapses");
+        // 反復単位の両方を残す。片方を黙って捨てない。
+        assert!(collapsed.contains("court:"), "first repeated line must survive");
+        assert!(collapsed.contains("summary:"), "second repeated line must survive");
+    }
+
+    #[test]
+    fn a_mention_flood_stays_within_the_cap() {
+        // 長大な mention 出力が別経路の全件送信で件数上限を迂回しない。
+        let mut content = String::new();
+        for i in 0..4000 {
+            content.push_str(&format!(
+                "<@123456789> 依頼 {i}: それぞれ異なる内容の指示です。\n\n"
+            ));
+        }
+        let plan = plan_streaming_delivery(&content, 2000);
+        let body_msgs = plan
+            .body
+            .as_deref()
+            .map_or(0, |b| split_streaming_display(b, 2000).len());
+        let total = body_msgs + plan.mentions.len();
+        assert!(
+            total <= MAX_STREAM_MESSAGES,
+            "mention turn produced {total} messages"
+        );
+        // ping は生かす。少なくとも1通の mention が新規postとして残る。
+        assert!(
+            plan.mentions.iter().any(|m| m.contains("<@123456789>")),
+            "the mention must survive so the ping fires"
+        );
+    }
+
+    #[test]
+    fn a_body_plus_mention_turn_is_capped_together() {
+        // 長大な body + 末尾の mention 段落。body の edit と mention の送信が
+        // 同じ上限を共有する。
+        let mut content = String::new();
+        for i in 0..4000 {
+            content.push_str(&format!("{i} 行目はそれぞれ異なる説明です。\n"));
+        }
+        content.push_str("\n\n<@123456789> レビューお願いします。");
+        let plan = plan_streaming_delivery(&content, 2000);
+        let body_msgs = plan
+            .body
+            .as_deref()
+            .map_or(0, |b| split_streaming_display(b, 2000).len());
+        let total = body_msgs + plan.mentions.len();
+        assert!(total <= MAX_STREAM_MESSAGES, "produced {total} messages");
+        assert!(
+            plan.mentions.iter().any(|m| m.contains("<@123456789>")),
+            "the mention must survive so the ping fires"
+        );
+    }
+
+    #[test]
+    fn a_degenerate_mention_flood_collapses_without_pinging() {
+        // mention 行の暴走反復は、数百の ping を撃たず in-place で畳む。
+        let content = "<@123456789> court:\n\n".repeat(24_000);
+        let plan = plan_streaming_delivery(&content, 2000);
+        assert!(
+            plan.mentions.is_empty(),
+            "degenerate flood must not fan out pings"
+        );
+        let body = plan.body.expect("collapsed notice");
+        assert!(body.contains("繰り返しを検出"));
+        assert_eq!(split_streaming_display(&body, 2000).len(), 1);
     }
 
     #[test]
