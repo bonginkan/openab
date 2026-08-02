@@ -426,7 +426,8 @@ fn default_max_bot_turns() -> u32 {
     100
 }
 fn default_bot_turn_window_secs() -> u64 {
-    600
+    // 既定は1箇所で決める。ここに数値を書くと、実装側の窓と静かにずれる。
+    crate::bot_turns::DEFAULT_WINDOW.as_secs()
 }
 fn default_max_buffered_messages() -> usize {
     10

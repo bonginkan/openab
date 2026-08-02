@@ -2899,7 +2899,9 @@ fn turn_limit_warning_present(messages: &[(bool, &str)]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bot_turns::{TurnResult, BOT_TURN_LIMIT_WARNING_PREFIX, HARD_BOT_TURN_LIMIT};
+    use crate::bot_turns::{
+        TurnResult, BOT_TURN_LIMIT_WARNING_PREFIX, DEFAULT_WINDOW, HARD_BOT_TURN_LIMIT,
+    };
 
     // --- resolve_mentions tests ---
 
@@ -3311,7 +3313,7 @@ mod tests {
     /// preventing warning messages from ping-ponging between bots.
     #[test]
     fn soft_limit_warn_once_semantics() {
-        let mut t = BotTurnTracker::new(20);
+        let mut t = BotTurnTracker::with_window(20, DEFAULT_WINDOW);
         for _ in 0..19 {
             assert_eq!(t.on_bot_message("t1"), TurnResult::Ok);
         }
@@ -3326,7 +3328,7 @@ mod tests {
     /// Hard limit also carries count for warn-once semantics.
     #[test]
     fn hard_limit_warn_once_semantics() {
-        let mut t = BotTurnTracker::new(HARD_BOT_TURN_LIMIT);
+        let mut t = BotTurnTracker::with_window(HARD_BOT_TURN_LIMIT, DEFAULT_WINDOW);
         for _ in 0..HARD_BOT_TURN_LIMIT - 1 {
             assert_eq!(t.on_bot_message("t1"), TurnResult::Ok);
         }
@@ -3342,7 +3344,7 @@ mod tests {
     /// when on_human_message is never called.
     #[test]
     fn system_message_does_not_reset_counter() {
-        let mut t = BotTurnTracker::new(3);
+        let mut t = BotTurnTracker::with_window(3, DEFAULT_WINDOW);
         assert_eq!(t.on_bot_message("t1"), TurnResult::Ok);
         assert_eq!(t.on_bot_message("t1"), TurnResult::Ok);
         // No on_human_message (system message filtered out at call site)

@@ -70,10 +70,8 @@ pub struct BotTurnTracker {
 }
 
 impl BotTurnTracker {
-    pub fn new(soft_limit: u32) -> Self {
-        Self::with_window(soft_limit, DEFAULT_WINDOW)
-    }
-
+    /// コンストラクタは1つだけにする。窓の長さは挙動を決める値なので、
+    /// 既定を隠した入口を別に持つと、どちらで作られたかで結果が変わる。
     pub fn with_window(soft_limit: u32, window: Duration) -> Self {
         Self {
             soft_limit,
@@ -184,14 +182,14 @@ mod tests {
 
     #[test]
     fn bot_turns_increment() {
-        let mut t = BotTurnTracker::new(5);
+        let mut t = BotTurnTracker::with_window(5, DEFAULT_WINDOW);
         assert_eq!(t.on_bot_message("t1"), TurnResult::Ok);
         assert_eq!(t.on_bot_message("t1"), TurnResult::Ok);
     }
 
     #[test]
     fn soft_limit_triggers() {
-        let mut t = BotTurnTracker::new(3);
+        let mut t = BotTurnTracker::with_window(3, DEFAULT_WINDOW);
         assert_eq!(t.on_bot_message("t1"), TurnResult::Ok);
         assert_eq!(t.on_bot_message("t1"), TurnResult::Ok);
         assert_eq!(t.on_bot_message("t1"), TurnResult::SoftLimit(3));
@@ -199,7 +197,7 @@ mod tests {
 
     #[test]
     fn human_resets_both_counters() {
-        let mut t = BotTurnTracker::new(3);
+        let mut t = BotTurnTracker::with_window(3, DEFAULT_WINDOW);
         assert_eq!(t.on_bot_message("t1"), TurnResult::Ok);
         assert_eq!(t.on_bot_message("t1"), TurnResult::Ok);
         t.on_human_message("t1");
@@ -210,7 +208,7 @@ mod tests {
 
     #[test]
     fn hard_limit_triggers() {
-        let mut t = BotTurnTracker::new(HARD_BOT_TURN_LIMIT + 1);
+        let mut t = BotTurnTracker::with_window(HARD_BOT_TURN_LIMIT + 1, DEFAULT_WINDOW);
         for _ in 0..HARD_BOT_TURN_LIMIT - 1 {
             assert_eq!(t.on_bot_message("t1"), TurnResult::Ok);
         }
@@ -219,7 +217,7 @@ mod tests {
 
     #[test]
     fn hard_limit_does_not_fire_at_legacy_100() {
-        let mut t = BotTurnTracker::new(HARD_BOT_TURN_LIMIT + 1);
+        let mut t = BotTurnTracker::with_window(HARD_BOT_TURN_LIMIT + 1, DEFAULT_WINDOW);
         for i in 1..=100 {
             assert_eq!(t.on_bot_message("t1"), TurnResult::Ok, "turn {i}");
         }
@@ -227,7 +225,7 @@ mod tests {
 
     #[test]
     fn hard_limit_resets_on_human() {
-        let mut t = BotTurnTracker::new(HARD_BOT_TURN_LIMIT + 1);
+        let mut t = BotTurnTracker::with_window(HARD_BOT_TURN_LIMIT + 1, DEFAULT_WINDOW);
         for _ in 0..HARD_BOT_TURN_LIMIT - 1 {
             assert_eq!(t.on_bot_message("t1"), TurnResult::Ok);
         }
@@ -237,7 +235,7 @@ mod tests {
 
     #[test]
     fn hard_before_soft_when_equal() {
-        let mut t = BotTurnTracker::new(HARD_BOT_TURN_LIMIT);
+        let mut t = BotTurnTracker::with_window(HARD_BOT_TURN_LIMIT, DEFAULT_WINDOW);
         for _ in 0..HARD_BOT_TURN_LIMIT - 1 {
             assert_eq!(t.on_bot_message("t1"), TurnResult::Ok);
         }
@@ -246,7 +244,7 @@ mod tests {
 
     #[test]
     fn threads_are_independent() {
-        let mut t = BotTurnTracker::new(3);
+        let mut t = BotTurnTracker::with_window(3, DEFAULT_WINDOW);
         assert_eq!(t.on_bot_message("t1"), TurnResult::Ok);
         assert_eq!(t.on_bot_message("t1"), TurnResult::Ok);
         assert_eq!(t.on_bot_message("t1"), TurnResult::SoftLimit(3));
@@ -255,13 +253,13 @@ mod tests {
 
     #[test]
     fn human_on_unknown_thread_is_noop() {
-        let mut t = BotTurnTracker::new(5);
+        let mut t = BotTurnTracker::with_window(5, DEFAULT_WINDOW);
         t.on_human_message("unknown");
     }
 
     #[test]
     fn two_bot_pingpong_hits_soft_limit() {
-        let mut t = BotTurnTracker::new(20);
+        let mut t = BotTurnTracker::with_window(20, DEFAULT_WINDOW);
         for i in 1..20 {
             assert_eq!(t.on_bot_message("t1"), TurnResult::Ok, "turn {i}");
         }
@@ -270,7 +268,7 @@ mod tests {
 
     #[test]
     fn two_bot_pingpong_human_resets() {
-        let mut t = BotTurnTracker::new(20);
+        let mut t = BotTurnTracker::with_window(20, DEFAULT_WINDOW);
         for _ in 0..15 {
             assert_eq!(t.on_bot_message("t1"), TurnResult::Ok);
         }
@@ -286,7 +284,7 @@ mod tests {
 
     #[test]
     fn soft_limit_warn_once_semantics() {
-        let mut t = BotTurnTracker::new(20);
+        let mut t = BotTurnTracker::with_window(20, DEFAULT_WINDOW);
         for _ in 0..19 {
             assert_eq!(t.on_bot_message("t1"), TurnResult::Ok);
         }
@@ -297,7 +295,7 @@ mod tests {
 
     #[test]
     fn hard_limit_warn_once_semantics() {
-        let mut t = BotTurnTracker::new(HARD_BOT_TURN_LIMIT + 1);
+        let mut t = BotTurnTracker::with_window(HARD_BOT_TURN_LIMIT + 1, DEFAULT_WINDOW);
         for _ in 0..HARD_BOT_TURN_LIMIT - 1 {
             assert_eq!(t.on_bot_message("t1"), TurnResult::Ok);
         }
@@ -310,7 +308,7 @@ mod tests {
     // when on_human_message is never called. Regression for openabdev/openab#497.
     #[test]
     fn system_message_does_not_reset_counter() {
-        let mut t = BotTurnTracker::new(3);
+        let mut t = BotTurnTracker::with_window(3, DEFAULT_WINDOW);
         assert_eq!(t.on_bot_message("t1"), TurnResult::Ok);
         assert_eq!(t.on_bot_message("t1"), TurnResult::Ok);
         assert_eq!(t.on_bot_message("t1"), TurnResult::SoftLimit(3));
@@ -318,13 +316,13 @@ mod tests {
 
     #[test]
     fn classify_returns_continue_under_limits() {
-        let mut t = BotTurnTracker::new(5);
+        let mut t = BotTurnTracker::with_window(5, DEFAULT_WINDOW);
         assert_eq!(t.classify_bot_message("t1"), TurnAction::Continue);
     }
 
     #[test]
     fn classify_returns_warn_and_stop_on_soft_limit() {
-        let mut t = BotTurnTracker::new(3);
+        let mut t = BotTurnTracker::with_window(3, DEFAULT_WINDOW);
         let _ = t.classify_bot_message("t1");
         let _ = t.classify_bot_message("t1");
         assert_eq!(
@@ -348,7 +346,7 @@ mod tests {
 
     #[test]
     fn classify_returns_silent_stop_past_soft_limit() {
-        let mut t = BotTurnTracker::new(2);
+        let mut t = BotTurnTracker::with_window(2, DEFAULT_WINDOW);
         let _ = t.classify_bot_message("t1");
         let _ = t.classify_bot_message("t1");
         assert_eq!(t.classify_bot_message("t1"), TurnAction::SilentStop);
@@ -357,7 +355,7 @@ mod tests {
 
     #[test]
     fn classify_returns_warn_and_stop_on_hard_limit() {
-        let mut t = BotTurnTracker::new(HARD_BOT_TURN_LIMIT + 1);
+        let mut t = BotTurnTracker::with_window(HARD_BOT_TURN_LIMIT + 1, DEFAULT_WINDOW);
         for _ in 0..HARD_BOT_TURN_LIMIT - 1 {
             let _ = t.classify_bot_message("t1");
         }
@@ -475,7 +473,7 @@ mod tests {
 
     #[test]
     fn classify_is_per_thread_independent() {
-        let mut t = BotTurnTracker::new(2);
+        let mut t = BotTurnTracker::with_window(2, DEFAULT_WINDOW);
         assert_eq!(t.classify_bot_message("t1"), TurnAction::Continue);
         assert!(matches!(
             t.classify_bot_message("t1"),
@@ -498,7 +496,7 @@ mod tests {
     // same thread, including unlocking new `Continue` responses.
     #[test]
     fn classify_resumes_after_human_message() {
-        let mut t = BotTurnTracker::new(2);
+        let mut t = BotTurnTracker::with_window(2, DEFAULT_WINDOW);
         let _ = t.classify_bot_message("t1"); // Continue
         assert!(matches!(
             t.classify_bot_message("t1"),
