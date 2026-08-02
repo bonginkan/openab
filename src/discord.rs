@@ -284,6 +284,12 @@ pub struct Handler {
     pub reminder_store: ReminderStore,
     /// Track scheduled reminder IDs to prevent duplicate scheduling on reconnect.
     pub scheduled_ids: tokio::sync::Mutex<std::collections::HashSet<String>>,
+    /// Durable queue backlog. Replayed once after connect so a restart resumes
+    /// whatever was still queued (see `spool.rs`). Shared with `dispatcher`.
+    pub spool: Arc<crate::spool::QueueSpool>,
+    /// Guards the one-time queue replay so a serenity reconnect (which re-fires
+    /// `ready`) does not re-submit the backlog.
+    pub replayed: std::sync::atomic::AtomicBool,
 }
 
 impl Handler {
@@ -1031,6 +1037,7 @@ impl EventHandler for Handler {
                 arrived_at: std::time::Instant::now(),
                 estimated_tokens,
                 other_bot_present: other_bot_present_flag,
+                spool_id: None,
             };
             match dispatcher
                 .submit(thread_key, thread_channel, adapter, buf_msg)
@@ -1141,6 +1148,42 @@ impl EventHandler for Handler {
             }
             if count > 0 {
                 info!(count, "re-scheduled pending reminders");
+            }
+        }
+
+        // Replay the durable queue that survived a restart: re-submit each still-
+        // queued message once. `swap` guards against a serenity reconnect (which
+        // re-fires `ready`) re-submitting the backlog.
+        if !self.replayed.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            let queued = self.spool.entries();
+            if !queued.is_empty() {
+                let adapter = self
+                    .adapter
+                    .get_or_init(|| Arc::new(DiscordAdapter::new(ctx.http.clone())))
+                    .clone();
+                info!(count = queued.len(), "replaying persisted queue after restart");
+                for pm in queued {
+                    let thread_key = pm.thread_key.clone();
+                    let thread_channel = pm.thread_channel.clone();
+                    let buf = crate::dispatch::BufferedMessage {
+                        sender_json: pm.sender_json,
+                        sender_name: pm.sender_name,
+                        prompt: pm.prompt,
+                        extra_blocks: pm.extra_blocks,
+                        trigger_msg: pm.trigger_msg,
+                        arrived_at: std::time::Instant::now(),
+                        estimated_tokens: pm.estimated_tokens,
+                        other_bot_present: pm.other_bot_present,
+                        spool_id: Some(pm.id),
+                    };
+                    if let Err(e) = self
+                        .dispatcher
+                        .submit(thread_key, thread_channel, adapter.clone(), buf)
+                        .await
+                    {
+                        error!(error = %e, "queue replay submit failed");
+                    }
+                }
             }
         }
     }

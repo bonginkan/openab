@@ -1,6 +1,6 @@
 use anyhow::Result;
 use async_trait::async_trait;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
@@ -339,7 +339,7 @@ fn is_valid_attachment_directive_path(value: &str) -> bool {
 /// Compare with `SenderContext`, which is **metadata for the agent**: there
 /// `channel_id` is the parent channel and `thread_id` is the thread,
 /// matching Slack's model for cross-platform consistency.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ChannelRef {
     pub platform: String,
     pub channel_id: String,
@@ -376,7 +376,7 @@ impl std::hash::Hash for ChannelRef {
 }
 
 /// Identifies a message across platforms.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MessageRef {
     pub channel: ChannelRef,
     pub message_id: String,

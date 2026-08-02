@@ -2015,6 +2015,7 @@ async fn handle_message(
         arrived_at: std::time::Instant::now(),
         estimated_tokens,
         other_bot_present,
+        spool_id: None,
     };
     match dispatcher
         .submit(thread_key, thread_channel, adapter_dyn, buf_msg)

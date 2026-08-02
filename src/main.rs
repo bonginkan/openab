@@ -17,6 +17,7 @@ mod reactions;
 mod remind;
 mod setup;
 mod slack;
+mod spool;
 mod stt;
 mod timestamp;
 
@@ -449,6 +450,16 @@ async fn main() -> anyhow::Result<()> {
             &discord_cfg.message_processing_mode,
             discord_cfg.max_buffered_messages,
         );
+        // Durable queue backlog, per bot (keyed off the --config source since
+        // $HOME/.openab is shared across bot processes). Shared by the dispatcher
+        // (persist on submit / ack on pickup) and the Handler (replay on connect).
+        let discord_spool = Arc::new(spool::QueueSpool::open(&spool::slug_from_config_source(
+            &config_source,
+        )));
+        let recovered = discord_spool.len();
+        if recovered > 0 {
+            info!(recovered, "loaded queued messages from spool; will replay on connect");
+        }
         let discord_dispatcher = Arc::new(
             dispatch::Dispatcher::with_idle_timeout(
                 router.clone(),
@@ -457,7 +468,8 @@ async fn main() -> anyhow::Result<()> {
                 discord_grouping,
                 discord_idle,
             )
-            .with_immediate_steer(immediate_steer),
+            .with_immediate_steer(immediate_steer)
+            .with_spool(discord_spool.clone()),
         );
         dispatchers.lock().unwrap().push(discord_dispatcher.clone());
 
@@ -513,6 +525,8 @@ async fn main() -> anyhow::Result<()> {
             dispatcher: discord_dispatcher,
             reminder_store: reminder_store.clone(),
             scheduled_ids: tokio::sync::Mutex::new(std::collections::HashSet::new()),
+            spool: discord_spool.clone(),
+            replayed: std::sync::atomic::AtomicBool::new(false),
         };
 
         let intents = GatewayIntents::GUILD_MESSAGES

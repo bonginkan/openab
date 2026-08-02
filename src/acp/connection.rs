@@ -85,7 +85,10 @@ fn expand_env(val: &str) -> String {
 use tokio::time::Instant;
 
 /// A content block for the ACP prompt — either text or image.
-#[derive(Debug, Clone)]
+///
+/// Serialize/Deserialize: buffered arrival events (which carry `extra_blocks`)
+/// are persisted by the queue spool so they survive a restart; see `spool.rs`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum ContentBlock {
     Text { text: String },
     Image { media_type: String, data: String },

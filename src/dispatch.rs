@@ -22,6 +22,7 @@ use crate::adapter::{AdapterRouter, ChannelRef, ChatAdapter, MessageRef};
 use crate::config::ReactionsConfig;
 use crate::error_display::format_user_error;
 use crate::reactions::StatusReactionController;
+use crate::spool::{now_ms, PersistedMessage, QueueSpool};
 
 type InFlightSet = std::collections::HashSet<String>;
 type ActiveReactions = HashMap<String, Arc<StatusReactionController>>;
@@ -51,6 +52,12 @@ pub struct BufferedMessage {
     /// Snapshot at submit time. Captured per-message so a batch reflects the
     /// freshest known state; `dispatch_batch` reads `batch.last()`.
     pub other_bot_present: bool,
+    /// Id of this message's durable spool entry, when a `QueueSpool` is wired.
+    /// `None` for a fresh message before `submit` persists it, and for messages
+    /// that are never buffered (immediate-steer). Set to the persisted id once
+    /// buffered; carried so the consumer can ack (remove) it on pickup, and so a
+    /// message replayed from the spool skips re-persisting.
+    pub spool_id: Option<u64>,
 }
 
 /// How `thread_key` is built for the dispatcher's per-thread map.
@@ -259,6 +266,10 @@ pub struct Dispatcher {
     /// Active reaction controller per in-flight session. Used by mid-turn
     /// steering to move status reactions to the newest triggering message.
     active_reactions: Arc<Mutex<ActiveReactions>>,
+    /// Durable backlog. When set, `submit` persists each buffered message and the
+    /// consumer removes it on pickup, so a restart replays what was still queued.
+    /// `None` disables persistence (default; Slack/Gateway lanes today).
+    spool: Option<Arc<QueueSpool>>,
 }
 
 impl Dispatcher {
@@ -283,7 +294,15 @@ impl Dispatcher {
             immediate_steer: false,
             in_flight: Arc::new(Mutex::new(InFlightSet::new())),
             active_reactions: Arc::new(Mutex::new(ActiveReactions::new())),
+            spool: None,
         }
+    }
+
+    /// Attach a durable queue spool (builder style). With a spool wired, buffered
+    /// messages survive a process restart; without one, behaviour is unchanged.
+    pub fn with_spool(mut self, spool: Arc<QueueSpool>) -> Self {
+        self.spool = Some(spool);
+        self
     }
 
     /// Enable immediate-steer mode on this dispatcher (builder style). When set,
@@ -338,7 +357,7 @@ impl Dispatcher {
         thread_key: String,
         thread_channel: ChannelRef,
         adapter: Arc<dyn ChatAdapter>,
-        msg: BufferedMessage,
+        mut msg: BufferedMessage,
     ) -> Result<(), DispatchError> {
         let cap = self.max_buffered_messages;
         let target = Arc::clone(&self.target);
@@ -391,6 +410,11 @@ impl Dispatcher {
                             sender = %msg.sender_name,
                             "forwarded in-flight message as mid-turn steer prompt"
                         );
+                        // A replayed message can arrive while a turn is in flight;
+                        // steering handles it, so drop its spool entry now.
+                        if let (Some(spool), Some(id)) = (self.spool.as_ref(), msg.spool_id) {
+                            spool.remove(id);
+                        }
                         return Ok(());
                     }
                     Err(e) => {
@@ -405,6 +429,29 @@ impl Dispatcher {
                         );
                     }
                 }
+            }
+        }
+
+        // Persist to the durable spool before buffering, so a restart replays it.
+        // Fresh messages (`spool_id == None`) are appended; a message replayed from
+        // the spool already has an id and is not re-persisted.
+        if msg.spool_id.is_none() {
+            if let Some(spool) = self.spool.as_ref() {
+                let persisted = PersistedMessage {
+                    id: 0, // assigned by append
+                    thread_key: thread_key.clone(),
+                    thread_channel: thread_channel.clone(),
+                    adapter_kind: adapter.platform().to_string(),
+                    sender_json: msg.sender_json.clone(),
+                    sender_name: msg.sender_name.clone(),
+                    prompt: msg.prompt.clone(),
+                    extra_blocks: msg.extra_blocks.clone(),
+                    trigger_msg: msg.trigger_msg.clone(),
+                    estimated_tokens: msg.estimated_tokens,
+                    other_bot_present: msg.other_bot_present,
+                    enqueued_at_ms: now_ms(),
+                };
+                msg.spool_id = Some(spool.append(persisted));
             }
         }
 
@@ -439,6 +486,7 @@ impl Dispatcher {
                     idle_timeout,
                     Arc::clone(&self.in_flight),
                     Arc::clone(&self.active_reactions),
+                    self.spool.clone(),
                 ));
                 ThreadHandle {
                     tx,
@@ -485,6 +533,7 @@ impl Dispatcher {
                         idle_timeout,
                         Arc::clone(&self.in_flight),
                         Arc::clone(&self.active_reactions),
+                        self.spool.clone(),
                     ));
                     ThreadHandle {
                         tx,
@@ -505,6 +554,11 @@ impl Dispatcher {
                     Self::try_evict_locked(&mut map, &thread_key, retry_gen);
                 }
                 let failed_msg = e2.0;
+                // Delivery failed for good — drop its spool entry so a poison
+                // message does not replay on every restart.
+                if let (Some(spool), Some(id)) = (self.spool.as_ref(), failed_msg.spool_id) {
+                    spool.remove(id);
+                }
                 let _ = adapter
                     .add_reaction(
                         &failed_msg.trigger_msg,
@@ -547,6 +601,11 @@ impl Dispatcher {
             .filter(|k| k.as_str() == prefix || k.starts_with(&lane_prefix))
             .cloned()
             .collect();
+        // Purge the spool for these keys: cancelled messages leave the mpsc
+        // without a consumer pickup, so without this they would replay on restart.
+        if let Some(spool) = self.spool.as_ref() {
+            spool.remove_matching(|pm| pm.thread_key == prefix || pm.thread_key.starts_with(&lane_prefix));
+        }
         let mut dropped = 0;
         for k in keys {
             if let Some(handle) = map.remove(&k) {
@@ -589,19 +648,34 @@ impl Dispatcher {
     }
 
     /// Log buffered-message counts and drop all handles (called on SIGTERM).
+    ///
+    /// With a spool wired, the still-buffered messages remain persisted and are
+    /// replayed on the next start, so their loss here is not terminal; without a
+    /// spool they are dropped as before.
     pub fn shutdown(&self) {
         // SAFETY: no .await while this guard is held — function is sync.
+        let persisted = self.spool.is_some();
         let mut map = self.per_thread.lock().unwrap();
         for (thread_id, handle) in map.iter() {
             let pending = handle.pending_count();
             if pending > 0 {
-                warn!(
-                    thread_id = %thread_id,
-                    channel   = %handle.channel_id,
-                    adapter   = %handle.adapter_kind,
-                    buffered_lost = pending,
-                    "shutdown dropped pending messages without dispatch",
-                );
+                if persisted {
+                    info!(
+                        thread_id = %thread_id,
+                        channel   = %handle.channel_id,
+                        adapter   = %handle.adapter_kind,
+                        buffered_pending = pending,
+                        "shutdown left pending messages buffered; they will replay from the spool",
+                    );
+                } else {
+                    warn!(
+                        thread_id = %thread_id,
+                        channel   = %handle.channel_id,
+                        adapter   = %handle.adapter_kind,
+                        buffered_lost = pending,
+                        "shutdown dropped pending messages without dispatch",
+                    );
+                }
             }
             handle.consumer.abort();
         }
@@ -676,6 +750,15 @@ impl Drop for ActiveReactionGuard {
     }
 }
 
+/// Remove a message's durable spool entry once a consumer has picked it up for
+/// dispatch. After this point the message is "started", so it must not replay on
+/// restart. No-op when no spool is wired or the message was never persisted.
+fn ack_pickup(spool: &Option<Arc<QueueSpool>>, msg: &BufferedMessage) {
+    if let (Some(s), Some(id)) = (spool.as_ref(), msg.spool_id) {
+        s.remove(id);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn consumer_loop(
     thread_key: String,
@@ -688,6 +771,7 @@ async fn consumer_loop(
     idle_timeout: Duration,
     in_flight: Arc<Mutex<InFlightSet>>,
     active_reactions: Arc<Mutex<ActiveReactions>>,
+    spool: Option<Arc<QueueSpool>>,
 ) {
     // `pending` holds a message that exceeded the token cap for the current batch;
     // it becomes the first message of the next batch, preserving FIFO.
@@ -702,7 +786,10 @@ async fn consumer_loop(
         let first = match pending.take() {
             Some(msg) => msg,
             None => match tokio::time::timeout(idle_timeout, rx.recv()).await {
-                Ok(Some(msg)) => msg,
+                Ok(Some(msg)) => {
+                    ack_pickup(&spool, &msg);
+                    msg
+                }
                 Ok(None) => {
                     // All senders dropped → shutdown() or cancel_buffered_thread().
                     break;
@@ -725,6 +812,7 @@ async fn consumer_loop(
         while batch.len() < max_batch {
             match rx.try_recv() {
                 Ok(more) => {
+                    ack_pickup(&spool, &more);
                     if cumulative_tokens + more.estimated_tokens > max_tokens {
                         // Token cap — save for next turn (FIFO preserved).
                         pending = Some(more);
@@ -1580,6 +1668,7 @@ mod tests {
             arrived_at: Instant::now(),
             estimated_tokens: tokens,
             other_bot_present: false,
+            spool_id: None,
         }
     }
 
@@ -1610,6 +1699,7 @@ mod tests {
             Duration::from_secs(60),
             Arc::new(Mutex::new(InFlightSet::new())),
             Arc::new(Mutex::new(ActiveReactions::new())),
+            None,
         )
         .await;
 
@@ -1672,6 +1762,7 @@ mod tests {
             Duration::from_millis(50),
             Arc::new(Mutex::new(InFlightSet::new())),
             Arc::new(Mutex::new(ActiveReactions::new())),
+            None,
         ));
         // Wait enough for the timeout branch + a tick for the task to finish.
         tokio::time::sleep(Duration::from_millis(150)).await;
