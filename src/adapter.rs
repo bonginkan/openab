@@ -8,7 +8,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{error, warn};
 
-use crate::acp::{classify_notification, AcpEvent, ContentBlock, SessionPool};
+use crate::acp::{classify_notification, AcpEvent, AcpMessagePhase, ContentBlock, SessionPool};
 use crate::config::{AttachmentsConfig, ReactionsConfig, ToolDisplay};
 use crate::error_display::{format_coded_error, format_user_error};
 use crate::format;
@@ -1233,6 +1233,7 @@ impl AdapterRouter {
                     reactions.set_thinking().await;
 
                     let mut text_buf = String::new();
+                    let mut commentary_buf = String::new();
                     let mut tool_lines: Vec<ToolEntry> = Vec::new();
 
                     if reset {
@@ -1322,8 +1323,25 @@ impl AdapterRouter {
                         }
 
                         if let Some(event) = classify_notification(&notification) {
+                            let Some(event) = buffer_non_streaming_commentary(
+                                streaming,
+                                event,
+                                &mut commentary_buf,
+                            ) else {
+                                continue;
+                            };
+
+                            flush_commentary_checkpoint(
+                                &adapter,
+                                &thread_channel,
+                                &mut commentary_buf,
+                                table_mode,
+                                message_limit,
+                            )
+                            .await;
+
                             match event {
-                                AcpEvent::Text(t) => {
+                                AcpEvent::Text { text: t, .. } => {
                                     let steer = {
                                         let mut pending = pending_steer_separators.lock().await;
                                         pending.remove(&thread_key_for_separator)
@@ -1423,6 +1441,15 @@ impl AdapterRouter {
                             }
                         }
                     }
+
+                    flush_commentary_checkpoint(
+                        &adapter,
+                        &thread_channel,
+                        &mut commentary_buf,
+                        table_mode,
+                        message_limit,
+                    )
+                    .await;
 
                     tracing::info!(
                         request_id,
@@ -1701,6 +1728,43 @@ async fn send_outbound_attachments(
         batch_index += 1;
     }
     Ok(())
+}
+
+async fn flush_commentary_checkpoint(
+    adapter: &Arc<dyn ChatAdapter>,
+    thread_channel: &ChannelRef,
+    commentary_buf: &mut String,
+    table_mode: TableMode,
+    message_limit: usize,
+) {
+    let commentary = std::mem::take(commentary_buf);
+    if commentary.trim().is_empty() {
+        return;
+    }
+
+    let commentary = markdown::convert_tables(&commentary, table_mode);
+    for chunk in format::split_message(&commentary, message_limit) {
+        if let Err(error) = adapter.send_message(thread_channel, &chunk).await {
+            warn!(?error, "failed to send non-streaming commentary checkpoint");
+        }
+    }
+}
+
+fn buffer_non_streaming_commentary(
+    streaming: bool,
+    event: AcpEvent,
+    commentary_buf: &mut String,
+) -> Option<AcpEvent> {
+    match event {
+        AcpEvent::Text {
+            text,
+            phase: Some(AcpMessagePhase::Commentary),
+        } if !streaming => {
+            append_text_chunk(commentary_buf, &text, false);
+            None
+        }
+        event => Some(event),
+    }
 }
 
 fn split_streaming_display(content: &str, message_limit: usize) -> Vec<String> {
@@ -2179,6 +2243,131 @@ mod tests {
             ..ch.clone()
         };
         assert_eq!(thread_ch.origin_event_id.as_deref(), Some("evt_abc"));
+    }
+
+    #[tokio::test]
+    async fn non_streaming_commentary_flushes_as_fresh_checkpoint() {
+        #[derive(Default)]
+        struct RecordingAdapter {
+            sent: Mutex<Vec<String>>,
+        }
+
+        #[async_trait]
+        impl ChatAdapter for RecordingAdapter {
+            fn platform(&self) -> &'static str {
+                "test"
+            }
+
+            fn message_limit(&self) -> usize {
+                2000
+            }
+
+            async fn send_message(
+                &self,
+                channel: &ChannelRef,
+                content: &str,
+            ) -> Result<MessageRef> {
+                self.sent.lock().await.push(content.to_string());
+                Ok(MessageRef {
+                    channel: channel.clone(),
+                    message_id: "checkpoint".into(),
+                })
+            }
+
+            async fn create_thread(
+                &self,
+                _: &ChannelRef,
+                _: &MessageRef,
+                _: &str,
+            ) -> Result<ChannelRef> {
+                unimplemented!()
+            }
+
+            async fn add_reaction(&self, _: &MessageRef, _: &str) -> Result<()> {
+                Ok(())
+            }
+
+            async fn remove_reaction(&self, _: &MessageRef, _: &str) -> Result<()> {
+                Ok(())
+            }
+
+            fn use_streaming(&self, _: bool) -> bool {
+                false
+            }
+        }
+
+        let adapter = Arc::new(RecordingAdapter::default());
+        let adapter_dyn: Arc<dyn ChatAdapter> = adapter.clone();
+        let channel = ChannelRef {
+            platform: "test".into(),
+            channel_id: "channel".into(),
+            thread_id: None,
+            parent_id: None,
+            origin_event_id: None,
+        };
+        let mut commentary = String::new();
+        let buffered = buffer_non_streaming_commentary(
+            false,
+            AcpEvent::Text {
+                text: "着手した。次に検証する。".into(),
+                phase: Some(AcpMessagePhase::Commentary),
+            },
+            &mut commentary,
+        );
+        assert!(buffered.is_none());
+
+        flush_commentary_checkpoint(
+            &adapter_dyn,
+            &channel,
+            &mut commentary,
+            TableMode::Off,
+            2000,
+        )
+        .await;
+
+        assert!(commentary.is_empty());
+        assert_eq!(
+            adapter.sent.lock().await.as_slice(),
+            ["着手した。次に検証する。"]
+        );
+    }
+
+    #[test]
+    fn streaming_and_final_text_bypass_commentary_checkpoint() {
+        let mut commentary = String::new();
+
+        let streaming_commentary = buffer_non_streaming_commentary(
+            true,
+            AcpEvent::Text {
+                text: "streamed".into(),
+                phase: Some(AcpMessagePhase::Commentary),
+            },
+            &mut commentary,
+        );
+        assert!(matches!(
+            streaming_commentary,
+            Some(AcpEvent::Text {
+                phase: Some(AcpMessagePhase::Commentary),
+                ..
+            })
+        ));
+
+        let final_text = buffer_non_streaming_commentary(
+            false,
+            AcpEvent::Text {
+                text: "done".into(),
+                phase: Some(AcpMessagePhase::FinalAnswer),
+            },
+            &mut commentary,
+        );
+        assert!(matches!(
+            final_text,
+            Some(AcpEvent::Text {
+                phase: Some(AcpMessagePhase::FinalAnswer),
+                ..
+            })
+        ));
+        assert!(commentary.is_empty());
     }
 
     fn tool(id: &str, title: &str, state: ToolState) -> ToolEntry {
