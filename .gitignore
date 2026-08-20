@@ -9,6 +9,11 @@ config.toml
 openab-restart.log
 openab-restart-scheduler.log
 
+# Local review and generated artifacts. Keep the README assets tracked.
+/images/*
+!/images/banner.jpg
+!/images/demo.png
+
 # Claude Code (https://claude.ai/code)
 CLAUDE.md
 .claude/
