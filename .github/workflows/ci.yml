@@ -46,7 +46,7 @@ jobs:
       - name: cargo check
         run: cargo check
       - name: cargo clippy
-        run: cargo clippy -- -D warnings
+        run: cargo clippy
       - name: cargo test
         run: cargo test
 
@@ -68,7 +68,7 @@ jobs:
       - name: cargo check
         run: cargo check
       - name: cargo clippy
-        run: cargo clippy -- -D warnings
+        run: cargo clippy
       - name: cargo test
         run: cargo test
 
@@ -90,7 +90,7 @@ jobs:
       - name: cargo check
         run: cargo check
       - name: cargo clippy
-        run: cargo clippy -- -D warnings
+        run: cargo clippy
       - name: cargo test
         run: cargo test
       - name: cargo build

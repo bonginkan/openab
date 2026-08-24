@@ -21,8 +21,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # HERMES_HOME points to agent user's data dir for OAuth tokens and config
 ARG HERMES_INSTALL_COMMIT=cc07e30f45267c00fac97ea5569c606aca5a1ffb
 ARG HERMES_INSTALL_SHA256=cb94b83b96cc924716bd1651411955da7495912ef68affe6788840e6cf147d41
-RUN curl -fsSL "https://raw.githubusercontent.com/NousResearch/hermes-agent/${HERMES_INSTALL_COMMIT}/scripts/install.sh" \
-      -o /tmp/install-hermes.sh && \
+RUN (curl -fsSL --retry 5 --retry-delay 2 --retry-max-time 60 --retry-all-errors \
+       "https://raw.githubusercontent.com/NousResearch/hermes-agent/${HERMES_INSTALL_COMMIT}/scripts/install.sh" \
+       -o /tmp/install-hermes.sh || \
+     curl -fsSL --retry 5 --retry-delay 2 --retry-max-time 60 --retry-all-errors \
+       "https://cdn.jsdelivr.net/gh/NousResearch/hermes-agent@${HERMES_INSTALL_COMMIT}/scripts/install.sh" \
+       -o /tmp/install-hermes.sh) && \
     echo "${HERMES_INSTALL_SHA256}  /tmp/install-hermes.sh" | sha256sum -c - && \
     HERMES_HOME=/home/agent/.hermes bash /tmp/install-hermes.sh && \
     rm /tmp/install-hermes.sh && \
