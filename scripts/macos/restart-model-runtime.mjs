@@ -10,9 +10,19 @@ const tmux = '/opt/homebrew/bin/tmux';
 const log = event => console.log(JSON.stringify({ time: new Date().toISOString(), ...event }));
 const hash = path => createHash('sha256').update(readFileSync(path)).digest('hex');
 
-function processes() {
-  return execFileSync('/bin/ps', ['-axo', 'pid=,ppid=,pgid=,stat=,lstart=,comm='], { encoding: 'utf8' })
-    .trim().split('\n').map(line => {
+function processes(pid) {
+  const fields = 'pid=,ppid=,pgid=,stat=,lstart=,comm=';
+  const args = pid === undefined ? ['-axo', fields] : ['-p', String(pid), '-o', fields];
+  let output;
+  try {
+    output = execFileSync('/bin/ps', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+  } catch (error) {
+    // ps exits 1 with empty output when the selected process has already exited.
+    if (pid !== undefined && error.status === 1 && !String(error.stdout ?? '').trim()
+        && !String(error.stderr ?? '').trim()) return [];
+    throw error;
+  }
+  return output.trim().split('\n').filter(Boolean).map(line => {
       const match = line.trim().match(/^(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(\w+\s+\w+\s+\d+\s+\d+:\d+:\d+\s+\d+)\s+(.+)$/);
       if (!match) throw new Error('Unrecognized process metadata');
       return { pid: Number(match[1]), ppid: Number(match[2]), pgid: Number(match[3]), state: match[4], started: match[5].replace(/\s+/g, ' '), comm: match[6] };
@@ -20,7 +30,7 @@ function processes() {
 }
 
 function sameProcess(saved) {
-  return processes().some(row => matches(row, saved) && !row.state.includes('Z'));
+  return processes(saved.pid).some(row => matches(row, saved) && !row.state.includes('Z'));
 }
 
 function matches(row, saved) {
@@ -79,9 +89,12 @@ async function quiesce(initial) {
     // Stop intake first, then discover descendants again after their parents stop.
     for (const service of spec.services) freeze(initial.find(row => matches(row, service.root)));
     let stable = 0;
-    const deadline = Date.now() + 10000;
+    let observations = 0;
+    const started = Date.now();
+    const deadline = started + 10000;
     while (Date.now() < deadline) {
       const rows = processes();
+      observations++;
       const alive = rows.filter(row => known.has(row.pid) && matches(row, known.get(row.pid)) && !row.state.includes('Z'));
       const owners = new Set(alive.map(row => row.pid));
       // A live owned group leader anchors membership, including reparented children.
@@ -102,7 +115,7 @@ async function quiesce(initial) {
       await delay(25);
     }
     const remaining = processes().filter(row => known.has(row.pid) && matches(row, known.get(row.pid)));
-    throw new Error('Runtime tree did not quiesce: ' + JSON.stringify(remaining.map(({ pid, state }) => ({ pid, state }))));
+    throw new Error('Runtime tree did not quiesce: ' + JSON.stringify({ elapsedMs: Date.now() - started, observations, remaining: remaining.map(({ pid, state }) => ({ pid, state })) }));
   } catch (error) {
     resume();
     throw error;
