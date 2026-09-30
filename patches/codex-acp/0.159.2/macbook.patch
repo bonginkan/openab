@@ -1,0 +1,260 @@
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -21,22 +21,21 @@
+ agent-client-protocol = { version = "=0.12.1", features = ["unstable"] }
+ anyhow = "1"
+ clap = "4"
+-codex-apply-patch = { git = "https://github.com/openai/codex", tag = "rust-v0.153.4" }
+-codex-arg0 = { git = "https://github.com/openai/codex", tag = "rust-v0.153.4" }
+-codex-config = { git = "https://github.com/openai/codex", tag = "rust-v0.153.4" }
+-codex-core = { git = "https://github.com/openai/codex", tag = "rust-v0.153.4" }
+-codex-exec-server = { git = "https://github.com/openai/codex", tag = "rust-v0.153.4" }
+-codex-extension-api = { git = "https://github.com/openai/codex", tag = "rust-v0.153.4" }
+-codex-home = { git = "https://github.com/openai/codex", tag = "rust-v0.153.4" }
+-codex-history = { git = "https://github.com/openai/codex", tag = "rust-v0.153.4" }
+-codex-mcp-server = { git = "https://github.com/openai/codex", tag = "rust-v0.153.4" }
+-codex-models-manager = { git = "https://github.com/openai/codex", tag = "rust-v0.153.4" }
+-codex-protocol = { git = "https://github.com/openai/codex", tag = "rust-v0.153.4" }
+-codex-login = { git = "https://github.com/openai/codex", tag = "rust-v0.153.4" }
+-codex-shell-command = { git = "https://github.com/openai/codex", tag = "rust-v0.153.4" }
+-codex-utils-approval-presets = { git = "https://github.com/openai/codex", tag = "rust-v0.153.4" }
+-codex-utils-cli = { git = "https://github.com/openai/codex", tag = "rust-v0.153.4" }
+-codex-utils-path-uri = { git = "https://github.com/openai/codex", tag = "rust-v0.153.4" }
++codex-apply-patch = { git = "https://github.com/openai/codex", tag = "rust-v0.159.2" }
++codex-arg0 = { git = "https://github.com/openai/codex", tag = "rust-v0.159.2" }
++codex-config = { git = "https://github.com/openai/codex", tag = "rust-v0.159.2" }
++codex-core = { git = "https://github.com/openai/codex", tag = "rust-v0.159.2" }
++codex-exec-server = { git = "https://github.com/openai/codex", tag = "rust-v0.159.2" }
++codex-extension-api = { git = "https://github.com/openai/codex", tag = "rust-v0.159.2" }
++codex-home = { git = "https://github.com/openai/codex", tag = "rust-v0.159.2" }
++codex-history = { git = "https://github.com/openai/codex", tag = "rust-v0.159.2" }
++codex-models-manager = { git = "https://github.com/openai/codex", tag = "rust-v0.159.2" }
++codex-protocol = { git = "https://github.com/openai/codex", tag = "rust-v0.159.2" }
++codex-login = { git = "https://github.com/openai/codex", tag = "rust-v0.159.2" }
++codex-shell-command = { git = "https://github.com/openai/codex", tag = "rust-v0.159.2" }
++codex-utils-approval-presets = { git = "https://github.com/openai/codex", tag = "rust-v0.159.2" }
++codex-utils-cli = { git = "https://github.com/openai/codex", tag = "rust-v0.159.2" }
++codex-utils-path-uri = { git = "https://github.com/openai/codex", tag = "rust-v0.159.2" }
+ # Match the allocative version required by Codex's starlark dependency.
+ allocative = "=0.3.6"
+ diffy = { version = "0.5.0", features = ["std"] }
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -71,9 +71,3 @@
+ 
+     Ok(())
+ }
+-
+-// Re-export the MCP server types for compatibility
+-pub use codex_mcp_server::{
+-    CodexToolCallParam, CodexToolCallReplyParam, ExecApprovalElicitRequestParams,
+-    ExecApprovalResponse, PatchApprovalElicitRequestParams, PatchApprovalResponse,
+-};
+--- a/src/codex_agent.rs
++++ b/src/codex_agent.rs
+@@ -19,7 +19,7 @@
+     find_thread_path_by_id_str, init_state_db, parse_cursor, resolve_installation_id,
+     thread_store_from_config,
+ };
+-use codex_exec_server::{EnvironmentManager, ExecServerRuntimePaths};
++use codex_exec_server::{EnvironmentManager, ExecServerRuntimeOptions};
+ use codex_extension_api::empty_extension_registry;
+ use codex_history::InitialHistory;
+ use codex_home::CodexHomeUserInstructionsProvider;
+@@ -77,7 +77,7 @@
+         let session_roots: Arc<Mutex<HashMap<SessionId, PathBuf>>> = Arc::default();
+         let state_db = init_state_db(&config).await;
+         let local_runtime_paths =
+-            ExecServerRuntimePaths::new(std::env::current_exe()?, codex_linux_sandbox_exe)?;
++            ExecServerRuntimeOptions::new(std::env::current_exe()?, codex_linux_sandbox_exe)?;
+         let environment_manager = Arc::new(
+             EnvironmentManager::from_codex_home(
+                 config.codex_home.clone(),
+@@ -103,6 +103,7 @@
+                 config.codex_home.clone(),
+             )),
+             None,
++            codex_core::passthrough_image_store(),
+             thread_store,
+             agent_graph_store,
+             installation_id,
+@@ -370,6 +371,8 @@
+                             environment_id: codex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID
+                                 .to_string(),
+                             required: false,
++                            startup_readiness: Default::default(),
++                            tool_input_schema_max_bytes: None,
+                             enabled: true,
+                             startup_timeout_sec: None,
+                             tool_timeout_sec: None,
+@@ -413,6 +416,8 @@
+                             environment_id: codex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID
+                                 .to_string(),
+                             required: false,
++                            startup_readiness: Default::default(),
++                            tool_input_schema_max_bytes: None,
+                             enabled: true,
+                             startup_timeout_sec: None,
+                             tool_timeout_sec: None,
+@@ -665,7 +670,7 @@
+             thread_id: _,
+             thread,
+             session_configured: _,
+-        } = Box::pin(self.thread_manager.resume_thread_from_rollout(
++        } = Box::pin(self.thread_manager.resume_legacy_thread_from_rollout(
+             config.clone(),
+             rollout_path,
+             self.auth_manager.clone(),
+--- a/src/thread.rs
++++ b/src/thread.rs
+@@ -45,8 +45,8 @@
+     items::TurnItem,
+     mcp::CallToolResult,
+     models::{
+-        ActivePermissionProfile, AdditionalPermissionProfile, MessagePhase, PermissionProfile,
+-        ResponseItem, WebSearchAction,
++        ActivePermissionProfile, AdditionalPermissionProfile, ImageReference, MessagePhase,
++        PermissionProfile, ResponseItem, WebSearchAction,
+     },
+     openai_models::{ModelPreset, ReasoningEffort},
+     parse_command::ParsedCommand,
+@@ -118,7 +118,8 @@
+ const INIT_COMMAND_PROMPT: &str = include_str!("./prompt_for_init_command.md");
+ const CODEX_READ_ONLY_PROFILE_ID: &str = ":read-only";
+ const CODEX_WORKSPACE_PROFILE_ID: &str = ":workspace";
+-const CODEX_DANGER_NO_SANDBOX_PROFILE_ID: &str = ":danger-no-sandbox";
++const CODEX_DANGER_NO_SANDBOX_PROFILE_ID: &str =
++    codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_DANGER_FULL_ACCESS;
+ const MESSAGE_PHASE_META_KEY: &str = "openai/codex-message-phase";
+ 
+ fn session_mode_id_for_active_profile(profile_id: &str) -> Option<&'static str> {
+@@ -178,7 +179,7 @@
+             let cwd = config.cwd.as_path();
+             if file_system.has_full_disk_read_access()
+                 && !file_system.has_full_disk_write_access()
+-                && file_system.can_write_path_with_cwd(cwd, cwd)
++                && file_system.can_write_local_path_with_cwd(cwd, cwd)
+             {
+                 Some("auto")
+             } else {
+@@ -1628,6 +1629,7 @@
+             | ElicitationRequest::OpenAiForm { .. }
+             | ElicitationRequest::OpenAiElicitationForm { .. } => "form",
+             ElicitationRequest::Url { .. } => "url",
++            ElicitationRequest::UserVerification { .. } => "user_verification",
+         };
+ 
+         info!(
+@@ -3279,6 +3281,7 @@
+                     effort: Some(effort_to_use.clone()),
+                     ..Default::default()
+                 },
++                reply: None,
+             })
+             .await
+             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
+@@ -3319,6 +3322,7 @@
+                     effort: Some(Some(effort.clone())),
+                     ..Default::default()
+                 },
++                reply: None,
+             })
+             .await
+             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
+@@ -3526,6 +3530,7 @@
+                         .map(ActivePermissionProfile::new),
+                     ..Default::default()
+                 },
++                reply: None,
+             })
+             .await
+             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
+@@ -3582,6 +3587,7 @@
+                     effort: Some(effort_to_use.clone()),
+                     ..Default::default()
+                 },
++                reply: None,
+             })
+             .await
+             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
+@@ -3978,7 +3984,12 @@
+                 text_elements: vec![],
+             }),
+             ContentBlock::Image(image_block) => Some(UserInput::Image {
+-                image_url: format!("data:{};base64,{}", image_block.mime_type, image_block.data),
++                image: ImageReference::Inline {
++                    image_url: format!(
++                        "data:{};base64,{}",
++                        image_block.mime_type, image_block.data
++                    ),
++                },
+                 detail: None,
+             }),
+             ContentBlock::ResourceLink(ResourceLink { name, uri, .. }) => Some(UserInput::Text {
+@@ -4201,7 +4212,7 @@
+             Some(format!("write stdin to process {process_id}"))
+         }
+         GuardianAssessmentAction::ApplyPatch { files, cwd: _ } => Some(if files.len() == 1 {
+-            format!("apply_patch touching {}", files[0].display())
++            format!("apply_patch touching {}", files[0])
+         } else {
+             format!("apply_patch touching {} files", files.len())
+         }),
+@@ -5300,6 +5311,9 @@
+                                     return Ok(id.to_string());
+                                 }
+                                 TurnInputMode::Steer { .. } => unimplemented!(),
++                                TurnInputMode::ContinueIfIdle { .. } => {
++                                    unreachable!("ACP does not submit internal continuation turns")
++                                }
+                             }
+                         }
+ 
+@@ -5485,6 +5499,7 @@
+                                 .send(Event {
+                                     id: id.to_string(),
+                                     msg: EventMsg::ExecApprovalRequest(ExecApprovalRequestEvent {
++                                        model_context: None,
+                                         kind: Default::default(),
+                                         call_id: "call-id".to_string(),
+                                         plugin_id: None,
+@@ -5561,6 +5576,7 @@
+                             .send(Event {
+                                 id: id.to_string(),
+                                 msg: EventMsg::TurnStarted(TurnStartedEvent {
++                                    root_turn_id: None,
+                                     model_context_window: None,
+                                     collaboration_mode_kind: ModeKind::default(),
+                                     turn_id: id.to_string(),
+@@ -5684,6 +5700,7 @@
+                                 .send(Event {
+                                     id: active_prompt_id.clone(),
+                                     msg: EventMsg::TurnAborted(TurnAbortedEvent {
++                                        error: None,
+                                         turn_id: Some(active_prompt_id),
+                                         reason:
+                                             codex_protocol::protocol::TurnAbortReason::Interrupted,
+@@ -5873,6 +5890,7 @@
+         prompt_state.exec_approval(
+             &session_client,
+             ExecApprovalRequestEvent {
++                model_context: None,
+                 kind: Default::default(),
+                 call_id: "call-id".to_string(),
+                 plugin_id: None,
+@@ -6137,6 +6155,7 @@
+             .handle_event(
+                 &session_client,
+                 EventMsg::ExecApprovalRequest(ExecApprovalRequestEvent {
++                    model_context: None,
+                     kind: Default::default(),
+                     call_id: "call-id".to_string(),
+                     plugin_id: None,
+@@ -6219,6 +6238,7 @@
+             .handle_event(
+                 &session_client,
+                 EventMsg::ExecApprovalRequest(ExecApprovalRequestEvent {
++                    model_context: None,
+                     kind: Default::default(),
+                     call_id: "call-id".to_string(),
+                     plugin_id: None,

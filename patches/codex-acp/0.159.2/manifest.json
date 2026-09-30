@@ -1,0 +1,91 @@
+{
+  "codex_tag": "rust-v0.159.2",
+  "codex_commit": "ff6aec96948b70d94983af2641a6b67c94faeff5",
+  "source_head": "25168092a5d206e193c648c58d2f04f669e02fe2",
+  "variants": {
+    "linux": {
+      "patch_sha256": "b486367f5e756f88362151350049fd31d42dd09f64ac09ebc65689714f1c78d3",
+      "files": [
+        {
+          "path": "Cargo.toml",
+          "before_sha256": "e04edde020deeb87a13db9e9ae459b57073bd560f31bf8d6e91aac2332b2e440",
+          "after_sha256": "7229c351dc2a1eb56f793332a93c610d99f8abcee15dcb709c56a9eaf4f9000a"
+        },
+        {
+          "path": "src/lib.rs",
+          "before_sha256": "7f316658332a6648c59c3d797cc04ec83830bf0486920d36b7a5a1e32bdc7363",
+          "after_sha256": "211040bc61c2575f399db5d0dcd7311aff2ae2beafd1f30fda423463bbad15c8"
+        },
+        {
+          "path": "src/codex_agent.rs",
+          "before_sha256": "6ad3f1a0b0738b927a0a65fe93b60bc58839711160fe4240086ec82e0a6709c2",
+          "after_sha256": "8e2dbb3e0c8c7b08f1b2a286777d9af7ae3ef36bdaf4878f23b703b7c3d7b4cc"
+        },
+        {
+          "path": "src/thread.rs",
+          "before_sha256": "327635fecd5f2e2216085a63b0d040b7f697ba214e21f10c21944e75a915a531",
+          "after_sha256": "fb9f99faf7f9aa3836e44a0c4792593b31bd47addf1d74fd5299aac8303532e9"
+        }
+      ]
+    },
+    "macbook": {
+      "patch_sha256": "ce425d9dc97afb60fb581e35c45dbaac45f7fd4bc9a633a787b91b284af0f09c",
+      "files": [
+        {
+          "path": "Cargo.toml",
+          "before_sha256": "e04edde020deeb87a13db9e9ae459b57073bd560f31bf8d6e91aac2332b2e440",
+          "after_sha256": "7229c351dc2a1eb56f793332a93c610d99f8abcee15dcb709c56a9eaf4f9000a"
+        },
+        {
+          "path": "src/lib.rs",
+          "before_sha256": "7f316658332a6648c59c3d797cc04ec83830bf0486920d36b7a5a1e32bdc7363",
+          "after_sha256": "211040bc61c2575f399db5d0dcd7311aff2ae2beafd1f30fda423463bbad15c8"
+        },
+        {
+          "path": "src/codex_agent.rs",
+          "before_sha256": "27affa98688fc86247c6ff8ad69a2fbffeae72ddf12d96d3eb8ee249950fad12",
+          "after_sha256": "1b9a2b62174c385f6cdb02b3fe667d1dbf13b600370f8d18fd26447b7cc15883"
+        },
+        {
+          "path": "src/thread.rs",
+          "before_sha256": "be40830a2dead858b9cd486ee932e91c02c6e35106e6893f15ec3496e66960ef",
+          "after_sha256": "a680d9b87fd624725d272a8009a10fe744b805ba992d5965eae112e6df71baf6"
+        }
+      ]
+    },
+    "macmini": {
+      "patch_sha256": "643a2968c4b439193d896686439c9d25ed5da857b28268d51fdea0b1729a63d4",
+      "files": [
+        {
+          "path": "Cargo.toml",
+          "before_sha256": "e04edde020deeb87a13db9e9ae459b57073bd560f31bf8d6e91aac2332b2e440",
+          "after_sha256": "7229c351dc2a1eb56f793332a93c610d99f8abcee15dcb709c56a9eaf4f9000a"
+        },
+        {
+          "path": "src/lib.rs",
+          "before_sha256": "7f316658332a6648c59c3d797cc04ec83830bf0486920d36b7a5a1e32bdc7363",
+          "after_sha256": "211040bc61c2575f399db5d0dcd7311aff2ae2beafd1f30fda423463bbad15c8"
+        },
+        {
+          "path": "src/codex_agent.rs",
+          "before_sha256": "ebbc8e6d5a2c7ff1a02be33e344cde706bab97f1ccffef91592429e394204cbc",
+          "after_sha256": "03f09df279b9ad4a78be1cf53f489919b167213741b76f8bb2eec52bd63f1628"
+        },
+        {
+          "path": "src/thread.rs",
+          "before_sha256": "10cfe6e05f1a6630254765e373bd3ea8326dc3497fa1da5e868190766e796219",
+          "after_sha256": "838c23cff64c50d90cfe10d23f29c18d105c0e4bdcb5693c23f8856983ad62b8"
+        }
+      ]
+    }
+  },
+  "validation": {
+    "linux_fmt": "pass",
+    "linux_release_tests": "22 passed",
+    "linux_release_build": "running",
+    "macbook_native_tests": "pending",
+    "macmini_native_tests": "pending",
+    "runtime_smoke": "pending"
+  },
+  "lock_sha256": "964aa49cf5837bb1b3e683262b052ab4caab5675d2ca805571fdbf7f2988031a"
+}

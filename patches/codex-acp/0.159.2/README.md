@@ -1,0 +1,9 @@
+# Codex ACP 0.159.2 migration patches
+
+These patches preserve three existing local steering forks while adapting their Codex dependencies to official `rust-v0.159.2` (`ff6aec96948b70d94983af2641a6b67c94faeff5`). They do not change OpenAB application code or runtime configuration.
+
+Choose the patch matching your exact baseline. Verify every input SHA-256 in `manifest.json`, apply with `patch --fuzz=0 -p1`, replace the lockfile with this directory's `Cargo.lock`, then verify every output hash. Do not apply a patch to a different baseline or on top of an older draft. Preserve your local source and existing runtime artifacts before applying.
+
+The compatibility changes cover the image store and image reference, thread settings replies, executor runtime options, legacy rollout resume, MCP defaults and unsupported user-verification decline, filesystem access API, path formatting, and test event fields. The removed upstream `codex-mcp-server` crate only supplied obsolete public reexports; MCP execution remains in Codex core. Each variant retains its existing steering implementation. MacBook message-phase metadata is preserved.
+
+Linux `cargo fmt --check` and `cargo test --release --locked -j 4` pass (22 tests). Native Mac builds, model/tool/steering/session-resume probes, matching official code-mode helper verification, and runtime adoption remain required. This revision is a build candidate, not an operational sign-off. No credentials, host configuration or restart specifications are included.
