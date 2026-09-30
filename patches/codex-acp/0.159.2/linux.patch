@@ -363,7 +363,7 @@
              })
              .await
              .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
-@@ -3612,6 +3638,84 @@
+@@ -3612,6 +3638,86 @@
                  // Skip SessionMeta, TurnContext, Compacted
                  _ => {}
              }
@@ -436,7 +436,9 @@
 +            let snapshot = serde_json::to_value(&item).map_err(Error::into_internal_error)?;
 +            let status = match snapshot.get("status").and_then(serde_json::Value::as_str) {
 +                Some("inProgress" | "in_progress") => ToolCallStatus::InProgress,
-+                Some("failed" | "declined" | "cancelled" | "incomplete") => ToolCallStatus::Failed,
++                Some("failed" | "declined" | "cancelled" | "incomplete" | "interrupted") => {
++                    ToolCallStatus::Failed
++                }
 +                _ => ToolCallStatus::Completed,
 +            };
 +            self.client.send_tool_call(
@@ -448,7 +450,7 @@
          }
          Ok(())
      }
-@@ -3956,7 +4060,12 @@
+@@ -3956,7 +4062,12 @@
                  text_elements: vec![],
              }),
              ContentBlock::Image(image_block) => Some(UserInput::Image {
@@ -462,7 +464,7 @@
                  detail: None,
              }),
              ContentBlock::ResourceLink(ResourceLink { name, uri, .. }) => Some(UserInput::Text {
-@@ -4179,7 +4288,7 @@
+@@ -4179,7 +4290,7 @@
              Some(format!("write_stdin to process {process_id}"))
          }
          GuardianAssessmentAction::ApplyPatch { files, cwd: _ } => Some(if files.len() == 1 {
@@ -471,7 +473,7 @@
          } else {
              format!("apply_patch touching {} files", files.len())
          }),
-@@ -4375,6 +4484,51 @@
+@@ -4375,6 +4486,59 @@
      use tokio::sync::{Mutex, Notify, mpsc::UnboundedSender};
  
      use super::*;
@@ -492,6 +494,9 @@
 +                json!({"type":"commandExecution", "id":"c1", "command":"false",
 +                    "cwd":"/tmp", "status":"failed", "commandActions":[],
 +                    "aggregatedOutput":"command failed", "exitCode":1}),
++                json!({"type":"collabAgentToolCall", "id":"collab1", "tool":"wait",
++                    "status":"interrupted", "senderThreadId":"sender",
++                    "receiverThreadIds":["receiver"], "agentsStates":{}}),
 +            ],
 +        ];
 +        for page in pages {
@@ -504,7 +509,7 @@
 +            response_rx.await??;
 +        }
 +        let notifications = client.notifications.lock().unwrap();
-+        assert_eq!(notifications.len(), 3);
++        assert_eq!(notifications.len(), 4);
 +        assert!(
 +            matches!(&notifications[0].update, SessionUpdate::UserMessageChunk(chunk)
 +            if matches!(&chunk.content, ContentBlock::Text(text) if text.text == "remember page one"))
@@ -518,12 +523,17 @@
 +            if call.status == ToolCallStatus::Failed
 +                && call.raw_output.as_ref().and_then(|output| output.get("exitCode")) == Some(&json!(1)))
 +        );
++        assert!(
++            matches!(&notifications[3].update, SessionUpdate::ToolCall(call)
++            if call.status == ToolCallStatus::Failed
++                && call.raw_output.as_ref().and_then(|output| output.get("status")) == Some(&json!("interrupted")))
++        );
 +        Ok(())
 +    }
  
      #[tokio::test]
      async fn test_prompt() -> anyhow::Result<()> {
-@@ -5126,6 +5280,9 @@
+@@ -5126,6 +5290,9 @@
                                  TurnInputSubmission::Started {
                                      turn_id: id.to_string(),
                                  }
@@ -533,7 +543,7 @@
                              }
                          };
                          let starts_turn = matches!(routing, TurnInputSubmission::Started { .. });
-@@ -5313,6 +5470,7 @@
+@@ -5313,6 +5480,7 @@
                                  .send(Event {
                                      id: id.to_string(),
                                      msg: EventMsg::ExecApprovalRequest(ExecApprovalRequestEvent {
@@ -541,7 +551,7 @@
                                          kind: Default::default(),
                                          call_id: "call-id".to_string(),
                                          plugin_id: None,
-@@ -5388,6 +5546,7 @@
+@@ -5388,6 +5556,7 @@
                              .send(Event {
                                  id: id.to_string(),
                                  msg: EventMsg::TurnStarted(TurnStartedEvent {
@@ -549,7 +559,7 @@
                                      model_context_window: None,
                                      collaboration_mode_kind: ModeKind::default(),
                                      turn_id: id.to_string(),
-@@ -5480,6 +5639,7 @@
+@@ -5480,6 +5649,7 @@
                                  .send(Event {
                                      id: active_prompt_id.clone(),
                                      msg: EventMsg::TurnAborted(TurnAbortedEvent {
@@ -557,7 +567,7 @@
                                          turn_id: Some(active_prompt_id),
                                          reason:
                                              codex_protocol::protocol::TurnAbortReason::Interrupted,
-@@ -5669,6 +5829,7 @@
+@@ -5669,6 +5839,7 @@
          prompt_state.exec_approval(
              &session_client,
              ExecApprovalRequestEvent {
@@ -565,7 +575,7 @@
                  kind: Default::default(),
                  call_id: "call-id".to_string(),
                  plugin_id: None,
-@@ -5934,6 +6095,7 @@
+@@ -5934,6 +6105,7 @@
              .handle_event(
                  &session_client,
                  EventMsg::ExecApprovalRequest(ExecApprovalRequestEvent {
@@ -573,7 +583,7 @@
                      kind: Default::default(),
                      call_id: "call-id".to_string(),
                      plugin_id: None,
-@@ -6016,6 +6178,7 @@
+@@ -6016,6 +6188,7 @@
              .handle_event(
                  &session_client,
                  EventMsg::ExecApprovalRequest(ExecApprovalRequestEvent {

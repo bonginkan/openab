@@ -4,7 +4,7 @@
   "source_head": "25168092a5d206e193c648c58d2f04f669e02fe2",
   "variants": {
     "linux": {
-      "patch_sha256": "bf414e36ca5c7f03131ab94db20f3868ceb531ebeb3f54654d6e290ba924d2dd",
+      "patch_sha256": "ba0577564a24ed00fe6508d77ab6185eb3072c43df9b1a5268371b2f2ac1b0dd",
       "files": [
         {
           "path": "Cargo.toml",
@@ -24,12 +24,12 @@
         {
           "path": "src/thread.rs",
           "before_sha256": "327635fecd5f2e2216085a63b0d040b7f697ba214e21f10c21944e75a915a531",
-          "after_sha256": "85cd0ece621ad2739f681f45a3348cb924d8db22c71a53cfb863a40f3cbc8f54"
+          "after_sha256": "471a54fd77524ac4885e679159093d0c1a6f6124becddf2a3d417508ee59c3f2"
         }
       ]
     },
     "macbook": {
-      "patch_sha256": "f1eece78d644797752ad4c1563e1a4b4741b3dd72d6067c09bba07fea241531d",
+      "patch_sha256": "5ab3066375ff0820c7cd6b01710b2f21ac1744d890babd0d0077123e765a7899",
       "files": [
         {
           "path": "Cargo.toml",
@@ -49,12 +49,12 @@
         {
           "path": "src/thread.rs",
           "before_sha256": "be40830a2dead858b9cd486ee932e91c02c6e35106e6893f15ec3496e66960ef",
-          "after_sha256": "fb70b1d4f5d62ab0223f3301403066e6a5a458f5287a72aae545f41dc473ea65"
+          "after_sha256": "a62caba74b7f0d2fdd27ad2827d7703c6af56e5ae6908dcb839a381ea7bf7faa"
         }
       ]
     },
     "macmini": {
-      "patch_sha256": "3eabfecc495be9a2f6174484a3a62a963d07e26371f4b0f1b4cffc9dfd870079",
+      "patch_sha256": "f8e228def02a4aabe82a69b27b4a1fb7633bbd862e2011a54fbcc779d38584ca",
       "files": [
         {
           "path": "Cargo.toml",
@@ -74,18 +74,18 @@
         {
           "path": "src/thread.rs",
           "before_sha256": "10cfe6e05f1a6630254765e373bd3ea8326dc3497fa1da5e868190766e796219",
-          "after_sha256": "070aa72d057a3d4d5a0246e04f5168c1b1674d4b8aca6891ac853aa13ad99bce"
+          "after_sha256": "091b6797fce50312533651293b3b8cc137e2787a410571f388ef6f6b56e62c8b"
         }
       ]
     }
   },
   "validation": {
     "linux_fmt": "pass",
-    "linux_release_tests": "23 passed; paginated replay regression included",
-    "linux_release_build": "pass",
-    "macbook_native_tests": "pending",
-    "macmini_native_tests": "pending",
-    "runtime_smoke": "prior candidate passed model, tools, steering; final resume probes pending",
+    "linux_release_tests": "interrupted-status regression validation running; prior revision 23 passed",
+    "linux_release_build": "interrupted-status revision pending; prior revision passed",
+    "macbook_native_tests": "previous revision 26 passed; interrupted-status revision pending",
+    "macmini_native_tests": "previous revision 23 passed; interrupted-status revision pending",
+    "runtime_smoke": "previous revision passed new paginated and legacy loads, model, image, tool, same-turn steering; final artifact validation pending",
     "linux_clippy": "fails on unchanged clone_on_copy and large_enum_variant sites; no lint suppression added"
   },
   "lock_sha256": "4b1e58f7ea7361c8b28c39c6d46676275d6ec4099056aa84aca55490318663e6"
