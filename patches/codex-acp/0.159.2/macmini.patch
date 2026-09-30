@@ -1,6 +1,6 @@
 --- a/Cargo.toml
 +++ b/Cargo.toml
-@@ -21,22 +21,21 @@
+@@ -21,22 +21,23 @@
  agent-client-protocol = { version = "=0.12.1", features = ["unstable"] }
  anyhow = "1"
  clap = "4"
@@ -20,6 +20,7 @@
 -codex-utils-approval-presets = { git = "https://github.com/openai/codex", tag = "rust-v0.153.4" }
 -codex-utils-cli = { git = "https://github.com/openai/codex", tag = "rust-v0.153.4" }
 -codex-utils-path-uri = { git = "https://github.com/openai/codex", tag = "rust-v0.153.4" }
++codex-app-server-protocol = { git = "https://github.com/openai/codex", tag = "rust-v0.159.2" }
 +codex-apply-patch = { git = "https://github.com/openai/codex", tag = "rust-v0.159.2" }
 +codex-arg0 = { git = "https://github.com/openai/codex", tag = "rust-v0.159.2" }
 +codex-config = { git = "https://github.com/openai/codex", tag = "rust-v0.159.2" }
@@ -32,6 +33,7 @@
 +codex-protocol = { git = "https://github.com/openai/codex", tag = "rust-v0.159.2" }
 +codex-login = { git = "https://github.com/openai/codex", tag = "rust-v0.159.2" }
 +codex-shell-command = { git = "https://github.com/openai/codex", tag = "rust-v0.159.2" }
++codex-thread-store = { git = "https://github.com/openai/codex", tag = "rust-v0.159.2" }
 +codex-utils-approval-presets = { git = "https://github.com/openai/codex", tag = "rust-v0.159.2" }
 +codex-utils-cli = { git = "https://github.com/openai/codex", tag = "rust-v0.159.2" }
 +codex-utils-path-uri = { git = "https://github.com/openai/codex", tag = "rust-v0.159.2" }
@@ -52,16 +54,42 @@
 -};
 --- a/src/codex_agent.rs
 +++ b/src/codex_agent.rs
-@@ -19,7 +19,7 @@
-     find_thread_path_by_id_str, init_state_db, parse_cursor, resolve_installation_id,
-     thread_store_from_config,
+@@ -16,18 +16,22 @@
+ use codex_core::{
+     CodexAppsToolsCache, NewThread, RolloutRecorder, SortDirection, StartThreadOptions,
+     StateDbHandle, ThreadManager, ThreadSortKey, build_models_manager, config::Config,
+-    find_thread_path_by_id_str, init_state_db, parse_cursor, resolve_installation_id,
+-    thread_store_from_config,
++    init_state_db, parse_cursor, resolve_installation_id, thread_store_from_config,
  };
 -use codex_exec_server::{EnvironmentManager, ExecServerRuntimePaths};
 +use codex_exec_server::{EnvironmentManager, ExecServerRuntimeOptions};
  use codex_extension_api::empty_extension_registry;
- use codex_history::InitialHistory;
+-use codex_history::InitialHistory;
++use codex_history::{InitialHistory, ResumedHistory};
  use codex_home::CodexHomeUserInstructionsProvider;
-@@ -77,7 +77,7 @@
+ use codex_login::{
+     CODEX_API_KEY_ENV_VAR, OPENAI_API_KEY_ENV_VAR,
+     auth::{AuthManager, CodexAuth, read_codex_api_key_from_env, read_openai_api_key_from_env},
+ };
++use codex_protocol::protocol::ThreadHistoryMode;
+ use codex_protocol::{ThreadId, mcp::ClientMcpExtensions, protocol::SessionSource};
++use codex_thread_store::{
++    ItemSortKey, ListItemsParams, ListItemsPosition, LoadThreadHistoryParams, ReadThreadParams,
++    ThreadStore,
++};
+ use codex_utils_path_uri::LegacyAppPathString;
+ use std::{
+     collections::HashMap,
+@@ -52,6 +56,7 @@
+     config: Config,
+     /// Thread manager for handling sessions
+     thread_manager: ThreadManager,
++    thread_store: Arc<dyn ThreadStore>,
+     /// SQLite-backed Codex state index, when initialization succeeds
+     state_db: Option<StateDbHandle>,
+     /// Active sessions mapped by `SessionId`
+@@ -77,7 +82,7 @@
          let session_roots: Arc<Mutex<HashMap<SessionId, PathBuf>>> = Arc::default();
          let state_db = init_state_db(&config).await;
          let local_runtime_paths =
@@ -70,15 +98,25 @@
          let environment_manager = Arc::new(
              EnvironmentManager::from_codex_home(
                  &config.codex_home,
-@@ -103,6 +103,7 @@
+@@ -103,7 +108,8 @@
                  config.codex_home.clone(),
              )),
              None,
+-            thread_store,
 +            codex_core::passthrough_image_store(),
-             thread_store,
++            thread_store.clone(),
              agent_graph_store,
              installation_id,
-@@ -370,6 +371,8 @@
+             None,
+@@ -114,6 +120,7 @@
+             client_capabilities,
+             config,
+             thread_manager,
++            thread_store,
+             state_db,
+             sessions: Arc::default(),
+             session_roots,
+@@ -370,6 +377,8 @@
                              environment_id: codex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID
                                  .to_string(),
                              required: false,
@@ -87,7 +125,7 @@
                              enabled: true,
                              startup_timeout_sec: None,
                              tool_timeout_sec: None,
-@@ -413,6 +416,8 @@
+@@ -413,6 +422,8 @@
                              environment_id: codex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID
                                  .to_string(),
                              required: false,
@@ -96,20 +134,122 @@
                              enabled: true,
                              startup_timeout_sec: None,
                              tool_timeout_sec: None,
-@@ -665,7 +670,7 @@
+@@ -640,23 +651,39 @@
+             ..
+         } = request;
+ 
+-        let rollout_path = find_thread_path_by_id_str(
+-            &self.config.codex_home,
+-            session_id.0.as_ref(),
+-            self.state_db.as_deref(),
+-        )
+-        .await
+-        .map_err(|e| Error::internal_error().data(e.to_string()))?
+-        .ok_or_else(|| Error::resource_not_found(None))?;
+-
+-        let history = RolloutRecorder::get_rollout_history(&rollout_path)
++        let thread_id = ThreadId::from_string(session_id.0.as_ref())
++            .map_err(|e| Error::invalid_params().data(e.to_string()))?;
++        let stored = self
++            .thread_store
++            .read_thread(ReadThreadParams {
++                thread_id,
++                include_archived: true,
++                include_history: false,
++            })
+             .await
+             .map_err(|e| Error::internal_error().data(e.to_string()))?;
+-
+-        let rollout_items = match &history {
+-            InitialHistory::Resumed(resumed) => resumed.history.as_ref().clone(),
+-            InitialHistory::Forked(items) => items.clone(),
+-            InitialHistory::Cleared | InitialHistory::New => Vec::new(),
++        let history_params = LoadThreadHistoryParams {
++            thread_id,
++            include_archived: true,
++        };
++        let context = self
++            .thread_store
++            .load_latest_model_context(history_params.clone())
++            .await
++            .map_err(|e| Error::internal_error().data(e.to_string()))?;
++        let history = InitialHistory::Resumed(ResumedHistory {
++            conversation_id: context.thread_id,
++            history: Arc::new(context.items),
++            rollout_path: stored.rollout_path,
++        });
++        let rollout_items = if stored.history_mode == ThreadHistoryMode::Legacy {
++            self.thread_store
++                .load_history(history_params)
++                .await
++                .map_err(|e| Error::internal_error().data(e.to_string()))?
++                .items
++        } else {
++            Vec::new()
+         };
+ 
+         let config = self.build_session_config(&cwd, mcp_servers)?;
+@@ -665,9 +692,9 @@
              thread_id: _,
              thread,
              session_configured: _,
 -        } = Box::pin(self.thread_manager.resume_thread_from_rollout(
-+        } = Box::pin(self.thread_manager.resume_legacy_thread_from_rollout(
++        } = Box::pin(self.thread_manager.resume_thread_with_history(
              config.clone(),
-             rollout_path,
+-            rollout_path,
++            history,
              self.auth_manager.clone(),
+             None,
+             ClientMcpExtensions::default(),
+@@ -685,7 +712,40 @@
+             cx,
+         ));
+ 
+-        thread.replay_history(rollout_items).await?;
++        if stored.history_mode == ThreadHistoryMode::Paginated {
++            let mut position = None;
++            loop {
++                let page = self
++                    .thread_store
++                    .list_items(ListItemsParams {
++                        thread_id,
++                        turn_id: None,
++                        include_archived: true,
++                        position,
++                        page_size: 100,
++                        sort_direction: codex_thread_store::SortDirection::Asc,
++                        sort_key: ItemSortKey::CreatedAtOrdinal,
++                        after_updated_at_ordinal: None,
++                    })
++                    .await
++                    .map_err(|e| Error::internal_error().data(e.to_string()))?;
++                let items = page
++                    .items
++                    .into_iter()
++                    .map(|item| {
++                        serde_json::from_slice(&item.item_json)
++                            .map_err(|e| Error::internal_error().data(e.to_string()))
++                    })
++                    .collect::<Result<Vec<_>, _>>()?;
++                thread.replay_stored_items(items).await?;
++                match page.next_cursor {
++                    Some(cursor) => position = Some(ListItemsPosition::Cursor(cursor)),
++                    None => break,
++                }
++            }
++        } else {
++            thread.replay_history(rollout_items).await?;
++        }
+ 
+         let load = thread.load().await?;
+ 
 --- a/src/thread.rs
 +++ b/src/thread.rs
-@@ -25,10 +25,8 @@
+@@ -24,11 +24,10 @@
+         UnstructuredCommandInput, UsageUpdate,
      },
  };
++use codex_app_server_protocol::ThreadItem as StoredThreadItem;
  use codex_apply_patch::parse_patch;
 -#[cfg(test)]
 -use codex_core::TurnInput;
@@ -119,7 +259,7 @@
      config::{Config, set_project_trust_level},
      review_prompts::user_facing_hint,
  };
-@@ -37,7 +35,9 @@
+@@ -37,7 +36,9 @@
  use codex_models_manager::manager::{ModelsManager, RefreshStrategy};
  #[cfg(test)]
  use codex_protocol::turn_input::NotSubmittedReason;
@@ -130,7 +270,7 @@
  use codex_protocol::{
      ResponseItemId,
      approvals::{
-@@ -49,8 +49,8 @@
+@@ -49,8 +50,8 @@
      error::CodexErr,
      mcp::CallToolResult,
      models::{
@@ -141,7 +281,7 @@
      },
      openai_models::{ModelPreset, ReasoningEffort},
      parse_command::ParsedCommand,
-@@ -121,7 +121,8 @@
+@@ -121,7 +122,8 @@
  const INIT_COMMAND_PROMPT: &str = include_str!("./prompt_for_init_command.md");
  const CODEX_READ_ONLY_PROFILE_ID: &str = ":read-only";
  const CODEX_WORKSPACE_PROFILE_ID: &str = ":workspace";
@@ -151,7 +291,7 @@
  
  fn session_mode_id_for_active_profile(profile_id: &str) -> Option<&'static str> {
      match profile_id {
-@@ -180,7 +181,7 @@
+@@ -180,7 +182,7 @@
              let cwd = config.cwd.as_path();
              if file_system.has_full_disk_read_access()
                  && !file_system.has_full_disk_write_access()
@@ -160,7 +300,36 @@
              {
                  Some("auto")
              } else {
-@@ -1615,6 +1616,7 @@
+@@ -329,6 +331,10 @@
+         history: Vec<RolloutItem>,
+         response_tx: oneshot::Sender<Result<(), Error>>,
+     },
++    ReplayStoredItems {
++        items: Vec<StoredThreadItem>,
++        response_tx: oneshot::Sender<Result<(), Error>>,
++    },
+     PermissionRequestResolved {
+         submission_id: String,
+         interaction_id: u64,
+@@ -477,6 +483,17 @@
+         };
+         drop(self.message_tx.send(message));
+ 
++        response_rx
++            .await
++            .map_err(|e| Error::internal_error().data(e.to_string()))?
++    }
++
++    pub async fn replay_stored_items(&self, items: Vec<StoredThreadItem>) -> Result<(), Error> {
++        let (response_tx, response_rx) = oneshot::channel();
++        drop(
++            self.message_tx
++                .send(ThreadMessage::ReplayStoredItems { items, response_tx }),
++        );
+         response_rx
+             .await
+             .map_err(|e| Error::internal_error().data(e.to_string()))?
+@@ -1615,6 +1632,7 @@
              | ElicitationRequest::OpenAiForm { .. }
              | ElicitationRequest::OpenAiElicitationForm { .. } => "form",
              ElicitationRequest::Url { .. } => "url",
@@ -168,7 +337,18 @@
          };
  
          info!(
-@@ -3241,6 +3243,7 @@
+@@ -2964,6 +2982,10 @@
+                 let result = self.handle_replay_history(history);
+                 drop(response_tx.send(result));
+             }
++            ThreadMessage::ReplayStoredItems { items, response_tx } => {
++                let result = self.handle_replay_stored_items(items);
++                drop(response_tx.send(result));
++            }
+             ThreadMessage::PermissionRequestResolved {
+                 submission_id,
+                 interaction_id,
+@@ -3241,6 +3263,7 @@
                      effort: Some(effort_to_use.clone()),
                      ..Default::default()
                  },
@@ -176,7 +356,7 @@
              })
              .await
              .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
-@@ -3281,6 +3284,7 @@
+@@ -3281,6 +3304,7 @@
                      effort: Some(Some(effort.clone())),
                      ..Default::default()
                  },
@@ -184,7 +364,7 @@
              })
              .await
              .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
-@@ -3486,6 +3490,7 @@
+@@ -3486,6 +3510,7 @@
                          .map(ActivePermissionProfile::new),
                      ..Default::default()
                  },
@@ -192,7 +372,7 @@
              })
              .await
              .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
-@@ -3542,6 +3547,7 @@
+@@ -3542,6 +3567,7 @@
                      effort: Some(effort_to_use.clone()),
                      ..Default::default()
                  },
@@ -200,7 +380,92 @@
              })
              .await
              .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
-@@ -3938,7 +3944,12 @@
+@@ -3594,6 +3620,84 @@
+                 // Skip SessionMeta, TurnContext, Compacted
+                 _ => {}
+             }
++        }
++        Ok(())
++    }
++
++    /// Replay projected items, including history outside the current model context window.
++    fn handle_replay_stored_items(&self, items: Vec<StoredThreadItem>) -> Result<(), Error> {
++        for item in items {
++            match &item {
++                StoredThreadItem::UserMessage { content, .. } => {
++                    let text = content
++                        .iter()
++                        .filter_map(|input| match input {
++                            codex_app_server_protocol::UserInput::Text { text, .. } => {
++                                Some(text.as_str())
++                            }
++                            _ => None,
++                        })
++                        .join("\n");
++                    self.client.send_user_message(text);
++                    continue;
++                }
++                StoredThreadItem::AgentMessage { text, .. } => {
++                    self.client.send_agent_text(text.clone());
++                    continue;
++                }
++                StoredThreadItem::Reasoning {
++                    summary, content, ..
++                } => {
++                    for text in summary.iter().chain(content) {
++                        self.client.send_agent_thought(text.clone());
++                    }
++                    continue;
++                }
++                StoredThreadItem::FunctionCallOutput { id, output, .. } => {
++                    self.client
++                        .send_tool_call_completed(id.clone(), Some(json!(output)));
++                    continue;
++                }
++                StoredThreadItem::HookPrompt { .. }
++                | StoredThreadItem::Plan { .. }
++                | StoredThreadItem::SubAgentActivity { .. }
++                | StoredThreadItem::EnteredReviewMode { .. }
++                | StoredThreadItem::ExitedReviewMode { .. }
++                | StoredThreadItem::ContextCompaction { .. } => continue,
++                _ => {}
++            }
++            let (title, kind) = match &item {
++                StoredThreadItem::CommandExecution { command, .. } => {
++                    (command.clone(), ToolKind::Execute)
++                }
++                StoredThreadItem::FileChange { .. } => ("Apply patch".to_string(), ToolKind::Edit),
++                StoredThreadItem::McpToolCall { server, tool, .. } => {
++                    (format!("{server}/{tool}"), ToolKind::Other)
++                }
++                StoredThreadItem::DynamicToolCall { tool, .. } => (tool.clone(), ToolKind::Other),
++                StoredThreadItem::CollabAgentToolCall { tool, .. } => {
++                    (format!("{tool:?}"), ToolKind::Other)
++                }
++                StoredThreadItem::WebSearch(..) => ("Web Search".to_string(), ToolKind::Search),
++                StoredThreadItem::ImageView { .. } => ("View image".to_string(), ToolKind::Read),
++                StoredThreadItem::ImageGeneration(..) => {
++                    ("Image generation".to_string(), ToolKind::Other)
++                }
++                StoredThreadItem::Sleep(..) => ("Sleep".to_string(), ToolKind::Other),
++                _ => continue,
++            };
++            let snapshot = serde_json::to_value(&item).map_err(Error::into_internal_error)?;
++            let status = match snapshot.get("status").and_then(serde_json::Value::as_str) {
++                Some("inProgress" | "in_progress") => ToolCallStatus::InProgress,
++                Some("failed" | "declined" | "cancelled" | "incomplete") => ToolCallStatus::Failed,
++                _ => ToolCallStatus::Completed,
++            };
++            self.client.send_tool_call(
++                ToolCall::new(item.id().to_string(), title)
++                    .kind(kind)
++                    .status(status)
++                    .raw_output(snapshot),
++            );
+         }
+         Ok(())
+     }
+@@ -3938,7 +4042,12 @@
                  text_elements: vec![],
              }),
              ContentBlock::Image(image_block) => Some(UserInput::Image {
@@ -214,7 +479,7 @@
                  detail: None,
              }),
              ContentBlock::ResourceLink(ResourceLink { name, uri, .. }) => Some(UserInput::Text {
-@@ -4163,7 +4174,7 @@
+@@ -4163,7 +4272,7 @@
              ..
          } => Some(format!("write to stdin for process {process_id}")),
          GuardianAssessmentAction::ApplyPatch { files, cwd: _ } => Some(if files.len() == 1 {
@@ -223,7 +488,59 @@
          } else {
              format!("apply_patch touching {} files", files.len())
          }),
-@@ -5055,6 +5066,9 @@
+@@ -4361,6 +4470,51 @@
+     use tokio::sync::{Mutex, Notify, mpsc::UnboundedSender};
+ 
+     use super::*;
++
++    #[tokio::test]
++    async fn paginated_replay_keeps_page_order_and_failed_tools_without_hook_prompts()
++    -> anyhow::Result<()> {
++        let (_, client, _, message_tx, _handle) = setup().await?;
++        let pages = [
++            vec![
++                json!({"type":"userMessage", "id":"u1", "clientId":null,
++                    "content":[{"type":"text", "text":"remember page one"}]}),
++                json!({"type":"hookPrompt", "id":"h1", "fragments":[
++                    {"text":"internal hook instructions", "hookRunId":"hook-1"}]}),
++            ],
++            vec![
++                json!({"type":"agentMessage", "id":"a1", "text":"page two answer"}),
++                json!({"type":"commandExecution", "id":"c1", "command":"false",
++                    "cwd":"/tmp", "status":"failed", "commandActions":[],
++                    "aggregatedOutput":"command failed", "exitCode":1}),
++            ],
++        ];
++        for page in pages {
++            let items = page
++                .into_iter()
++                .map(serde_json::from_value)
++                .collect::<Result<Vec<StoredThreadItem>, _>>()?;
++            let (response_tx, response_rx) = oneshot::channel();
++            message_tx.send(ThreadMessage::ReplayStoredItems { items, response_tx })?;
++            response_rx.await??;
++        }
++        let notifications = client.notifications.lock().unwrap();
++        assert_eq!(notifications.len(), 3);
++        assert!(
++            matches!(&notifications[0].update, SessionUpdate::UserMessageChunk(chunk)
++            if matches!(&chunk.content, ContentBlock::Text(text) if text.text == "remember page one"))
++        );
++        assert!(
++            matches!(&notifications[1].update, SessionUpdate::AgentMessageChunk(chunk)
++            if matches!(&chunk.content, ContentBlock::Text(text) if text.text == "page two answer"))
++        );
++        assert!(
++            matches!(&notifications[2].update, SessionUpdate::ToolCall(call)
++            if call.status == ToolCallStatus::Failed
++                && call.raw_output.as_ref().and_then(|output| output.get("exitCode")) == Some(&json!(1)))
++        );
++        Ok(())
++    }
+ 
+     #[tokio::test]
+     async fn test_prompt() -> anyhow::Result<()> {
+@@ -5055,6 +5209,9 @@
                                  TurnInputSubmission::NotSubmitted {
                                      reason: NotSubmittedReason::NoActiveTurn,
                                  }
@@ -233,7 +550,7 @@
                              }
                              (TurnInputMode::StartOrSteer | TurnInputMode::StartIfIdle, None) => {
                                  TurnInputSubmission::Started {
-@@ -5250,6 +5264,7 @@
+@@ -5250,6 +5407,7 @@
                                  .send(Event {
                                      id: id.to_string(),
                                      msg: EventMsg::ExecApprovalRequest(ExecApprovalRequestEvent {
@@ -241,7 +558,7 @@
                                          kind: Default::default(),
                                          call_id: "call-id".to_string(),
                                          plugin_id: None,
-@@ -5326,6 +5341,7 @@
+@@ -5326,6 +5484,7 @@
                              .send(Event {
                                  id: id.to_string(),
                                  msg: EventMsg::TurnStarted(TurnStartedEvent {
@@ -249,7 +566,7 @@
                                      model_context_window: None,
                                      collaboration_mode_kind: ModeKind::default(),
                                      turn_id: id.to_string(),
-@@ -5424,6 +5440,7 @@
+@@ -5424,6 +5583,7 @@
                                  .send(Event {
                                      id: active_prompt_id.clone(),
                                      msg: EventMsg::TurnAborted(TurnAbortedEvent {
@@ -257,7 +574,7 @@
                                          turn_id: Some(active_prompt_id),
                                          reason:
                                              codex_protocol::protocol::TurnAbortReason::Interrupted,
-@@ -5613,6 +5630,7 @@
+@@ -5613,6 +5773,7 @@
          prompt_state.exec_approval(
              &session_client,
              ExecApprovalRequestEvent {
@@ -265,7 +582,7 @@
                  kind: Default::default(),
                  call_id: "call-id".to_string(),
                  plugin_id: None,
-@@ -5879,6 +5897,7 @@
+@@ -5879,6 +6040,7 @@
              .handle_event(
                  &session_client,
                  EventMsg::ExecApprovalRequest(ExecApprovalRequestEvent {
@@ -273,7 +590,7 @@
                      kind: Default::default(),
                      call_id: "call-id".to_string(),
                      plugin_id: None,
-@@ -5963,6 +5982,7 @@
+@@ -5963,6 +6125,7 @@
              .handle_event(
                  &session_client,
                  EventMsg::ExecApprovalRequest(ExecApprovalRequestEvent {

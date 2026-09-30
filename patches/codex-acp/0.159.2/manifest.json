@@ -4,12 +4,12 @@
   "source_head": "25168092a5d206e193c648c58d2f04f669e02fe2",
   "variants": {
     "linux": {
-      "patch_sha256": "b486367f5e756f88362151350049fd31d42dd09f64ac09ebc65689714f1c78d3",
+      "patch_sha256": "bf414e36ca5c7f03131ab94db20f3868ceb531ebeb3f54654d6e290ba924d2dd",
       "files": [
         {
           "path": "Cargo.toml",
           "before_sha256": "e04edde020deeb87a13db9e9ae459b57073bd560f31bf8d6e91aac2332b2e440",
-          "after_sha256": "7229c351dc2a1eb56f793332a93c610d99f8abcee15dcb709c56a9eaf4f9000a"
+          "after_sha256": "404e10c567c96d8ba2d4ec4c351a8aabf13f694ad4e807d45fe2095afe753779"
         },
         {
           "path": "src/lib.rs",
@@ -19,22 +19,22 @@
         {
           "path": "src/codex_agent.rs",
           "before_sha256": "6ad3f1a0b0738b927a0a65fe93b60bc58839711160fe4240086ec82e0a6709c2",
-          "after_sha256": "8e2dbb3e0c8c7b08f1b2a286777d9af7ae3ef36bdaf4878f23b703b7c3d7b4cc"
+          "after_sha256": "56863d80053e638053bfa1ffff77c12b8cc88fc29c1879f2209e9d6e9e7f302a"
         },
         {
           "path": "src/thread.rs",
           "before_sha256": "327635fecd5f2e2216085a63b0d040b7f697ba214e21f10c21944e75a915a531",
-          "after_sha256": "fb9f99faf7f9aa3836e44a0c4792593b31bd47addf1d74fd5299aac8303532e9"
+          "after_sha256": "85cd0ece621ad2739f681f45a3348cb924d8db22c71a53cfb863a40f3cbc8f54"
         }
       ]
     },
     "macbook": {
-      "patch_sha256": "ce425d9dc97afb60fb581e35c45dbaac45f7fd4bc9a633a787b91b284af0f09c",
+      "patch_sha256": "f1eece78d644797752ad4c1563e1a4b4741b3dd72d6067c09bba07fea241531d",
       "files": [
         {
           "path": "Cargo.toml",
           "before_sha256": "e04edde020deeb87a13db9e9ae459b57073bd560f31bf8d6e91aac2332b2e440",
-          "after_sha256": "7229c351dc2a1eb56f793332a93c610d99f8abcee15dcb709c56a9eaf4f9000a"
+          "after_sha256": "404e10c567c96d8ba2d4ec4c351a8aabf13f694ad4e807d45fe2095afe753779"
         },
         {
           "path": "src/lib.rs",
@@ -44,22 +44,22 @@
         {
           "path": "src/codex_agent.rs",
           "before_sha256": "27affa98688fc86247c6ff8ad69a2fbffeae72ddf12d96d3eb8ee249950fad12",
-          "after_sha256": "1b9a2b62174c385f6cdb02b3fe667d1dbf13b600370f8d18fd26447b7cc15883"
+          "after_sha256": "afb13ddb3b5bf3113cc21a17fa2cd39ca2fcf775c8c92d3d4264b09b16f6b5e3"
         },
         {
           "path": "src/thread.rs",
           "before_sha256": "be40830a2dead858b9cd486ee932e91c02c6e35106e6893f15ec3496e66960ef",
-          "after_sha256": "a680d9b87fd624725d272a8009a10fe744b805ba992d5965eae112e6df71baf6"
+          "after_sha256": "fb70b1d4f5d62ab0223f3301403066e6a5a458f5287a72aae545f41dc473ea65"
         }
       ]
     },
     "macmini": {
-      "patch_sha256": "643a2968c4b439193d896686439c9d25ed5da857b28268d51fdea0b1729a63d4",
+      "patch_sha256": "3eabfecc495be9a2f6174484a3a62a963d07e26371f4b0f1b4cffc9dfd870079",
       "files": [
         {
           "path": "Cargo.toml",
           "before_sha256": "e04edde020deeb87a13db9e9ae459b57073bd560f31bf8d6e91aac2332b2e440",
-          "after_sha256": "7229c351dc2a1eb56f793332a93c610d99f8abcee15dcb709c56a9eaf4f9000a"
+          "after_sha256": "404e10c567c96d8ba2d4ec4c351a8aabf13f694ad4e807d45fe2095afe753779"
         },
         {
           "path": "src/lib.rs",
@@ -69,23 +69,24 @@
         {
           "path": "src/codex_agent.rs",
           "before_sha256": "ebbc8e6d5a2c7ff1a02be33e344cde706bab97f1ccffef91592429e394204cbc",
-          "after_sha256": "03f09df279b9ad4a78be1cf53f489919b167213741b76f8bb2eec52bd63f1628"
+          "after_sha256": "f853a597de07240db0fa497be3732be2123b1dc890ca375e0a9717f7117c2813"
         },
         {
           "path": "src/thread.rs",
           "before_sha256": "10cfe6e05f1a6630254765e373bd3ea8326dc3497fa1da5e868190766e796219",
-          "after_sha256": "838c23cff64c50d90cfe10d23f29c18d105c0e4bdcb5693c23f8856983ad62b8"
+          "after_sha256": "070aa72d057a3d4d5a0246e04f5168c1b1674d4b8aca6891ac853aa13ad99bce"
         }
       ]
     }
   },
   "validation": {
     "linux_fmt": "pass",
-    "linux_release_tests": "22 passed",
-    "linux_release_build": "running",
+    "linux_release_tests": "23 passed; paginated replay regression included",
+    "linux_release_build": "pass",
     "macbook_native_tests": "pending",
     "macmini_native_tests": "pending",
-    "runtime_smoke": "pending"
+    "runtime_smoke": "prior candidate passed model, tools, steering; final resume probes pending",
+    "linux_clippy": "fails on unchanged clone_on_copy and large_enum_variant sites; no lint suppression added"
   },
-  "lock_sha256": "964aa49cf5837bb1b3e683262b052ab4caab5675d2ca805571fdbf7f2988031a"
+  "lock_sha256": "4b1e58f7ea7361c8b28c39c6d46676275d6ec4099056aa84aca55490318663e6"
 }
