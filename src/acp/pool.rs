@@ -592,7 +592,7 @@ impl SessionPool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::{get_or_insert_gate, remove_if_same_handle};
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -685,6 +685,11 @@ while IFS= read -r line; do
       sid="fresh-$n"
       printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"%s"}}\n' "$id" "$sid" ;;
     session/prompt)
+      if [ "$FAKE_PROMPT_END" = "disconnect" ]; then
+        printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"%s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"unfinished buffered output"}}}}\n' "$sid"
+        printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"%s","update":{"sessionUpdate":"agent_message_chunk","_meta":{"openai/codex-message-phase":"commentary"},"content":{"type":"text","text":"unsent commentary"}}}}\n' "$sid"
+        kill -TERM "$$"
+      fi
       if [ -n "$replay" ]; then
         printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"saved-session","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"replayed history"}}}}\n'
       fi
@@ -698,7 +703,7 @@ done
     const THREAD: &str = "discord:thread";
 
     #[cfg(unix)]
-    fn fake_pool(dir: &std::path::Path, env: &[(&str, &str)]) -> super::SessionPool {
+    pub(crate) fn fake_pool(dir: &std::path::Path, env: &[(&str, &str)]) -> super::SessionPool {
         let script = dir.join("fake-agent.sh");
         std::fs::write(&script, FAKE_AGENT).unwrap();
         let mut env: HashMap<String, String> = env

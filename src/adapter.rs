@@ -1310,6 +1310,7 @@ impl AdapterRouter {
                     // messages and abandons cleanly on dead agent / optional hard
                     // ceiling so late responses cannot leak into the next prompt.
                     let mut response_error: Option<String> = None;
+                    let mut received_prompt_response = false;
                     let prompt_start = tokio::time::Instant::now();
                     loop {
                         let notification = tokio::select! {
@@ -1344,6 +1345,7 @@ impl AdapterRouter {
                             if let Some(ref err) = notification.error {
                                 response_error = Some(format_coded_error(err.code, &err.message, err.data_message()));
                             }
+                            received_prompt_response = true;
                             break;
                         }
 
@@ -1488,6 +1490,17 @@ impl AdapterRouter {
                                 _ => {}
                             }
                         }
+                    }
+
+                    if !received_prompt_response && !streaming {
+                        // A disconnected non-streaming turn has no completed answer.
+                        // Shutdown must not publish its long unfinished buffer as a final.
+                        response_error.get_or_insert_with(|| {
+                            "Agent connection closed before completing the turn".into()
+                        });
+                        text_buf.clear();
+                        commentary_buf.clear();
+                        tool_lines.clear();
                     }
 
                     flush_commentary_checkpoint(
@@ -2457,57 +2470,53 @@ mod tests {
         ));
     }
 
+    #[derive(Default)]
+    struct RecordingAdapter {
+        sent: Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl ChatAdapter for RecordingAdapter {
+        fn platform(&self) -> &'static str {
+            "test"
+        }
+
+        fn message_limit(&self) -> usize {
+            2000
+        }
+
+        async fn send_message(&self, channel: &ChannelRef, content: &str) -> Result<MessageRef> {
+            self.sent.lock().await.push(content.to_string());
+            Ok(MessageRef {
+                channel: channel.clone(),
+                message_id: "checkpoint".into(),
+            })
+        }
+
+        async fn create_thread(
+            &self,
+            _: &ChannelRef,
+            _: &MessageRef,
+            _: &str,
+        ) -> Result<ChannelRef> {
+            unimplemented!()
+        }
+
+        async fn add_reaction(&self, _: &MessageRef, _: &str) -> Result<()> {
+            Ok(())
+        }
+
+        async fn remove_reaction(&self, _: &MessageRef, _: &str) -> Result<()> {
+            Ok(())
+        }
+
+        fn use_streaming(&self, _: bool) -> bool {
+            false
+        }
+    }
+
     #[tokio::test]
     async fn non_streaming_commentary_flushes_as_fresh_checkpoint() {
-        #[derive(Default)]
-        struct RecordingAdapter {
-            sent: Mutex<Vec<String>>,
-        }
-
-        #[async_trait]
-        impl ChatAdapter for RecordingAdapter {
-            fn platform(&self) -> &'static str {
-                "test"
-            }
-
-            fn message_limit(&self) -> usize {
-                2000
-            }
-
-            async fn send_message(
-                &self,
-                channel: &ChannelRef,
-                content: &str,
-            ) -> Result<MessageRef> {
-                self.sent.lock().await.push(content.to_string());
-                Ok(MessageRef {
-                    channel: channel.clone(),
-                    message_id: "checkpoint".into(),
-                })
-            }
-
-            async fn create_thread(
-                &self,
-                _: &ChannelRef,
-                _: &MessageRef,
-                _: &str,
-            ) -> Result<ChannelRef> {
-                unimplemented!()
-            }
-
-            async fn add_reaction(&self, _: &MessageRef, _: &str) -> Result<()> {
-                Ok(())
-            }
-
-            async fn remove_reaction(&self, _: &MessageRef, _: &str) -> Result<()> {
-                Ok(())
-            }
-
-            fn use_streaming(&self, _: bool) -> bool {
-                false
-            }
-        }
-
         let adapter = Arc::new(RecordingAdapter::default());
         let adapter_dyn: Arc<dyn ChatAdapter> = adapter.clone();
         let channel = ChannelRef {
@@ -2542,6 +2551,73 @@ mod tests {
             adapter.sent.lock().await.as_slice(),
             ["着手した。次に検証する。"]
         );
+    }
+
+    #[cfg(unix)]
+    async fn route_fake_agent_prompt(env: &[(&str, &str)]) -> Vec<String> {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = Arc::new(crate::acp::pool::tests::fake_pool(dir.path(), env));
+        pool.get_or_create("discord:thread").await.unwrap();
+        let adapter = Arc::new(RecordingAdapter::default());
+        let adapter_dyn: Arc<dyn ChatAdapter> = adapter.clone();
+        let channel = ChannelRef {
+            platform: "test".into(),
+            channel_id: "channel".into(),
+            thread_id: None,
+            parent_id: None,
+            origin_event_id: None,
+        };
+        let reactions = Arc::new(StatusReactionController::new(
+            false,
+            adapter_dyn.clone(),
+            MessageRef {
+                channel: channel.clone(),
+                message_id: "incoming".into(),
+            },
+            Default::default(),
+            Default::default(),
+        ));
+        let router = AdapterRouter::new(
+            pool,
+            Default::default(),
+            Default::default(),
+            TableMode::Off,
+            30,
+            Default::default(),
+            dir.path().to_string_lossy().into_owned(),
+        );
+        router
+            .stream_prompt_blocks(
+                &adapter_dyn,
+                "discord:thread",
+                vec![ContentBlock::Text { text: "hi".into() }],
+                &channel,
+                reactions,
+                false,
+            )
+            .await
+            .unwrap();
+        let sent = adapter.sent.lock().await.clone();
+        sent
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn non_streaming_agent_disconnect_discards_unfinished_output() {
+        let sent =
+            route_fake_agent_prompt(&[("FAKE_LOAD", "ok"), ("FAKE_PROMPT_END", "disconnect")])
+                .await;
+        assert_eq!(sent.len(), 1, "disconnect must send only one short error");
+        assert!(sent[0].contains("Agent connection closed"));
+        assert!(!sent[0].contains("unfinished buffered output"));
+        assert!(!sent[0].contains("unsent commentary"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn non_streaming_agent_completion_keeps_final_output() {
+        let sent = route_fake_agent_prompt(&[("FAKE_LOAD", "ok")]).await;
+        assert_eq!(sent, ["answer from 1"]);
     }
 
     #[test]
