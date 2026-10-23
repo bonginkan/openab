@@ -121,7 +121,8 @@ impl LiveStatus {
         if !self.running_tools.is_empty() {
             return;
         }
-        if self.elapsed_ms.saturating_sub(self.last_event_ms) >= self.silence_after.as_millis() as u64
+        if self.elapsed_ms.saturating_sub(self.last_event_ms)
+            >= self.silence_after.as_millis() as u64
         {
             let last_known = Box::new(self.phase.clone());
             self.enter(Phase::Silent { last_known });
@@ -148,7 +149,11 @@ impl LiveStatus {
         } else {
             self.running_tools.push((id.to_string(), title.to_string()));
         }
-        let title = self.running_tools.last().map(|(_, t)| t.clone()).unwrap_or_default();
+        let title = self
+            .running_tools
+            .last()
+            .map(|(_, t)| t.clone())
+            .unwrap_or_default();
         self.enter(Phase::Tool { title });
     }
 
@@ -265,7 +270,12 @@ mod tests {
         let mut s = status();
         s.on_tool_start("1", "bash");
         s.tick(Duration::from_secs(300));
-        assert_eq!(s.phase(), &Phase::Tool { title: "bash".into() });
+        assert_eq!(
+            s.phase(),
+            &Phase::Tool {
+                title: "bash".into()
+            }
+        );
     }
 
     #[test]
@@ -281,7 +291,12 @@ mod tests {
         s.on_tool_start("1", "bash");
         s.on_tool_start("2", "read");
         s.on_tool_done("1", true);
-        assert_eq!(s.phase(), &Phase::Tool { title: "read".into() });
+        assert_eq!(
+            s.phase(),
+            &Phase::Tool {
+                title: "read".into()
+            }
+        );
     }
 
     #[test]
@@ -307,7 +322,10 @@ mod tests {
         s.tick(Duration::from_secs(20));
         assert!(matches!(s.phase(), Phase::Silent { .. }));
         s.tick(Duration::from_secs(21));
-        assert!(matches!(s.phase(), Phase::Silent { .. }), "silence lifted itself");
+        assert!(
+            matches!(s.phase(), Phase::Silent { .. }),
+            "silence lifted itself"
+        );
         s.on_thinking();
         assert_eq!(s.phase(), &Phase::Thinking);
     }
@@ -364,8 +382,14 @@ pub enum StatusEvent {
     Thinking,
     /// The answer has started arriving; the message now belongs to it.
     TextStarted,
-    ToolStart { id: String, title: String },
-    ToolDone { id: String, succeeded: bool },
+    ToolStart {
+        id: String,
+        title: String,
+    },
+    ToolDone {
+        id: String,
+        succeeded: bool,
+    },
 }
 
 pub struct LiveStatusHandle {
@@ -437,7 +461,10 @@ pub fn spawn(
                 break;
             }
             status.tick(started.elapsed());
-            if display.send(format!("{MARKER}{}", status.render())).is_err() {
+            if display
+                .send(format!("{MARKER}{}", status.render()))
+                .is_err()
+            {
                 break;
             }
         }

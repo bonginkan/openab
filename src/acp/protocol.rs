@@ -204,7 +204,10 @@ pub fn parse_config_options(result: &Value) -> Vec<ConfigOption> {
 
 #[derive(Debug)]
 pub enum AcpEvent {
-    Text(String),
+    Text {
+        text: String,
+        phase: Option<AcpMessagePhase>,
+    },
     Thinking,
     ToolStart {
         id: String,
@@ -219,6 +222,12 @@ pub enum AcpEvent {
         options: Vec<ConfigOption>,
     },
     Status,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AcpMessagePhase {
+    Commentary,
+    FinalAnswer,
 }
 
 pub fn classify_notification(msg: &JsonRpcMessage) -> Option<AcpEvent> {
@@ -242,7 +251,19 @@ pub fn classify_notification(msg: &JsonRpcMessage) -> Option<AcpEvent> {
     match session_update {
         "agent_message_chunk" => {
             let text = update.get("content")?.get("text")?.as_str()?;
-            Some(AcpEvent::Text(text.to_string()))
+            let phase = update
+                .get("_meta")
+                .and_then(|meta| meta.get("openai/codex-message-phase"))
+                .and_then(serde_json::Value::as_str)
+                .and_then(|phase| match phase {
+                    "commentary" => Some(AcpMessagePhase::Commentary),
+                    "final_answer" => Some(AcpMessagePhase::FinalAnswer),
+                    _ => None,
+                });
+            Some(AcpEvent::Text {
+                text: text.to_string(),
+                phase,
+            })
         }
         "agent_thought_chunk" => Some(AcpEvent::Thinking),
         "tool_call" => {
@@ -402,5 +423,61 @@ mod tests {
         let opts = parse_config_options(&result);
         assert_eq!(opts.len(), 1);
         assert_eq!(opts[0].id, "model");
+    }
+
+    #[test]
+    fn classify_agent_text_preserves_codex_message_phase() {
+        let commentary = JsonRpcMessage {
+            id: None,
+            method: Some("session/update".to_string()),
+            params: Some(json!({
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {"type": "text", "text": "working"},
+                    "_meta": {"openai/codex-message-phase": "commentary"}
+                }
+            })),
+            result: None,
+            error: None,
+        };
+        assert!(matches!(
+            classify_notification(&commentary),
+            Some(AcpEvent::Text {
+                text,
+                phase: Some(AcpMessagePhase::Commentary)
+            }) if text == "working"
+        ));
+
+        let final_answer = JsonRpcMessage {
+            params: Some(json!({
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {"type": "text", "text": "done"},
+                    "_meta": {"openai/codex-message-phase": "final_answer"}
+                }
+            })),
+            ..commentary
+        };
+        assert!(matches!(
+            classify_notification(&final_answer),
+            Some(AcpEvent::Text {
+                text,
+                phase: Some(AcpMessagePhase::FinalAnswer)
+            }) if text == "done"
+        ));
+
+        let legacy = JsonRpcMessage {
+            params: Some(json!({
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {"type": "text", "text": "legacy"}
+                }
+            })),
+            ..final_answer
+        };
+        assert!(matches!(
+            classify_notification(&legacy),
+            Some(AcpEvent::Text { text, phase: None }) if text == "legacy"
+        ));
     }
 }

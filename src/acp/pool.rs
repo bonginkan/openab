@@ -127,6 +127,19 @@ impl SessionPool {
         state.persisted.keys().cloned().collect()
     }
 
+    async fn spawn_initialized_connection(&self) -> Result<AcpConnection> {
+        let mut conn = AcpConnection::spawn(
+            &self.config.command,
+            &self.config.args,
+            &self.config.working_dir,
+            &self.config.env,
+            &self.config.inherit_env,
+        )
+        .await?;
+        conn.initialize().await?;
+        Ok(conn)
+    }
+
     pub async fn get_or_create(&self, thread_id: &str) -> Result<()> {
         let create_gate = {
             let mut state = self.state.write().await;
@@ -189,16 +202,7 @@ impl SessionPool {
 
         // Build the replacement connection outside the state lock so one stuck
         // initialization does not block all unrelated sessions.
-        let mut new_conn = AcpConnection::spawn(
-            &self.config.command,
-            &self.config.args,
-            &self.config.working_dir,
-            &self.config.env,
-            &self.config.inherit_env,
-        )
-        .await?;
-
-        new_conn.initialize().await?;
+        let mut new_conn = self.spawn_initialized_connection().await?;
 
         let mut resumed = false;
         if let Some(ref sid) = saved_session_id {
@@ -209,7 +213,11 @@ impl SessionPool {
                         resumed = true;
                     }
                     Err(e) => {
-                        warn!(thread_id, session_id = %sid, error = %e, "session/load failed, creating new session");
+                        warn!(thread_id, session_id = %sid, error = %e, "session/load failed, creating new session on a fresh agent process");
+                        // The agent may still be replaying the stored session
+                        // after the load timed out. Do not reuse that process
+                        // for the new session; dropping it kills the process.
+                        new_conn = self.spawn_initialized_connection().await?;
                     }
                 }
             }
@@ -584,7 +592,7 @@ impl SessionPool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::{get_or_insert_gate, remove_if_same_handle};
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -648,5 +656,200 @@ mod tests {
             roundtrip.get("suspended-thread"),
             Some(&"session-suspended".to_string())
         );
+    }
+
+    /// Minimal ACP agent. Each process numbers itself from a shared counter.
+    /// After a failed or unanswered `session/load` it replays the stored
+    /// session into the next prompt, as a timed-out load can.
+    #[cfg(unix)]
+    const FAKE_AGENT: &str = r#"
+n=$(( $(cat "$FAKE_DIR/spawns" 2>/dev/null || echo 0) + 1 ))
+echo "$n" > "$FAKE_DIR/spawns"
+if [ -n "$FAKE_FAIL_FROM_SPAWN" ] && [ "$n" -ge "$FAKE_FAIL_FROM_SPAWN" ]; then exit 1; fi
+sid=""
+replay=""
+while IFS= read -r line; do
+  id=$(printf '%s\n' "$line" | sed -n 's/^.*"id":\([0-9][0-9]*\).*$/\1/p')
+  method=$(printf '%s\n' "$line" | sed -n 's/^.*"method":"\([^"]*\)".*$/\1/p')
+  echo "$n $method" >> "$FAKE_DIR/log"
+  case "$method" in
+    initialize)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true},"agentInfo":{"name":"fake"}}}\n' "$id" ;;
+    session/load)
+      case "$FAKE_LOAD" in
+        ok) sid=saved-session; printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id" ;;
+        reject) replay=1; printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32000,"message":"load rejected"}}\n' "$id" ;;
+        *) replay=1 ;;
+      esac ;;
+    session/new)
+      sid="fresh-$n"
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"%s"}}\n' "$id" "$sid" ;;
+    session/prompt)
+      if [ "$FAKE_PROMPT_END" = "disconnect" ]; then
+        printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"%s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"unfinished buffered output"}}}}\n' "$sid"
+        printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"%s","update":{"sessionUpdate":"agent_message_chunk","_meta":{"openai/codex-message-phase":"commentary"},"content":{"type":"text","text":"unsent commentary"}}}}\n' "$sid"
+        kill -TERM "$$"
+      fi
+      if [ -n "$replay" ]; then
+        printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"saved-session","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"replayed history"}}}}\n'
+      fi
+      if [ "$FAKE_COMMENTARY" = "yes" ]; then
+        printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"%s","update":{"sessionUpdate":"agent_message_chunk","_meta":{"openai/codex-message-phase":"commentary"},"content":{"type":"text","text":"checkpoint before final"}}}}\n' "$sid"
+      fi
+      printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"%s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"answer from %s"}}}}\n' "$sid" "$n"
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id" ;;
+  esac
+done
+"#;
+
+    #[cfg(unix)]
+    const THREAD: &str = "discord:thread";
+
+    #[cfg(unix)]
+    pub(crate) fn fake_pool(dir: &std::path::Path, env: &[(&str, &str)]) -> super::SessionPool {
+        let script = dir.join("fake-agent.sh");
+        std::fs::write(&script, FAKE_AGENT).unwrap();
+        let mut env: HashMap<String, String> = env
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect();
+        env.insert("FAKE_DIR".into(), dir.to_string_lossy().into_owned());
+        let saved = HashMap::from([(THREAD.to_string(), "saved-session".to_string())]);
+        super::SessionPool {
+            state: tokio::sync::RwLock::new(super::PoolState {
+                active: HashMap::new(),
+                cancel_handles: HashMap::new(),
+                persisted: saved.clone(),
+                suspended: saved,
+                creating: HashMap::new(),
+            }),
+            config: crate::config::AgentConfig {
+                command: "/bin/sh".into(),
+                args: vec![script.to_string_lossy().into_owned()],
+                working_dir: dir.to_string_lossy().into_owned(),
+                env,
+                inherit_env: Vec::new(),
+            },
+            max_sessions: 4,
+            mapping_path: dir.join("thread_map.json"),
+        }
+    }
+
+    /// Runs one prompt on the thread's connection and returns its session id
+    /// and every streamed text chunk, without any adapter-side filtering.
+    #[cfg(unix)]
+    async fn prompt_once(pool: &super::SessionPool) -> (Option<String>, Vec<String>) {
+        let conn = pool.state.read().await.active.get(THREAD).cloned().unwrap();
+        let mut conn = conn.lock().await;
+        let (mut rx, request_id) = conn
+            .session_prompt(vec![crate::acp::ContentBlock::Text { text: "hi".into() }])
+            .await
+            .unwrap();
+        let mut texts = Vec::new();
+        loop {
+            let msg = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+                .await
+                .expect("prompt timed out")
+                .expect("agent closed the prompt stream");
+            if msg.id == Some(request_id) {
+                break;
+            }
+            if let Some(text) = msg
+                .params
+                .as_ref()
+                .and_then(|params| params.pointer("/update/content/text"))
+                .and_then(serde_json::Value::as_str)
+            {
+                texts.push(text.to_string());
+            }
+        }
+        conn.prompt_done().await;
+        (conn.acp_session_id.clone(), texts)
+    }
+
+    #[cfg(unix)]
+    fn agent_log(dir: &std::path::Path) -> Vec<String> {
+        std::fs::read_to_string(dir.join("log"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rejected_load_creates_session_on_fresh_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = fake_pool(dir.path(), &[("FAKE_LOAD", "reject")]);
+
+        pool.get_or_create(THREAD).await.unwrap();
+        let (session_id, texts) = prompt_once(&pool).await;
+
+        assert_eq!(session_id.as_deref(), Some("fresh-2"));
+        assert_eq!(texts, vec!["answer from 2".to_string()]);
+        assert_eq!(
+            agent_log(dir.path()),
+            [
+                "1 initialize",
+                "1 session/load",
+                "2 initialize",
+                "2 session/new",
+                "2 session/prompt"
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timed_out_load_creates_session_on_fresh_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = fake_pool(dir.path(), &[("FAKE_LOAD", "silent")]);
+
+        pool.get_or_create(THREAD).await.unwrap();
+        let (session_id, texts) = prompt_once(&pool).await;
+
+        assert_eq!(session_id.as_deref(), Some("fresh-2"));
+        assert_eq!(texts, vec!["answer from 2".to_string()]);
+        assert_eq!(
+            agent_log(dir.path()),
+            [
+                "1 initialize",
+                "1 session/load",
+                "2 initialize",
+                "2 session/new",
+                "2 session/prompt"
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn successful_load_keeps_process_and_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = fake_pool(dir.path(), &[("FAKE_LOAD", "ok")]);
+
+        pool.get_or_create(THREAD).await.unwrap();
+        let (session_id, texts) = prompt_once(&pool).await;
+
+        assert_eq!(session_id.as_deref(), Some("saved-session"));
+        assert_eq!(texts, vec!["answer from 1".to_string()]);
+        assert_eq!(
+            agent_log(dir.path()),
+            ["1 initialize", "1 session/load", "1 session/prompt"]
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fresh_process_failure_after_rejected_load_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = fake_pool(
+            dir.path(),
+            &[("FAKE_LOAD", "reject"), ("FAKE_FAIL_FROM_SPAWN", "2")],
+        );
+
+        assert!(pool.get_or_create(THREAD).await.is_err());
+        assert!(!pool.state.read().await.active.contains_key(THREAD));
+        assert_eq!(agent_log(dir.path()), ["1 initialize", "1 session/load"]);
     }
 }

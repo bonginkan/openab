@@ -1154,14 +1154,20 @@ impl EventHandler for Handler {
         // Replay the durable queue that survived a restart: re-submit each still-
         // queued message once. `swap` guards against a serenity reconnect (which
         // re-fires `ready`) re-submitting the backlog.
-        if !self.replayed.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        if !self
+            .replayed
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
             let queued = self.spool.entries();
             if !queued.is_empty() {
                 let adapter = self
                     .adapter
                     .get_or_init(|| Arc::new(DiscordAdapter::new(ctx.http.clone())))
                     .clone();
-                info!(count = queued.len(), "replaying persisted queue after restart");
+                info!(
+                    count = queued.len(),
+                    "replaying persisted queue after restart"
+                );
                 for pm in queued {
                     let thread_key = pm.thread_key.clone();
                     let thread_channel = pm.thread_channel.clone();

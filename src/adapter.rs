@@ -8,7 +8,8 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{error, warn};
 
-use crate::acp::{classify_notification, AcpEvent, ContentBlock, SessionPool};
+use crate::acp::protocol::JsonRpcMessage;
+use crate::acp::{classify_notification, AcpEvent, AcpMessagePhase, ContentBlock, SessionPool};
 use crate::config::{AttachmentsConfig, LiveStatusConfig, ReactionsConfig, ToolDisplay};
 use crate::error_display::{format_coded_error, format_user_error};
 use crate::format;
@@ -1235,9 +1236,11 @@ impl AdapterRouter {
                     conn.session_reset = false;
 
                     let (mut rx, request_id) = conn.session_prompt(content_blocks).await?;
+                    let active_session_id = conn.acp_session_id.clone();
                     reactions.set_thinking().await;
 
                     let mut text_buf = String::new();
+                    let mut commentary_buf = String::new();
                     let mut tool_lines: Vec<ToolEntry> = Vec::new();
 
                     if reset {
@@ -1307,6 +1310,7 @@ impl AdapterRouter {
                     // messages and abandons cleanly on dead agent / optional hard
                     // ceiling so late responses cannot leak into the next prompt.
                     let mut response_error: Option<String> = None;
+                    let mut received_prompt_response = false;
                     let prompt_start = tokio::time::Instant::now();
                     loop {
                         let notification = tokio::select! {
@@ -1341,12 +1345,41 @@ impl AdapterRouter {
                             if let Some(ref err) = notification.error {
                                 response_error = Some(format_coded_error(err.code, &err.message, err.data_message()));
                             }
+                            received_prompt_response = true;
                             break;
                         }
 
+                        if is_foreign_session_notification(
+                            &notification,
+                            active_session_id.as_deref(),
+                        ) {
+                            tracing::warn!(
+                                request_id,
+                                "dropping session/update for a session other than the active prompt"
+                            );
+                            continue;
+                        }
+
                         if let Some(event) = classify_notification(&notification) {
+                            let Some(event) = buffer_non_streaming_commentary(
+                                streaming,
+                                event,
+                                &mut commentary_buf,
+                            ) else {
+                                continue;
+                            };
+
+                            flush_commentary_checkpoint(
+                                &adapter,
+                                &thread_channel,
+                                &mut commentary_buf,
+                                table_mode,
+                                message_limit,
+                            )
+                            .await;
+
                             match event {
-                                AcpEvent::Text(t) => {
+                                AcpEvent::Text { text: t, .. } => {
                                     // Before anything is composed: the answer owns
                                     // the message from here on.
                                     live_status.send(LiveStatusEvent::TextStarted);
@@ -1354,32 +1387,23 @@ impl AdapterRouter {
                                         let mut pending = pending_steer_separators.lock().await;
                                         pending.remove(&thread_key_for_separator)
                                     };
-                                    if let Some(steer_text) = steer {
-                                        // First post-steer chunk: open a new section
-                                        // headed by the steer content.
+                                    if let (Some(steer_text), Some(post)) =
+                                        (steer, placeholder_post.as_ref())
+                                    {
+                                        // Streaming keeps its continuation post. A
+                                        // non-streaming final contains only the answer,
+                                        // without replaying the incoming steer prompt.
                                         let header = render_steer_header(&steer_text);
-                                        if let Some(post) = &placeholder_post {
-                                            // Streaming: seal the pre-steer message in
-                                            // place and roll edits onto a fresh post
-                                            // below the user's steer message.
-                                            tool_lines.clear();
-                                            text_buf.clear();
-                                            text_buf.push_str(&header);
-                                            text_buf.push_str("\n\n");
-                                            if let Err(e) =
-                                                post.seal_and_start_continuation(&header).await
-                                            {
-                                                warn!(error = ?e, "failed to start steer continuation post");
-                                            }
-                                            text_buf.push_str(&t);
-                                        } else {
-                                            // Non-streaming: inline the steer section
-                                            // into the single end-of-turn post.
-                                            ensure_response_separator(&mut text_buf, &header);
-                                            text_buf.push_str(&header);
-                                            text_buf.push_str("\n\n");
-                                            text_buf.push_str(&t);
+                                        tool_lines.clear();
+                                        text_buf.clear();
+                                        text_buf.push_str(&header);
+                                        text_buf.push_str("\n\n");
+                                        if let Err(e) =
+                                            post.seal_and_start_continuation(&header).await
+                                        {
+                                            warn!(error = ?e, "failed to start steer continuation post");
                                         }
+                                        text_buf.push_str(&t);
                                     } else {
                                         append_text_chunk(&mut text_buf, &t, false);
                                     }
@@ -1458,6 +1482,26 @@ impl AdapterRouter {
                             }
                         }
                     }
+
+                    if !received_prompt_response && !streaming {
+                        // A disconnected non-streaming turn has no completed answer.
+                        // Shutdown must not publish its long unfinished buffer as a final.
+                        response_error.get_or_insert_with(|| {
+                            "Agent connection closed before completing the turn".into()
+                        });
+                        text_buf.clear();
+                        commentary_buf.clear();
+                        tool_lines.clear();
+                    }
+
+                    flush_commentary_checkpoint(
+                        &adapter,
+                        &thread_channel,
+                        &mut commentary_buf,
+                        table_mode,
+                        message_limit,
+                    )
+                    .await;
 
                     tracing::info!(
                         request_id,
@@ -1785,6 +1829,62 @@ fn collapse_degenerate(content: &str) -> Option<String> {
         content.chars().count(),
         unit
     ))
+}
+
+async fn flush_commentary_checkpoint(
+    adapter: &Arc<dyn ChatAdapter>,
+    thread_channel: &ChannelRef,
+    commentary_buf: &mut String,
+    table_mode: TableMode,
+    message_limit: usize,
+) {
+    let commentary = std::mem::take(commentary_buf);
+    if commentary.trim().is_empty() {
+        return;
+    }
+
+    let commentary = markdown::convert_tables(&commentary, table_mode);
+    for chunk in format::split_message(&commentary, message_limit) {
+        if let Err(error) = adapter.send_message(thread_channel, &chunk).await {
+            warn!(?error, "failed to send non-streaming commentary checkpoint");
+        }
+    }
+}
+
+/// The connection forwards every notification to the active prompt's
+/// subscriber. A `session/load` that timed out can still replay the stored
+/// session's history afterwards, so updates that name a different session
+/// must not reach the current prompt's buffer.
+fn is_foreign_session_notification(
+    notification: &JsonRpcMessage,
+    active_session_id: Option<&str>,
+) -> bool {
+    let Some(active_session_id) = active_session_id else {
+        return false;
+    };
+    notification
+        .params
+        .as_ref()
+        .and_then(|params| params.get("sessionId"))
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|session_id| session_id != active_session_id)
+}
+
+fn buffer_non_streaming_commentary(
+    streaming: bool,
+    event: AcpEvent,
+    commentary_buf: &mut String,
+) -> Option<AcpEvent> {
+    match event {
+        AcpEvent::Text {
+            text,
+            phase: Some(AcpMessagePhase::Commentary),
+        } if !streaming => {
+            append_text_chunk(commentary_buf, &text, false);
+            None
+        }
+        event => Some(event),
+    }
 }
 
 fn split_streaming_display(content: &str, message_limit: usize) -> Vec<String> {
@@ -2313,6 +2413,263 @@ mod tests {
             ..ch.clone()
         };
         assert_eq!(thread_ch.origin_event_id.as_deref(), Some("evt_abc"));
+    }
+
+    fn session_update(session_id: Option<&str>) -> JsonRpcMessage {
+        let mut params = serde_json::json!({
+            "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "content": {"type": "text", "text": "replayed history"}
+            }
+        });
+        if let Some(session_id) = session_id {
+            params["sessionId"] = serde_json::Value::from(session_id);
+        }
+        serde_json::from_value(serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": params
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn late_load_replay_for_another_session_is_dropped() {
+        assert!(is_foreign_session_notification(
+            &session_update(Some("loaded-session")),
+            Some("fresh-session"),
+        ));
+    }
+
+    #[test]
+    fn active_session_updates_are_kept() {
+        assert!(!is_foreign_session_notification(
+            &session_update(Some("fresh-session")),
+            Some("fresh-session"),
+        ));
+    }
+
+    #[test]
+    fn updates_without_session_ids_are_kept() {
+        assert!(!is_foreign_session_notification(
+            &session_update(None),
+            Some("fresh-session"),
+        ));
+        assert!(!is_foreign_session_notification(
+            &session_update(Some("loaded-session")),
+            None,
+        ));
+    }
+
+    #[derive(Default)]
+    struct RecordingAdapter {
+        sent: Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl ChatAdapter for RecordingAdapter {
+        fn platform(&self) -> &'static str {
+            "test"
+        }
+
+        fn message_limit(&self) -> usize {
+            2000
+        }
+
+        async fn send_message(&self, channel: &ChannelRef, content: &str) -> Result<MessageRef> {
+            self.sent.lock().await.push(content.to_string());
+            Ok(MessageRef {
+                channel: channel.clone(),
+                message_id: "checkpoint".into(),
+            })
+        }
+
+        async fn create_thread(
+            &self,
+            _: &ChannelRef,
+            _: &MessageRef,
+            _: &str,
+        ) -> Result<ChannelRef> {
+            unimplemented!()
+        }
+
+        async fn add_reaction(&self, _: &MessageRef, _: &str) -> Result<()> {
+            Ok(())
+        }
+
+        async fn remove_reaction(&self, _: &MessageRef, _: &str) -> Result<()> {
+            Ok(())
+        }
+
+        fn use_streaming(&self, _: bool) -> bool {
+            false
+        }
+    }
+
+    #[tokio::test]
+    async fn non_streaming_commentary_flushes_as_fresh_checkpoint() {
+        let adapter = Arc::new(RecordingAdapter::default());
+        let adapter_dyn: Arc<dyn ChatAdapter> = adapter.clone();
+        let channel = ChannelRef {
+            platform: "test".into(),
+            channel_id: "channel".into(),
+            thread_id: None,
+            parent_id: None,
+            origin_event_id: None,
+        };
+        let mut commentary = String::new();
+        let buffered = buffer_non_streaming_commentary(
+            false,
+            AcpEvent::Text {
+                text: "着手した。次に検証する。".into(),
+                phase: Some(AcpMessagePhase::Commentary),
+            },
+            &mut commentary,
+        );
+        assert!(buffered.is_none());
+
+        flush_commentary_checkpoint(
+            &adapter_dyn,
+            &channel,
+            &mut commentary,
+            TableMode::Off,
+            2000,
+        )
+        .await;
+
+        assert!(commentary.is_empty());
+        assert_eq!(
+            adapter.sent.lock().await.as_slice(),
+            ["着手した。次に検証する。"]
+        );
+    }
+
+    #[cfg(unix)]
+    async fn route_fake_agent_prompt(env: &[(&str, &str)], steer: Option<&str>) -> Vec<String> {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = Arc::new(crate::acp::pool::tests::fake_pool(dir.path(), env));
+        pool.get_or_create("discord:thread").await.unwrap();
+        let adapter = Arc::new(RecordingAdapter::default());
+        let adapter_dyn: Arc<dyn ChatAdapter> = adapter.clone();
+        let channel = ChannelRef {
+            platform: "test".into(),
+            channel_id: "channel".into(),
+            thread_id: None,
+            parent_id: None,
+            origin_event_id: None,
+        };
+        let reactions = Arc::new(StatusReactionController::new(
+            false,
+            adapter_dyn.clone(),
+            MessageRef {
+                channel: channel.clone(),
+                message_id: "incoming".into(),
+            },
+            Default::default(),
+            Default::default(),
+        ));
+        let router = AdapterRouter::new(
+            pool,
+            Default::default(),
+            Default::default(),
+            TableMode::Off,
+            30,
+            Default::default(),
+            dir.path().to_string_lossy().into_owned(),
+        );
+        if let Some(steer) = steer {
+            router
+                .pending_steer_separators
+                .lock()
+                .await
+                .insert("discord:thread".into(), steer.into());
+        }
+        router
+            .stream_prompt_blocks(
+                &adapter_dyn,
+                "discord:thread",
+                vec![ContentBlock::Text { text: "hi".into() }],
+                &channel,
+                reactions,
+                false,
+            )
+            .await
+            .unwrap();
+        let sent = adapter.sent.lock().await.clone();
+        sent
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn non_streaming_agent_disconnect_discards_unfinished_output() {
+        let sent = route_fake_agent_prompt(
+            &[("FAKE_LOAD", "ok"), ("FAKE_PROMPT_END", "disconnect")],
+            None,
+        )
+        .await;
+        assert_eq!(sent.len(), 1, "disconnect must send only one short error");
+        assert!(sent[0].contains("Agent connection closed"));
+        assert!(!sent[0].contains("unfinished buffered output"));
+        assert!(!sent[0].contains("unsent commentary"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn non_streaming_agent_completion_keeps_final_output() {
+        let sent = route_fake_agent_prompt(&[("FAKE_LOAD", "ok")], None).await;
+        assert_eq!(sent, ["answer from 1"]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn non_streaming_steer_keeps_checkpoint_and_final_without_prompt_replay() {
+        let steer = "previous request that must not be echoed\n".repeat(100);
+        for pending in [None, Some(steer.as_str())] {
+            let sent = route_fake_agent_prompt(
+                &[("FAKE_LOAD", "ok"), ("FAKE_COMMENTARY", "yes")],
+                pending,
+            )
+            .await;
+            assert_eq!(sent, ["checkpoint before final", "answer from 1"]);
+        }
+    }
+
+    #[test]
+    fn streaming_and_final_text_bypass_commentary_checkpoint() {
+        let mut commentary = String::new();
+
+        let streaming_commentary = buffer_non_streaming_commentary(
+            true,
+            AcpEvent::Text {
+                text: "streamed".into(),
+                phase: Some(AcpMessagePhase::Commentary),
+            },
+            &mut commentary,
+        );
+        assert!(matches!(
+            streaming_commentary,
+            Some(AcpEvent::Text {
+                phase: Some(AcpMessagePhase::Commentary),
+                ..
+            })
+        ));
+
+        let final_text = buffer_non_streaming_commentary(
+            false,
+            AcpEvent::Text {
+                text: "done".into(),
+                phase: Some(AcpMessagePhase::FinalAnswer),
+            },
+            &mut commentary,
+        );
+        assert!(matches!(
+            final_text,
+            Some(AcpEvent::Text {
+                phase: Some(AcpMessagePhase::FinalAnswer),
+                ..
+            })
+        ));
+        assert!(commentary.is_empty());
     }
 
     fn tool(id: &str, title: &str, state: ToolState) -> ToolEntry {

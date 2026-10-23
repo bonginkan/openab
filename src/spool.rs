@@ -83,7 +83,13 @@ pub fn slug_from_config_source(src: &str) -> String {
 fn sanitize(slug: &str) -> String {
     let cleaned: String = slug
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     if cleaned.is_empty() {
         "default".to_string()
@@ -112,7 +118,12 @@ impl QueueSpool {
     /// Open at an explicit path (used by tests).
     pub fn open_at(path: PathBuf) -> Self {
         let entries = Self::load(&path);
-        let next = entries.iter().map(|e| e.id).max().map(|m| m + 1).unwrap_or(0);
+        let next = entries
+            .iter()
+            .map(|e| e.id)
+            .max()
+            .map(|m| m + 1)
+            .unwrap_or(0);
         Self {
             path,
             inner: Mutex::new(entries),
@@ -139,7 +150,8 @@ impl QueueSpool {
             }
         };
         let tmp = self.path.with_extension("json.tmp");
-        if let Err(e) = std::fs::write(&tmp, &data).and_then(|_| std::fs::rename(&tmp, &self.path)) {
+        if let Err(e) = std::fs::write(&tmp, &data).and_then(|_| std::fs::rename(&tmp, &self.path))
+        {
             warn!(path = %self.path.display(), error = %e, "failed to persist queue spool");
         }
     }
@@ -213,7 +225,9 @@ mod tests {
             sender_json: r#"{"sender_id":"u1"}"#.to_string(),
             sender_name: "user".to_string(),
             prompt: prompt.to_string(),
-            extra_blocks: vec![ContentBlock::Text { text: "img-caption".to_string() }],
+            extra_blocks: vec![ContentBlock::Text {
+                text: "img-caption".to_string(),
+            }],
             trigger_msg: MessageRef {
                 channel: channel(),
                 message_id: "msg-1".to_string(),
@@ -294,9 +308,18 @@ mod tests {
 
     #[test]
     fn slug_from_config_source_is_per_bot() {
-        assert_eq!(slug_from_config_source("/home/x/dev/config/config.reina.dev.toml"), "config_reina_dev");
-        assert_eq!(slug_from_config_source("config.hana.dev.toml"), "config_hana_dev");
-        assert_eq!(slug_from_config_source("https://example.test/config.northstar.toml"), "config_northstar");
+        assert_eq!(
+            slug_from_config_source("/home/x/dev/config/config.reina.dev.toml"),
+            "config_reina_dev"
+        );
+        assert_eq!(
+            slug_from_config_source("config.hana.dev.toml"),
+            "config_hana_dev"
+        );
+        assert_eq!(
+            slug_from_config_source("https://example.test/config.northstar.toml"),
+            "config_northstar"
+        );
         // distinct bots get distinct files
         assert_ne!(
             slug_from_config_source("config.reina.dev.toml"),
@@ -326,8 +349,13 @@ mod tests {
         let spool = QueueSpool::open_at(path.clone());
         let mut msg = sample("with-image");
         msg.extra_blocks = vec![
-            ContentBlock::Text { text: "caption".to_string() },
-            ContentBlock::Image { media_type: "image/png".to_string(), data: "AAAA".to_string() },
+            ContentBlock::Text {
+                text: "caption".to_string(),
+            },
+            ContentBlock::Image {
+                media_type: "image/png".to_string(),
+                data: "AAAA".to_string(),
+            },
         ];
         spool.append(msg);
 

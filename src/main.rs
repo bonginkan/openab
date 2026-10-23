@@ -462,7 +462,10 @@ async fn main() -> anyhow::Result<()> {
         )));
         let recovered = discord_spool.len();
         if recovered > 0 {
-            info!(recovered, "loaded queued messages from spool; will replay on connect");
+            info!(
+                recovered,
+                "loaded queued messages from spool; will replay on connect"
+            );
         }
         let discord_dispatcher = Arc::new(
             dispatch::Dispatcher::with_idle_timeout(
