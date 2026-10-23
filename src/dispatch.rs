@@ -604,7 +604,9 @@ impl Dispatcher {
         // Purge the spool for these keys: cancelled messages leave the mpsc
         // without a consumer pickup, so without this they would replay on restart.
         if let Some(spool) = self.spool.as_ref() {
-            spool.remove_matching(|pm| pm.thread_key == prefix || pm.thread_key.starts_with(&lane_prefix));
+            spool.remove_matching(|pm| {
+                pm.thread_key == prefix || pm.thread_key.starts_with(&lane_prefix)
+            });
         }
         let mut dropped = 0;
         for k in keys {
@@ -1820,8 +1822,15 @@ mod tests {
         let spool_opt = Some(spool.clone());
         let (batch, pending) = drain_batch(m1, &mut rx, &spool_opt, 10, 100);
 
-        assert_eq!(batch.len(), 1, "token cap keeps the second message out of the batch");
-        assert!(pending.is_some(), "the second message is carried over as pending");
+        assert_eq!(
+            batch.len(),
+            1,
+            "token cap keeps the second message out of the batch"
+        );
+        assert!(
+            pending.is_some(),
+            "the second message is carried over as pending"
+        );
 
         // m1 dispatched → acked off the spool; m2 pending → still persisted.
         let survivors: Vec<String> = spool.entries().iter().map(|p| p.prompt.clone()).collect();
