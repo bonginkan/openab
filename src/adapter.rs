@@ -1387,32 +1387,23 @@ impl AdapterRouter {
                                         let mut pending = pending_steer_separators.lock().await;
                                         pending.remove(&thread_key_for_separator)
                                     };
-                                    if let Some(steer_text) = steer {
-                                        // First post-steer chunk: open a new section
-                                        // headed by the steer content.
+                                    if let (Some(steer_text), Some(post)) =
+                                        (steer, placeholder_post.as_ref())
+                                    {
+                                        // Streaming keeps its continuation post. A
+                                        // non-streaming final contains only the answer,
+                                        // without replaying the incoming steer prompt.
                                         let header = render_steer_header(&steer_text);
-                                        if let Some(post) = &placeholder_post {
-                                            // Streaming: seal the pre-steer message in
-                                            // place and roll edits onto a fresh post
-                                            // below the user's steer message.
-                                            tool_lines.clear();
-                                            text_buf.clear();
-                                            text_buf.push_str(&header);
-                                            text_buf.push_str("\n\n");
-                                            if let Err(e) =
-                                                post.seal_and_start_continuation(&header).await
-                                            {
-                                                warn!(error = ?e, "failed to start steer continuation post");
-                                            }
-                                            text_buf.push_str(&t);
-                                        } else {
-                                            // Non-streaming: inline the steer section
-                                            // into the single end-of-turn post.
-                                            ensure_response_separator(&mut text_buf, &header);
-                                            text_buf.push_str(&header);
-                                            text_buf.push_str("\n\n");
-                                            text_buf.push_str(&t);
+                                        tool_lines.clear();
+                                        text_buf.clear();
+                                        text_buf.push_str(&header);
+                                        text_buf.push_str("\n\n");
+                                        if let Err(e) =
+                                            post.seal_and_start_continuation(&header).await
+                                        {
+                                            warn!(error = ?e, "failed to start steer continuation post");
                                         }
+                                        text_buf.push_str(&t);
                                     } else {
                                         append_text_chunk(&mut text_buf, &t, false);
                                     }
@@ -2554,7 +2545,7 @@ mod tests {
     }
 
     #[cfg(unix)]
-    async fn route_fake_agent_prompt(env: &[(&str, &str)]) -> Vec<String> {
+    async fn route_fake_agent_prompt(env: &[(&str, &str)], steer: Option<&str>) -> Vec<String> {
         let dir = tempfile::tempdir().unwrap();
         let pool = Arc::new(crate::acp::pool::tests::fake_pool(dir.path(), env));
         pool.get_or_create("discord:thread").await.unwrap();
@@ -2586,6 +2577,13 @@ mod tests {
             Default::default(),
             dir.path().to_string_lossy().into_owned(),
         );
+        if let Some(steer) = steer {
+            router
+                .pending_steer_separators
+                .lock()
+                .await
+                .insert("discord:thread".into(), steer.into());
+        }
         router
             .stream_prompt_blocks(
                 &adapter_dyn,
@@ -2604,9 +2602,11 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn non_streaming_agent_disconnect_discards_unfinished_output() {
-        let sent =
-            route_fake_agent_prompt(&[("FAKE_LOAD", "ok"), ("FAKE_PROMPT_END", "disconnect")])
-                .await;
+        let sent = route_fake_agent_prompt(
+            &[("FAKE_LOAD", "ok"), ("FAKE_PROMPT_END", "disconnect")],
+            None,
+        )
+        .await;
         assert_eq!(sent.len(), 1, "disconnect must send only one short error");
         assert!(sent[0].contains("Agent connection closed"));
         assert!(!sent[0].contains("unfinished buffered output"));
@@ -2616,8 +2616,22 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn non_streaming_agent_completion_keeps_final_output() {
-        let sent = route_fake_agent_prompt(&[("FAKE_LOAD", "ok")]).await;
+        let sent = route_fake_agent_prompt(&[("FAKE_LOAD", "ok")], None).await;
         assert_eq!(sent, ["answer from 1"]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn non_streaming_steer_keeps_checkpoint_and_final_without_prompt_replay() {
+        let steer = "previous request that must not be echoed\n".repeat(100);
+        for pending in [None, Some(steer.as_str())] {
+            let sent = route_fake_agent_prompt(
+                &[("FAKE_LOAD", "ok"), ("FAKE_COMMENTARY", "yes")],
+                pending,
+            )
+            .await;
+            assert_eq!(sent, ["checkpoint before final", "answer from 1"]);
+        }
     }
 
     #[test]

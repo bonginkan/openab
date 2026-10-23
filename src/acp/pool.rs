@@ -693,6 +693,9 @@ while IFS= read -r line; do
       if [ -n "$replay" ]; then
         printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"saved-session","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"replayed history"}}}}\n'
       fi
+      if [ "$FAKE_COMMENTARY" = "yes" ]; then
+        printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"%s","update":{"sessionUpdate":"agent_message_chunk","_meta":{"openai/codex-message-phase":"commentary"},"content":{"type":"text","text":"checkpoint before final"}}}}\n' "$sid"
+      fi
       printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"%s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"answer from %s"}}}}\n' "$sid" "$n"
       printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id" ;;
   esac
